@@ -1,0 +1,37 @@
+name: ARPoseStreamer
+
+options:
+  createIntermediateGroups: true
+
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.example.ARPoseStreamer
+    INFOPLIST_FILE: Info.plist
+    SWIFT_VERSION: 5.9
+    IPHONEOS_DEPLOYMENT_TARGET: 17.0
+    TARGETED_DEVICE_FAMILY: 1
+    SUPPORTS_MACCATALYST: NO
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  ARPoseStreamer:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: ARPositionApp.swift
+      - path: ContentView.swift
+      - path: PositionViewModel.swift
+      - path: ARPoseUDPSender.swift
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: NO
+        DEVELOPMENT_ASSET_PATHS: "\"Preview Content\""
+
+schemes:
+  ARPoseStreamer:
+    build:
+      targets:
+        ARPoseStreamer: all
+    run:
+      config: Debug
