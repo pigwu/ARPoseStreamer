@@ -9,6 +9,36 @@ It is built for robotics, teleoperation, computer vision, and rapid lab experime
 - a simple iPhone-to-host pose stream
 - easy debugging on macOS or Windows
 
+## At A Glance
+
+```text
+iPhone (ARKit)
+    |
+    |  UDP pose packets
+    |  seq, time, x, y, z, qx, qy, qz, qw
+    v
+Mac / Windows receiver
+    |
+    +--> terminal inspection
+    +--> CSV logging
+    +--> custom robotics / CV pipeline
+```
+
+## Table Of Contents
+
+- [What It Does](#what-it-does)
+- [Why This Repo Exists](#why-this-repo-exists)
+- [Highlights](#highlights)
+- [Quick Start](#quick-start)
+- [Sample Receiver Output](#sample-receiver-output)
+- [Repository Structure](#repository-structure)
+- [Packet Format](#packet-format)
+- [iPhone Installation Model](#iphone-installation-model)
+- [Notes For Robotics / UMI-Style Pipelines](#notes-for-robotics--umi-style-pipelines)
+- [FAQ](#faq)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## What It Does
 
 ARPoseStreamer runs ARKit world tracking on an iPhone, converts the pose into a compact packet, and streams it over UDP to a receiver on your laptop or workstation.
@@ -136,6 +166,20 @@ Note:
 
 `approx_lat` is only meaningful when the iPhone and receiver clocks are reasonably synchronized.
 
+## Sample Receiver Output
+
+```text
+192.168.1.15:53318 seq=   128 drop=  0 approx_lat=  14.72ms fps= 59.84
+x=+0.0124 y=-0.0317 z=+0.8421 qx=+0.0021 qy=-0.7063 qz=+0.0064 qw=+0.7079
+```
+
+What you usually want to see:
+
+- `seq` keeps increasing
+- `drop` stays near zero on a stable network
+- `fps` stays close to `60`
+- pose values change smoothly as the phone moves
+
 ## Repository Structure
 
 - `ARPoseUDPSender.swift`: ARKit + UDP sender core
@@ -222,6 +266,21 @@ For the default lab setup, yes. They should be on the same LAN or Wi-Fi so the i
 ### Why does the receiver show approximate latency?
 
 Because it compares sender time and receiver time. If those clocks are not synchronized, the value is only a rough hint.
+
+## Contributing
+
+Contributions are welcome.
+
+If you want to improve the app, receiver, docs, or downstream integration:
+
+- open an issue describing the problem or idea
+- keep changes focused and easy to review
+- include repro steps for bugs
+- include validation notes for code changes
+
+See:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Limitations
 
