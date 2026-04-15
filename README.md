@@ -1,5 +1,9 @@
 # ARPoseStreamer
 
+![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
+![Platform: iOS](https://img.shields.io/badge/platform-iOS-blue.svg)
+![Receiver: macOS%20%7C%20Windows](https://img.shields.io/badge/receiver-macOS%20%7C%20Windows-lightgrey.svg)
+
 ARPoseStreamer is a lightweight iPhone ARKit app and cross-platform UDP receiver for streaming relative camera pose to a host machine.
 
 It is built for robotics, teleoperation, computer vision, and rapid lab experiments where you want:
@@ -37,6 +41,7 @@ Mac / Windows receiver
 - [Notes For Robotics / UMI-Style Pipelines](#notes-for-robotics--umi-style-pipelines)
 - [FAQ](#faq)
 - [Contributing](#contributing)
+- [Repository Metadata](#repository-metadata)
 - [License](#license)
 
 ## What It Does
@@ -281,6 +286,12 @@ If you want to improve the app, receiver, docs, or downstream integration:
 See:
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
+
+## Repository Metadata
+
+If you want the GitHub project page to look more polished, use:
+
+- [REPOSITORY_METADATA.md](REPOSITORY_METADATA.md)
 
 ## Limitations
 
