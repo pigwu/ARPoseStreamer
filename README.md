@@ -35,12 +35,14 @@ Mac / Windows receiver
 - [Highlights](#highlights)
 - [Quick Start](#quick-start)
 - [Sample Receiver Output](#sample-receiver-output)
+- [Documentation](#documentation)
 - [Repository Structure](#repository-structure)
 - [Packet Format](#packet-format)
 - [iPhone Installation Model](#iphone-installation-model)
 - [Notes For Robotics / UMI-Style Pipelines](#notes-for-robotics--umi-style-pipelines)
 - [FAQ](#faq)
 - [Contributing](#contributing)
+- [Code of Conduct](#code-of-conduct)
 - [Repository Metadata](#repository-metadata)
 - [License](#license)
 
@@ -185,6 +187,15 @@ What you usually want to see:
 - `fps` stays close to `60`
 - pose values change smoothly as the phone moves
 
+## Documentation
+
+Detailed docs:
+
+- [Install the iPhone app](INSTALL_IPHONE_APP.md)
+- [Setup guide](docs/SETUP.md)
+- [Architecture overview](docs/ARCHITECTURE.md)
+- [Packet protocol](docs/PROTOCOL.md)
+
 ## Repository Structure
 
 - `ARPoseUDPSender.swift`: ARKit + UDP sender core
@@ -286,6 +297,12 @@ If you want to improve the app, receiver, docs, or downstream integration:
 See:
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
+
+## Code of Conduct
+
+Please read:
+
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
 ## Repository Metadata
 
