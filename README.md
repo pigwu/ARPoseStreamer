@@ -1,64 +1,55 @@
 # ARPoseStreamer
 
-ARPoseStreamer is a lightweight ARKit-based iPhone app for streaming relative camera pose over UDP to a Mac or Windows receiver.
+ARPoseStreamer is a lightweight iPhone ARKit app and cross-platform UDP receiver for streaming relative camera pose to a host machine.
 
-It is designed for robotics, teleoperation, and computer vision experiments where you want a simple iPhone-to-host pose stream without SceneKit or RealityKit rendering code.
+It is built for robotics, teleoperation, computer vision, and rapid lab experiments where you want:
 
-## Features
+- no rendering stack
+- no SceneKit or RealityKit dependency
+- a simple iPhone-to-host pose stream
+- easy debugging on macOS or Windows
+
+## What It Does
+
+ARPoseStreamer runs ARKit world tracking on an iPhone, converts the pose into a compact packet, and streams it over UDP to a receiver on your laptop or workstation.
+
+Each packet includes:
+
+- sequence number
+- sender timestamp
+- position: `x, y, z`
+- orientation quaternion: `qx, qy, qz, qw`
+
+Default frame convention:
+
+- right-handed
+- `Z-up`
+
+## Why This Repo Exists
+
+Many public iPhone pose streaming examples send large transforms or depend on heavier networking stacks. This repository is intentionally smaller and easier to adapt for lab use.
+
+It is especially useful when you want a clean building block for:
+
+- robot teleoperation pipelines
+- quick ARKit pose capture
+- UMI-style or VIO-style experiments
+- custom downstream receivers in Python, ROS2, or C++
+
+## Highlights
 
 - ARKit world tracking
-- Relative pose with resettable origin
+- resettable relative origin
 - 60 Hz oriented streaming pipeline
-- UDP transport to a configurable host IP on port `5555`
-- Cross-platform receiver on macOS and Windows
-- Compact pose packets with:
-  - sequence number
-  - sender timestamp
-  - `x, y, z, qx, qy, qz, qw`
-- Default output frame:
-  - `Z-up`
-  - right-handed
-
-## Repository Layout
-
-- `ARPoseUDPSender.swift`: ARKit + UDP sender
-- `ARPositionApp.swift`: SwiftUI app entry
-- `ContentView.swift`: iPhone UI
-- `PositionViewModel.swift`: sender/UI wiring
-- `Info.plist`: camera and local network permission strings
-- `project.yml`: XcodeGen spec for generating the Xcode project
-- `udp_pose_receiver.py`: Python UDP receiver for macOS/Windows
-- `run_receiver_mac.sh`: helper launcher for macOS
-- `run_receiver_windows.ps1`: helper launcher for Windows
-- `INSTALL_IPHONE_APP.md`: iPhone installation guide
-
-## Packet Format
-
-Default packet encoding is binary UDP, little-endian.
-
-Binary layout:
-
-1. `sequence` as `UInt32`
-2. `sender_time` as `Float64`
-3. `x` as `Float32`
-4. `y` as `Float32`
-5. `z` as `Float32`
-6. `qx` as `Float32`
-7. `qy` as `Float32`
-8. `qz` as `Float32`
-9. `qw` as `Float32`
-
-Total packet size: `40` bytes.
-
-CSV mode is also supported for debugging:
-
-```text
-sequence,sender_time,x,y,z,qx,qy,qz,qw
-```
+- UDP output to a configurable host IP on port `5555`
+- compact pose packets
+- cross-platform Python receiver
+- SwiftUI control panel on iPhone
+- XcodeGen project spec included
 
 ## Quick Start
 
-### 1. Run The Receiver
+### Receiver
 
 On macOS:
 
@@ -84,13 +75,13 @@ or:
 powershell -ExecutionPolicy Bypass -File .\run_receiver_windows.ps1
 ```
 
-Optional logging:
+Optional packet logging:
 
 ```bash
 python3 udp_pose_receiver.py --encoding binary --csv-log logs/pose.csv
 ```
 
-### 2. Find The Receiver IP
+### Find The Host IP
 
 On macOS:
 
@@ -104,15 +95,24 @@ On Windows:
 ipconfig
 ```
 
-Use the IPv4 address of the machine running `udp_pose_receiver.py`.
+Use the IPv4 address of the machine running the receiver.
 
-### 3. Install The iPhone App
+### Install The iPhone App
 
 Follow:
 
-- `INSTALL_IPHONE_APP.md`
+- [INSTALL_IPHONE_APP.md](INSTALL_IPHONE_APP.md)
 
-### 4. Start Streaming
+Short version:
+
+1. Install Xcode on a Mac
+2. Install XcodeGen
+3. Run `xcodegen generate`
+4. Open the generated project
+5. Choose your Apple signing team
+6. Build to a connected iPhone
+
+### Start Streaming
 
 On the iPhone:
 
@@ -123,42 +123,111 @@ On the iPhone:
    - camera access
    - local network access
 
-### 5. Verify
+### Verify
 
-The receiver should print:
+The receiver should show:
 
 - increasing sequence numbers
 - near-zero drop count on a stable LAN
 - roughly 60 FPS receive rate
 - live pose values
 
-The printed `approx_lat` value is only meaningful when the iPhone and receiver clocks are reasonably synchronized.
+Note:
 
-## iPhone Installation Notes
+`approx_lat` is only meaningful when the iPhone and receiver clocks are reasonably synchronized.
 
-This repository contains source code, not a universally installable iPhone binary.
+## Repository Structure
 
-To install on an iPhone, users must build and sign the app locally with Xcode using their own Apple account, or distribute it through TestFlight / App Store workflows.
+- `ARPoseUDPSender.swift`: ARKit + UDP sender core
+- `ARPositionApp.swift`: SwiftUI app entry
+- `ContentView.swift`: iPhone UI
+- `PositionViewModel.swift`: app state and sender wiring
+- `Info.plist`: iOS permission strings
+- `project.yml`: XcodeGen project spec
+- `udp_pose_receiver.py`: Python UDP receiver for macOS and Windows
+- `run_receiver_mac.sh`: macOS helper launcher
+- `run_receiver_windows.ps1`: Windows helper launcher
+- `INSTALL_IPHONE_APP.md`: iPhone installation guide
 
-For local installation:
+## Packet Format
 
-- install Xcode on a Mac
-- generate the Xcode project with XcodeGen
-- sign with your own Apple team
-- build and run on a connected iPhone
+Default encoding is binary UDP, little-endian.
 
-## Notes For Robotics / UMI-Style Use
+Binary layout:
 
-- The public Stanford `iPhoneVIO` example sends a full `4x4` transform over Socket.IO.
-- This project is intentionally lighter and sends only the pose state required downstream.
+1. `sequence` as `UInt32`
+2. `sender_time` as `Float64`
+3. `x` as `Float32`
+4. `y` as `Float32`
+5. `z` as `Float32`
+6. `qx` as `Float32`
+7. `qy` as `Float32`
+8. `qz` as `Float32`
+9. `qw` as `Float32`
+
+Total packet size:
+
+```text
+40 bytes
+```
+
+CSV mode is available for debugging:
+
+```text
+sequence,sender_time,x,y,z,qx,qy,qz,qw
+```
+
+## iPhone Installation Model
+
+This repository ships source code, not a universally installable iPhone binary.
+
+That means:
+
+- users can clone the repository and build it
+- users cannot install it like an Android APK directly from GitHub
+- iPhone installation requires local signing with Xcode, or a separate TestFlight / App Store distribution flow
+
+For most lab and personal workflows, the expected setup is:
+
+- build locally with Xcode
+- sign with your own Apple account
+- install to your own iPhone
+
+## Notes For Robotics / UMI-Style Pipelines
+
+- Public Stanford `iPhoneVIO` examples often send a full `4x4` transform over Socket.IO.
+- This repository is intentionally more compact and sends only the pose state that many downstream systems actually use.
 - If your downstream stack expects quaternion order `wxyz`, reorder from `xyzw`.
-- If your downstream stack expects ARKit's original `Y-up` frame, update the sender configuration accordingly.
+- If your downstream stack expects ARKit's original `Y-up` frame, adjust the sender configuration accordingly.
+- The sequence field is included so downstream code can detect packet drops or reordering.
+
+## FAQ
+
+### Can I receive packets on Windows?
+
+Yes. The Python receiver works on both macOS and Windows.
+
+### Can I install the iPhone app without a Mac?
+
+Not in the normal local-development flow. Installing to iPhone requires Xcode signing on a Mac, unless you distribute through TestFlight or the App Store.
+
+### Can I use a personal Apple account?
+
+Usually yes, for local development and testing on your own device. Personal-team builds may expire after a short period.
+
+### Do I need the iPhone and host machine on the same network?
+
+For the default lab setup, yes. They should be on the same LAN or Wi-Fi so the iPhone can send UDP packets to the receiver.
+
+### Why does the receiver show approximate latency?
+
+Because it compares sender time and receiver time. If those clocks are not synchronized, the value is only a rough hint.
 
 ## Limitations
 
 - iPhone installation requires a Mac and Xcode
-- Personal-team builds may expire after a short period
-- LAN UDP can drop packets, so the sequence field is included for drop detection
+- LAN UDP can drop packets
+- personal-team iOS builds may expire
 
 ## License
 
