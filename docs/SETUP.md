@@ -51,11 +51,12 @@ Short version:
 ## iPhone App Usage
 
 1. open the app
-2. enter the host IP
-3. tap `Start Streaming`
-4. optionally tap `Start Video Recording`
-5. allow camera access
-6. allow local network access
+2. open the settings sheet
+3. enter the host IP and choose the receiver OS
+4. tap `Start Streaming`
+5. optionally tap `Start Video Recording`
+6. allow camera access
+7. allow local network access
 
 Recorded videos are saved inside the app Documents directory and can be exported later through Files or Finder file sharing.
 

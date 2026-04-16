@@ -107,14 +107,11 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         session.delegate = self
         videoRecorder.onStatusChange = { [weak self] status in
             self?.arQueue.async {
-                switch status {
-                case .idle, .saved, .failed:
+                if status.isTerminal {
                     self?.isRecordingEnabled = false
                     if self?.isStreamingEnabled == false {
                         self?.pauseSessionIfNeeded()
                     }
-                case .recording, .saving:
-                    break
                 }
             }
 

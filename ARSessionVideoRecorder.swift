@@ -17,6 +17,15 @@ enum VideoRecordingStatus {
         return false
     }
 
+    var isTerminal: Bool {
+        switch self {
+        case .idle, .saved, .failed:
+            return true
+        case .recording, .saving:
+            return false
+        }
+    }
+
     var message: String {
         switch self {
         case .idle:

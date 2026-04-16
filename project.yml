@@ -21,6 +21,7 @@ targets:
     sources:
       - path: ARPositionApp.swift
       - path: ContentView.swift
+      - path: AppSettingsView.swift
       - path: PositionViewModel.swift
       - path: ARPoseUDPSender.swift
       - path: ARSessionVideoRecorder.swift

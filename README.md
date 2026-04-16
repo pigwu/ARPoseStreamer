@@ -82,6 +82,8 @@ It is especially useful when you want a clean building block for:
 - compact pose packets
 - cross-platform Python receiver
 - local video recording to the app Documents folder
+- settings panel for receiver and export configuration
+- live X/Y/Z history chart
 - SwiftUI control panel on iPhone
 - XcodeGen project spec included
 
@@ -155,10 +157,11 @@ Short version:
 On the iPhone:
 
 1. Open the app
-2. Enter the receiver IP
-3. Tap `Start Streaming`
-4. Use `Start Video Recording` if you want to save camera video locally
-5. Allow:
+2. Open `Settings`
+3. Enter the receiver IP and choose the receiver OS
+4. Tap `Start Streaming`
+5. Use `Start Video Recording` if you want to save camera video locally
+6. Allow:
    - camera access
    - local network access
 
@@ -205,6 +208,7 @@ Detailed docs:
 - `ARPoseUDPSender.swift`: ARKit + UDP sender core
 - `ARPositionApp.swift`: SwiftUI app entry
 - `ContentView.swift`: iPhone UI
+- `AppSettingsView.swift`: settings sheet for receiver and export options
 - `PositionViewModel.swift`: app state and sender wiring
 - `Info.plist`: iOS permission strings
 - `project.yml`: XcodeGen project spec
