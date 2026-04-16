@@ -25,6 +25,7 @@ targets:
       - path: PositionViewModel.swift
       - path: ARPoseUDPSender.swift
       - path: ARSessionVideoRecorder.swift
+      - path: PoseDataSessionRecorder.swift
     settings:
       base:
         GENERATE_INFOPLIST_FILE: NO

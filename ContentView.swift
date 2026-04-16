@@ -90,12 +90,46 @@ struct ContentView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
 
+                    if let lastPoseCSVURL = viewModel.lastPoseCSVURL {
+                        ShareLink(item: lastPoseCSVURL) {
+                            Label("Share Last Pose CSV", systemImage: "square.and.arrow.up")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 16)
+                        }
+                        .background(Color.purple)
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
+
+                    if let lastManifestURL = viewModel.lastManifestURL {
+                        ShareLink(item: lastManifestURL) {
+                            Label("Share Capture Manifest", systemImage: "doc.badge.gearshape")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 16)
+                        }
+                        .background(Color.indigo)
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
+
                     Text("Last saved video: \(viewModel.lastSavedVideoName)")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
+                    Text("Last capture session: \(viewModel.lastCaptureSessionName)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
                     Text(viewModel.videoAccessHint)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+
+                    Text("If a host is connected, pose data is streamed in real time. If not, pose CSV and capture metadata can still be exported later.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)

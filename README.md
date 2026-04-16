@@ -84,6 +84,7 @@ It is especially useful when you want a clean building block for:
 - local video recording to the app Documents folder
 - settings panel for receiver and export configuration
 - live X/Y/Z history chart
+- local pose CSV + manifest export for offline upload
 - SwiftUI control panel on iPhone
 - XcodeGen project spec included
 
@@ -165,6 +166,8 @@ On the iPhone:
    - camera access
    - local network access
 
+If a host is reachable, pose is streamed in real time. If you are not connected, the app still saves pose logs locally so they can be exported later.
+
 ### Verify
 
 The receiver should show:
@@ -179,6 +182,7 @@ Note:
 `approx_lat` is only meaningful when the iPhone and receiver clocks are reasonably synchronized.
 
 Recorded videos are stored in the app Documents directory. With file sharing enabled, they can be accessed later through Files or Finder.
+Pose data is also saved as CSV plus a JSON manifest, so offline capture sessions can be uploaded later.
 
 ## Sample Receiver Output
 
@@ -210,6 +214,7 @@ Detailed docs:
 - `ContentView.swift`: iPhone UI
 - `AppSettingsView.swift`: settings sheet for receiver and export options
 - `PositionViewModel.swift`: app state and sender wiring
+- `PoseDataSessionRecorder.swift`: local pose CSV + manifest recorder
 - `Info.plist`: iOS permission strings
 - `project.yml`: XcodeGen project spec
 - `udp_pose_receiver.py`: Python UDP receiver for macOS and Windows
@@ -262,6 +267,16 @@ For most lab and personal workflows, the expected setup is:
 - sign with your own Apple account
 - install to your own iPhone
 
+## Offline Capture Alignment
+
+When a recording session is captured locally, the app stores:
+
+- video as `mp4`
+- pose as `csv`
+- capture metadata as `json`
+
+The pose CSV includes frame timestamps and relative timestamps. The manifest also stores the video start offset relative to the pose session, so pose and video can be aligned during downstream processing.
+
 ## Notes For Robotics / UMI-Style Pipelines
 
 - Public Stanford `iPhoneVIO` examples often send a full `4x4` transform over Socket.IO.
@@ -275,6 +290,14 @@ For most lab and personal workflows, the expected setup is:
 ### Can I receive packets on Windows?
 
 Yes. The Python receiver works on both macOS and Windows.
+
+### Can I save data locally and upload it later?
+
+Yes. The app now stores pose CSV and capture metadata locally, and recorded videos can be exported later as well.
+
+### Are recorded videos time-aligned with pose data?
+
+Yes. The capture CSV stores frame and relative timestamps, and the manifest records the video start offset for downstream alignment.
 
 ### Can I install the iPhone app without a Mac?
 

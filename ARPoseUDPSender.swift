@@ -66,6 +66,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     var onSampleSent: ((PoseSample) -> Void)?
     var onError: ((Error) -> Void)?
     var onRecordingStatusChange: ((VideoRecordingStatus) -> Void)?
+    var onCaptureSessionSaved: ((PoseCaptureArtifact) -> Void)?
 
     private let coordinateSystem: CoordinateSystem
     private let payloadEncoding: PayloadEncoding
@@ -74,6 +75,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     private let networkQueue = DispatchQueue(label: "umi.pose.udp", qos: .userInitiated)
     private let zUpAlignment = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0))
     private let videoRecorder = ARSessionVideoRecorder()
+    private let poseSessionRecorder = PoseDataSessionRecorder()
 
     private var host: NWEndpoint.Host
     private var port: NWEndpoint.Port
@@ -86,6 +88,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     private var isSessionRunning = false
     private var isStreamingEnabled = false
     private var isRecordingEnabled = false
+    private var hasPoseCaptureSession = false
 
     init?(
         hostIP: String,
@@ -107,9 +110,14 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         session.delegate = self
         videoRecorder.onStatusChange = { [weak self] status in
             self?.arQueue.async {
+                if case .saved(let url) = status {
+                    self?.poseSessionRecorder.attachVideo(url: url)
+                }
+
                 if status.isTerminal {
                     self?.isRecordingEnabled = false
                     if self?.isStreamingEnabled == false {
+                        self?.finishPoseSessionIfNeeded()
                         self?.pauseSessionIfNeeded()
                     }
                 }
@@ -117,6 +125,11 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
             DispatchQueue.main.async {
                 self?.onRecordingStatusChange?(status)
+            }
+        }
+        poseSessionRecorder.onSessionSaved = { [weak self] artifact in
+            DispatchQueue.main.async {
+                self?.onCaptureSessionSaved?(artifact)
             }
         }
     }
@@ -147,6 +160,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         arQueue.async { [weak self] in
             guard let self else { return }
             if !self.isRecordingEnabled {
+                self.finishPoseSessionIfNeeded()
                 self.pauseSessionIfNeeded()
             }
         }
@@ -178,6 +192,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
         arQueue.async { [weak self] in
             self?.startSessionIfNeeded()
+            self?.ensurePoseSession()
             self?.videoRecorder.startRecording()
         }
     }
@@ -302,6 +317,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
     private func processFrame(transform: simd_float4x4, pixelBuffer: CVPixelBuffer, frameTimestamp: TimeInterval) {
         guard isStreamingEnabled || isRecordingEnabled else { return }
+        ensurePoseSession()
 
         if shouldResetOriginOnNextFrame || originTransform == nil {
             originTransform = transform
@@ -313,6 +329,15 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         } ?? transform
 
         let sample = makePoseSample(from: relativeTransform)
+        poseSessionRecorder.append(
+            sample: PoseSampleRecord(
+                sequence: sample.sequence,
+                senderTimestamp: sample.timestamp,
+                frameTimestamp: frameTimestamp,
+                position: sample.position,
+                orientation: sample.orientation
+            )
+        )
         let presentationTime = CMTime(seconds: frameTimestamp, preferredTimescale: 600)
 
         DispatchQueue.main.async { [sample, weak self] in
@@ -320,6 +345,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         }
 
         if isRecordingEnabled {
+            poseSessionRecorder.markVideoStarted(frameTimestamp: frameTimestamp)
             videoRecorder.appendFrame(pixelBuffer: pixelBuffer, at: presentationTime)
         }
 
@@ -346,6 +372,18 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
                 }
             )
         }
+    }
+
+    private func ensurePoseSession() {
+        guard !hasPoseCaptureSession else { return }
+        poseSessionRecorder.startSessionIfNeeded()
+        hasPoseCaptureSession = true
+    }
+
+    private func finishPoseSessionIfNeeded() {
+        guard hasPoseCaptureSession else { return }
+        poseSessionRecorder.finishSession()
+        hasPoseCaptureSession = false
     }
 
     private func makePoseSample(from transform: simd_float4x4) -> PoseSample {

@@ -68,6 +68,9 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var isRecordingVideo = false
     @Published private(set) var lastSavedVideoURL: URL?
     @Published private(set) var lastSavedVideoName = "No saved video yet"
+    @Published private(set) var lastPoseCSVURL: URL?
+    @Published private(set) var lastManifestURL: URL?
+    @Published private(set) var lastCaptureSessionName = "No capture exported yet"
 
     private let maxHistorySamples = 120
     private var sender: ARPoseUDPSender?
@@ -185,6 +188,19 @@ final class PositionViewModel: ObservableObject {
                 if case .saved(let url) = status {
                     self?.lastSavedVideoURL = url
                     self?.lastSavedVideoName = url.lastPathComponent
+                }
+            }
+        }
+
+        newSender?.onCaptureSessionSaved = { [weak self] artifact in
+            Task { @MainActor [weak self] in
+                self?.lastPoseCSVURL = artifact.poseCSVURL
+                self?.lastManifestURL = artifact.manifestURL
+                self?.lastCaptureSessionName = artifact.sessionDirectoryURL.lastPathComponent
+
+                if let videoURL = artifact.videoURL {
+                    self?.lastSavedVideoURL = videoURL
+                    self?.lastSavedVideoName = videoURL.lastPathComponent
                 }
             }
         }

@@ -59,6 +59,7 @@ Short version:
 7. allow local network access
 
 Recorded videos are saved inside the app Documents directory and can be exported later through Files or Finder file sharing.
+Pose CSV and capture manifest files are also saved locally, so offline sessions can be uploaded later even without a live host connection.
 
 ## Validation Checklist
 
