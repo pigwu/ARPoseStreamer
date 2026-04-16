@@ -398,7 +398,12 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             transform.columns.3.y,
             transform.columns.3.z
         )
-        let orientationYUp = simd_quatf(simd_float3x3(transform))
+        let rotationMatrix = simd_float3x3(
+            SIMD3(transform.columns.0.x, transform.columns.0.y, transform.columns.0.z),
+            SIMD3(transform.columns.1.x, transform.columns.1.y, transform.columns.1.z),
+            SIMD3(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z)
+        )
+        let orientationYUp = simd_quatf(rotationMatrix)
 
         let convertedPosition: SIMD3<Float>
         let convertedOrientation: simd_quatf
