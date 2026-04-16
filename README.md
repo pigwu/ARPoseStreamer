@@ -11,9 +11,10 @@ ARPoseStreamer is a lightweight iPhone ARKit app and cross-platform UDP receiver
 It is built for robotics, teleoperation, computer vision, and rapid lab experiments where you want:
 
 - no rendering stack
-- no SceneKit or RealityKit dependency
+- no 3D scene content or heavy rendering logic
 - a simple iPhone-to-host pose stream
 - easy debugging on macOS or Windows
+- live camera preview background in the app
 
 ## At A Glance
 
@@ -88,7 +89,7 @@ It is especially useful when you want a clean building block for:
 - settings panel for receiver and export configuration
 - hidden side menu for operational actions
 - capture history with renaming and re-upload prompts
-- live X/Y/Z history chart
+- 5-second relative 3D trajectory view
 - local pose CSV + manifest export for offline upload
 - SwiftUI control panel on iPhone
 - XcodeGen project spec included
@@ -181,6 +182,8 @@ On the iPhone:
 5. Allow:
    - camera access
    - local network access
+
+The app opens with a live AR camera background, and the main dashboard overlays status, coordinates, and the recent 3D trajectory.
 
 If a host is reachable, pose is streamed in real time. If you are not connected, the app still saves pose logs locally so they can be exported later.
 Multiple recording or streaming segments are saved as separate capture records, named by time by default.

@@ -25,6 +25,7 @@ targets:
       - path: Assets.xcassets
       - path: ARPositionApp.swift
       - path: ContentView.swift
+      - path: ARCameraPreviewView.swift
       - path: AppSettingsView.swift
       - path: CaptureHistoryView.swift
       - path: PositionViewModel.swift

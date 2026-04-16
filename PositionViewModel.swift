@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import simd
+import ARKit
 
 enum ReceiverPlatform: String, CaseIterable, Identifiable {
     case macOS
@@ -56,6 +57,7 @@ enum ReceiverPlatform: String, CaseIterable, Identifiable {
 
 struct PositionHistorySample: Identifiable {
     let id = UUID()
+    let timestamp: TimeInterval
     let sequence: Int
     let x: Double
     let y: Double
@@ -107,6 +109,10 @@ final class PositionViewModel: ObservableObject {
     private let captureLibraryStore = CaptureLibraryStore()
     private let captureUploadService = CaptureUploadService()
     private var sender: ARPoseUDPSender?
+
+    var previewSession: ARSession? {
+        sender?.session
+    }
 
     var targetSummary: String {
         "\(receiverPlatform.displayName) receiver at \(hostIP):\(hostPort)"
@@ -181,6 +187,16 @@ final class PositionViewModel: ObservableObject {
         if isSending {
             stopSending()
         }
+
+        sender?.stopPreview()
+    }
+
+    func activatePreview() {
+        if sender == nil {
+            configureSender()
+        }
+
+        sender?.startPreview()
     }
 
     func formattedValue(for value: Float) -> String {
@@ -371,6 +387,7 @@ final class PositionViewModel: ObservableObject {
     private func appendHistory(_ sample: ARPoseUDPSender.PoseSample) {
         positionHistory.append(
             PositionHistorySample(
+                timestamp: sample.timestamp,
                 sequence: Int(sample.sequence),
                 x: Double(sample.position.x),
                 y: Double(sample.position.y),

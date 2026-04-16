@@ -135,7 +135,10 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     }
 
     deinit {
-        stop()
+        connection?.cancel()
+        connection = nil
+        session.pause()
+        session.delegate = nil
     }
 
     func start() {
@@ -145,6 +148,12 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             self?.connectUDP()
         }
 
+        arQueue.async { [weak self] in
+            self?.startSessionIfNeeded()
+        }
+    }
+
+    func startPreview() {
         arQueue.async { [weak self] in
             self?.startSessionIfNeeded()
         }
@@ -161,6 +170,15 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             guard let self else { return }
             if !self.isRecordingEnabled {
                 self.finishPoseSessionIfNeeded()
+                self.pauseSessionIfNeeded()
+            }
+        }
+    }
+
+    func stopPreview() {
+        arQueue.async { [weak self] in
+            guard let self else { return }
+            if !self.isStreamingEnabled && !self.isRecordingEnabled {
                 self.pauseSessionIfNeeded()
             }
         }
@@ -322,9 +340,6 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     }
 
     private func processFrame(transform: simd_float4x4, pixelBuffer: CVPixelBuffer, frameTimestamp: TimeInterval) {
-        guard isStreamingEnabled || isRecordingEnabled else { return }
-        ensurePoseSession()
-
         if shouldResetOriginOnNextFrame || originTransform == nil {
             originTransform = transform
             shouldResetOriginOnNextFrame = false
@@ -335,19 +350,23 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         } ?? transform
 
         let sample = makePoseSample(from: relativeTransform)
-        poseSessionRecorder.append(
-            sample: PoseSampleRecord(
-                sequence: sample.sequence,
-                senderTimestamp: sample.timestamp,
-                frameTimestamp: frameTimestamp,
-                position: sample.position,
-                orientation: sample.orientation
-            )
-        )
         let presentationTime = CMTime(seconds: frameTimestamp, preferredTimescale: 600)
 
         DispatchQueue.main.async { [sample, weak self] in
             self?.onSampleUpdated?(sample)
+        }
+
+        if isStreamingEnabled || isRecordingEnabled {
+            ensurePoseSession()
+            poseSessionRecorder.append(
+                sample: PoseSampleRecord(
+                    sequence: sample.sequence,
+                    senderTimestamp: sample.timestamp,
+                    frameTimestamp: frameTimestamp,
+                    position: sample.position,
+                    orientation: sample.orientation
+                )
+            )
         }
 
         if isRecordingEnabled {

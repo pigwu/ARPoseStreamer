@@ -27,7 +27,7 @@ struct AppSettingsView: View {
                 }
 
                 Section("Display") {
-                    Toggle("Show Position Chart", isOn: $viewModel.showPositionChart)
+                    Toggle("Show 3D Trajectory", isOn: $viewModel.showPositionChart)
                 }
 
                 Section("Receiver Help") {
