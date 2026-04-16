@@ -199,6 +199,10 @@ final class PositionViewModel: ObservableObject {
         sender?.startPreview()
     }
 
+    func deactivatePreviewIfPossible() {
+        sender?.stopPreview()
+    }
+
     func formattedValue(for value: Float) -> String {
         String(format: "%.3f m", value)
     }
@@ -394,6 +398,9 @@ final class PositionViewModel: ObservableObject {
                 z: Double(sample.position.z)
             )
         )
+
+        let cutoff = sample.timestamp - 5.0
+        positionHistory.removeAll { $0.timestamp < cutoff }
 
         if positionHistory.count > maxHistorySamples {
             positionHistory.removeFirst(positionHistory.count - maxHistorySamples)

@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = PositionViewModel()
     @State private var isShowingSettings = false
     @State private var isShowingHistory = false
@@ -67,6 +68,16 @@ struct ContentView: View {
         .task {
             viewModel.activatePreview()
         }
+        .onChange(of: scenePhase) { _, newPhase in
+            switch newPhase {
+            case .active:
+                viewModel.activatePreview()
+            case .inactive, .background:
+                viewModel.deactivatePreviewIfPossible()
+            @unknown default:
+                break
+            }
+        }
         .onDisappear {
             viewModel.shutdown()
         }
@@ -112,11 +123,15 @@ private struct BottomDashboard: View {
     var body: some View {
         VStack(spacing: 12) {
             HStack(spacing: 8) {
-                StatusChip(text: viewModel.sendStatus)
-                StatusChip(text: viewModel.recordingStatus)
+                if viewModel.sendStatus != "Idle" {
+                    StatusChip(text: viewModel.sendStatus)
+                }
+                if viewModel.recordingStatus != "Video idle" {
+                    StatusChip(text: viewModel.recordingStatus)
+                }
             }
 
-            if !viewModel.uploadStatus.isEmpty {
+            if viewModel.uploadStatus != "Upload idle" {
                 StatusChip(text: viewModel.uploadStatus)
             }
 
