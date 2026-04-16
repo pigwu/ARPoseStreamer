@@ -170,7 +170,8 @@ private struct SidebarDrawer: View {
                 .foregroundStyle(.secondary)
         }
         .padding(20)
-        .frame(width: 300, maxHeight: .infinity, alignment: .topLeading)
+        .frame(width: 300)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(Color(.systemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .padding(.leading, 12)
