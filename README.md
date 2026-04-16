@@ -6,6 +6,8 @@
 
 ARPoseStreamer is a lightweight iPhone ARKit app and cross-platform UDP receiver for streaming relative camera pose to a host machine.
 
+![ARPoseStreamer workflow](docs/assets/overview.svg)
+
 It is built for robotics, teleoperation, computer vision, and rapid lab experiments where you want:
 
 - no rendering stack
