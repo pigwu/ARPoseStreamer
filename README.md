@@ -235,8 +235,11 @@ Detailed docs:
 - `CaptureLibraryStore.swift`: persistent metadata for all capture sessions
 - `CaptureUploadService.swift`: HTTP upload client for stored captures
 - `capture_upload_server.py`: cross-platform HTTP upload server for macOS/Windows
+- `run_upload_server_mac.sh`: macOS helper launcher for uploads
+- `run_upload_server_windows.ps1`: Windows helper launcher for uploads
 - `PositionViewModel.swift`: app state and sender wiring
 - `PoseDataSessionRecorder.swift`: local pose CSV + manifest recorder
+- `Assets.xcassets`: app icon resources
 - `Info.plist`: iOS permission strings
 - `project.yml`: XcodeGen project spec
 - `udp_pose_receiver.py`: Python UDP receiver for macOS and Windows
