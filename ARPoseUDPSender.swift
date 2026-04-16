@@ -191,9 +191,15 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         isRecordingEnabled = true
 
         arQueue.async { [weak self] in
-            self?.startSessionIfNeeded()
-            self?.ensurePoseSession()
-            self?.videoRecorder.startRecording()
+            guard let self else { return }
+            self.startSessionIfNeeded()
+
+            if self.hasPoseCaptureSession {
+                self.finishPoseSessionIfNeeded()
+            }
+
+            self.ensurePoseSession()
+            self.videoRecorder.startRecording()
         }
     }
 

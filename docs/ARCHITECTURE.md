@@ -53,6 +53,7 @@ Responsibilities:
 Primary file:
 
 - `udp_pose_receiver.py`
+- `capture_upload_server.py`
 
 Responsibilities:
 
@@ -60,6 +61,7 @@ Responsibilities:
 - decode binary or CSV packets
 - show stream rate and packet-drop hints
 - optionally log incoming pose to CSV
+- receive uploaded capture files over HTTP
 
 ## Design Goals
 

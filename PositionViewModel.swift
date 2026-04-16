@@ -26,6 +26,15 @@ enum ReceiverPlatform: String, CaseIterable, Identifiable {
         }
     }
 
+    var uploadServerCommand: String {
+        switch self {
+        case .macOS:
+            return "python3 capture_upload_server.py --host 0.0.0.0 --port 8000"
+        case .windows:
+            return "py capture_upload_server.py --host 0.0.0.0 --port 8000"
+        }
+    }
+
     var ipHint: String {
         switch self {
         case .macOS:
@@ -53,14 +62,6 @@ struct PositionHistorySample: Identifiable {
     let z: Double
 }
 
-struct CaptureShareRequest: Identifiable {
-    let id = UUID()
-    let recordID: UUID
-    let kind: CaptureUploadKind
-    let itemURLs: [URL]
-    let title: String
-}
-
 struct ReuploadPrompt: Identifiable {
     let id = UUID()
     let recordID: UUID
@@ -77,6 +78,9 @@ final class PositionViewModel: ObservableObject {
     @Published var hostPort: String {
         didSet { UserDefaults.standard.set(hostPort, forKey: Self.hostPortKey) }
     }
+    @Published var uploadPort: String {
+        didSet { UserDefaults.standard.set(uploadPort, forKey: Self.uploadPortKey) }
+    }
     @Published var receiverPlatform: ReceiverPlatform {
         didSet { UserDefaults.standard.set(receiverPlatform.rawValue, forKey: Self.receiverPlatformKey) }
     }
@@ -87,6 +91,7 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var position: SIMD3<Float> = .zero
     @Published private(set) var positionHistory: [PositionHistorySample] = []
     @Published private(set) var sendStatus = "Idle"
+    @Published private(set) var uploadStatus = "Upload idle"
     @Published private(set) var latestPacketSummary = "No packets yet"
     @Published private(set) var recordingStatus = VideoRecordingStatus.idle.message
     @Published private(set) var isSending = false
@@ -95,11 +100,12 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var lastSavedVideoName = "No saved video yet"
     @Published private(set) var lastCaptureSessionName = "No capture exported yet"
     @Published private(set) var captureRecords: [CaptureRecord] = []
-    @Published var activeShareRequest: CaptureShareRequest?
+    @Published private(set) var uploadingRecordIDs: Set<UUID> = []
     @Published var pendingReuploadPrompt: ReuploadPrompt?
 
     private let maxHistorySamples = 120
     private let captureLibraryStore = CaptureLibraryStore()
+    private let captureUploadService = CaptureUploadService()
     private var sender: ARPoseUDPSender?
 
     var targetSummary: String {
@@ -110,10 +116,15 @@ final class PositionViewModel: ObservableObject {
         receiverPlatform.videoAccessHint
     }
 
+    var uploadServerSummary: String {
+        "HTTP upload server at \(hostIP):\(uploadPort)"
+    }
+
     init() {
         let defaults = UserDefaults.standard
         hostIP = defaults.string(forKey: Self.hostIPKey) ?? "192.168.1.10"
         hostPort = defaults.string(forKey: Self.hostPortKey) ?? "5555"
+        uploadPort = defaults.string(forKey: Self.uploadPortKey) ?? "8000"
         receiverPlatform = ReceiverPlatform(rawValue: defaults.string(forKey: Self.receiverPlatformKey) ?? ReceiverPlatform.macOS.rawValue) ?? .macOS
         showPositionChart = defaults.object(forKey: Self.showPositionChartKey) as? Bool ?? true
         captureRecords = captureLibraryStore.loadRecords().sorted { $0.createdAt > $1.createdAt }
@@ -122,7 +133,10 @@ final class PositionViewModel: ObservableObject {
     }
 
     func startSending() {
-        guard let port = normalizedPort() else { return }
+        guard let port = normalizedPort(hostPort) else {
+            sendStatus = "Invalid UDP port"
+            return
+        }
 
         if sender == nil {
             configureSender()
@@ -182,6 +196,10 @@ final class PositionViewModel: ObservableObject {
             .sorted { $0.createdAt > $1.createdAt }
     }
 
+    func isUploading(_ record: CaptureRecord) -> Bool {
+        uploadingRecordIDs.contains(record.id)
+    }
+
     func requestVideoUpload(for record: CaptureRecord) {
         guard captureLibraryStore.urlForVideo(record: record) != nil else { return }
 
@@ -193,7 +211,7 @@ final class PositionViewModel: ObservableObject {
                 previousUploadDate: previousUploadDate
             )
         } else {
-            startUpload(for: record, kind: .video)
+            upload(record: record, kind: .video)
         }
     }
 
@@ -206,52 +224,72 @@ final class PositionViewModel: ObservableObject {
                 previousUploadDate: previousUploadDate
             )
         } else {
-            startUpload(for: record, kind: .pose)
+            upload(record: record, kind: .pose)
         }
     }
 
     func confirmReupload(_ prompt: ReuploadPrompt) {
         guard let record = captureRecords.first(where: { $0.id == prompt.recordID }) else { return }
         pendingReuploadPrompt = nil
-        startUpload(for: record, kind: prompt.kind)
+        upload(record: record, kind: prompt.kind)
     }
 
     func cancelReuploadPrompt() {
         pendingReuploadPrompt = nil
     }
 
-    func markShareCompleted(for request: CaptureShareRequest, completed: Bool) {
-        guard completed else { return }
-
-        captureRecords = captureLibraryStore
-            .markUploaded(id: request.recordID, kind: request.kind)
-            .sorted { $0.createdAt > $1.createdAt }
-    }
-
-    private func startUpload(for record: CaptureRecord, kind: CaptureUploadKind) {
-        let request: CaptureShareRequest?
-
-        switch kind {
-        case .video:
-            guard let videoURL = captureLibraryStore.urlForVideo(record: record) else { return }
-            request = CaptureShareRequest(
-                recordID: record.id,
-                kind: .video,
-                itemURLs: [videoURL],
-                title: "Upload Video"
-            )
-        case .pose:
-            let poseURL = captureLibraryStore.urlForPoseCSV(record: record)
-            let manifestURL = captureLibraryStore.urlForManifest(record: record)
-            request = CaptureShareRequest(
-                recordID: record.id,
-                kind: .pose,
-                itemURLs: [poseURL, manifestURL],
-                title: "Upload Pose Data"
-            )
+    private func upload(record: CaptureRecord, kind: CaptureUploadKind) {
+        guard let uploadPort = normalizedPort(uploadPort) else {
+            uploadStatus = "Invalid upload port"
+            return
         }
 
-        activeShareRequest = request
+        let descriptors: [UploadDescriptor]
+        switch kind {
+        case .video:
+            guard let videoURL = captureLibraryStore.urlForVideo(record: record) else {
+                uploadStatus = "This capture has no video file"
+                return
+            }
+            descriptors = [UploadDescriptor(fileURL: videoURL, component: "video")]
+        case .pose:
+            descriptors = [
+                UploadDescriptor(fileURL: captureLibraryStore.urlForPoseCSV(record: record), component: "pose_csv"),
+                UploadDescriptor(fileURL: captureLibraryStore.urlForManifest(record: record), component: "manifest")
+            ]
+        }
+
+        guard let baseURL = URL(string: "http://\(hostIP):\(uploadPort)") else {
+            uploadStatus = "Invalid upload server URL"
+            return
+        }
+
+        uploadingRecordIDs.insert(record.id)
+        uploadStatus = "Uploading \(kind == .video ? "video" : "pose") for \(record.displayName)..."
+
+        Task {
+            do {
+                try await captureUploadService.upload(
+                    descriptors: descriptors,
+                    captureID: record.sessionDirectoryName,
+                    serverBaseURL: baseURL,
+                    kind: kind
+                )
+
+                await MainActor.run {
+                    uploadingRecordIDs.remove(record.id)
+                    captureRecords = captureLibraryStore
+                        .markUploaded(id: record.id, kind: kind)
+                        .sorted { $0.createdAt > $1.createdAt }
+                    uploadStatus = "Uploaded \(kind == .video ? "video" : "pose") for \(record.displayName)"
+                }
+            } catch {
+                await MainActor.run {
+                    uploadingRecordIDs.remove(record.id)
+                    uploadStatus = "Upload failed: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     private func configureSender() {
@@ -326,13 +364,8 @@ final class PositionViewModel: ObservableObject {
         }
     }
 
-    private func normalizedPort() -> UInt16? {
-        guard let port = UInt16(hostPort) else {
-            sendStatus = "Invalid port. Use a number between 0 and 65535."
-            return nil
-        }
-
-        return port
+    private func normalizedPort(_ value: String) -> UInt16? {
+        UInt16(value)
     }
 
     private func appendHistory(_ sample: ARPoseUDPSender.PoseSample) {
@@ -352,6 +385,7 @@ final class PositionViewModel: ObservableObject {
 
     private static let hostIPKey = "ARPoseStreamer.hostIP"
     private static let hostPortKey = "ARPoseStreamer.hostPort"
+    private static let uploadPortKey = "ARPoseStreamer.uploadPort"
     private static let receiverPlatformKey = "ARPoseStreamer.receiverPlatform"
     private static let showPositionChartKey = "ARPoseStreamer.showPositionChart"
 }

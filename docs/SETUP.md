@@ -12,6 +12,12 @@ Run:
 python3 udp_pose_receiver.py --host 0.0.0.0 --port 5555 --encoding binary
 ```
 
+Optional real upload server:
+
+```bash
+python3 capture_upload_server.py --host 0.0.0.0 --port 8000
+```
+
 Find your IP:
 
 ```bash
@@ -24,6 +30,12 @@ Run:
 
 ```powershell
 py udp_pose_receiver.py --host 0.0.0.0 --port 5555 --encoding binary
+```
+
+Optional real upload server:
+
+```powershell
+py capture_upload_server.py --host 0.0.0.0 --port 8000
 ```
 
 Find your IP:
@@ -61,6 +73,7 @@ Short version:
 Recorded videos are saved inside the app Documents directory and can be exported later through Files or Finder file sharing.
 Pose CSV and capture manifest files are also saved locally, so offline sessions can be uploaded later even without a live host connection.
 Each capture segment is stored as a separate historical record and can be renamed later in the app.
+For actual uploads, open `Past Records` and use the upload buttons after you start the host upload server.
 
 ## Validation Checklist
 

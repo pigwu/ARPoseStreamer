@@ -15,6 +15,7 @@ struct CaptureHistoryView: View {
                 ForEach(viewModel.captureRecords) { record in
                     CaptureRecordCard(
                         record: record,
+                        isUploading: viewModel.isUploading(record),
                         onRename: { newName in
                             viewModel.renameCapture(record, to: newName)
                         },
@@ -32,14 +33,6 @@ struct CaptureHistoryView: View {
         }
         .listStyle(.plain)
         .navigationTitle("Past Records")
-        .sheet(item: $viewModel.activeShareRequest, onDismiss: {
-            viewModel.activeShareRequest = nil
-        }) { request in
-            ActivityShareSheet(activityItems: request.itemURLs.map { $0 as Any }) { completed in
-                viewModel.markShareCompleted(for: request, completed: completed)
-                viewModel.activeShareRequest = nil
-            }
-        }
         .alert(item: $viewModel.pendingReuploadPrompt) { prompt in
             Alert(
                 title: Text(prompt.title),
@@ -57,6 +50,7 @@ struct CaptureHistoryView: View {
 
 private struct CaptureRecordCard: View {
     let record: CaptureRecord
+    let isUploading: Bool
     let onRename: (String) -> Void
     let onUploadVideo: () -> Void
     let onUploadPose: () -> Void
@@ -65,11 +59,13 @@ private struct CaptureRecordCard: View {
 
     init(
         record: CaptureRecord,
+        isUploading: Bool,
         onRename: @escaping (String) -> Void,
         onUploadVideo: @escaping () -> Void,
         onUploadPose: @escaping () -> Void
     ) {
         self.record = record
+        self.isUploading = isUploading
         self.onRename = onRename
         self.onUploadVideo = onUploadVideo
         self.onUploadPose = onUploadPose
@@ -108,17 +104,27 @@ private struct CaptureRecordCard: View {
                     onUploadVideo()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(record.videoFileName == nil)
+                .disabled(record.videoFileName == nil || isUploading)
 
                 Button("Upload Pose") {
                     onUploadPose()
                 }
                 .buttonStyle(.bordered)
+                .disabled(isUploading)
+            }
+
+            if isUploading {
+                Text("Uploading...")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(16)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .onChange(of: record.displayName) { _, newValue in
+            draftName = newValue
+        }
     }
 
     private func uploadStatusText(for kind: CaptureUploadKind) -> String {

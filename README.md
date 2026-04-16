@@ -79,6 +79,7 @@ It is especially useful when you want a clean building block for:
 - resettable relative origin
 - 60 Hz oriented streaming pipeline
 - UDP output to a configurable host IP on port `5555`
+- HTTP upload to a configurable host IP and upload port
 - compact pose packets
 - cross-platform Python receiver
 - local video recording to the app Documents folder
@@ -124,6 +125,12 @@ Optional packet logging:
 python3 udp_pose_receiver.py --encoding binary --csv-log logs/pose.csv
 ```
 
+For real uploads on macOS:
+
+```bash
+python3 capture_upload_server.py --host 0.0.0.0 --port 8000
+```
+
 ### Find The Host IP
 
 On macOS:
@@ -139,6 +146,12 @@ ipconfig
 ```
 
 Use the IPv4 address of the machine running the receiver.
+
+For Windows uploads:
+
+```powershell
+py capture_upload_server.py --host 0.0.0.0 --port 8000
+```
 
 ### Install The iPhone App
 
@@ -169,6 +182,7 @@ On the iPhone:
 
 If a host is reachable, pose is streamed in real time. If you are not connected, the app still saves pose logs locally so they can be exported later.
 Multiple recording or streaming segments are saved as separate capture records, named by time by default.
+For real file uploads, run the HTTP upload server on the host machine and use the `Past Records` page inside the app.
 
 ### Verify
 
@@ -217,7 +231,8 @@ Detailed docs:
 - `AppSettingsView.swift`: settings sheet for receiver and export options
 - `CaptureHistoryView.swift`: past records, rename, and re-upload UI
 - `CaptureLibraryStore.swift`: persistent metadata for all capture sessions
-- `ActivityShareSheet.swift`: upload / export share bridge
+- `CaptureUploadService.swift`: HTTP upload client for stored captures
+- `capture_upload_server.py`: cross-platform HTTP upload server for macOS/Windows
 - `PositionViewModel.swift`: app state and sender wiring
 - `PoseDataSessionRecorder.swift`: local pose CSV + manifest recorder
 - `Info.plist`: iOS permission strings
@@ -295,6 +310,10 @@ The pose CSV includes frame timestamps and relative timestamps. The manifest als
 ### Can I receive packets on Windows?
 
 Yes. The Python receiver works on both macOS and Windows.
+
+### Can I do real uploads over Bluetooth?
+
+Not in the Mac/Windows workflow used by this repository. For cross-platform host support, the app uses HTTP over the local network for uploads and UDP for real-time pose streaming.
 
 ### Can I save data locally and upload it later?
 

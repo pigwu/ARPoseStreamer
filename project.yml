@@ -25,12 +25,12 @@ targets:
       - path: ContentView.swift
       - path: AppSettingsView.swift
       - path: CaptureHistoryView.swift
-      - path: ActivityShareSheet.swift
       - path: PositionViewModel.swift
       - path: ARPoseUDPSender.swift
       - path: ARSessionVideoRecorder.swift
       - path: PoseDataSessionRecorder.swift
       - path: CaptureLibraryStore.swift
+      - path: CaptureUploadService.swift
     settings:
       base:
         GENERATE_INFOPLIST_FILE: NO

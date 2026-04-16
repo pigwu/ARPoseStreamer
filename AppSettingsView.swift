@@ -16,6 +16,9 @@ struct AppSettingsView: View {
                     TextField("Port", text: $viewModel.hostPort)
                         .keyboardType(.numberPad)
 
+                    TextField("Upload Port", text: $viewModel.uploadPort)
+                        .keyboardType(.numberPad)
+
                     Picker("Receiver OS", selection: $viewModel.receiverPlatform) {
                         ForEach(ReceiverPlatform.allCases) { platform in
                             Text(platform.displayName).tag(platform)
@@ -37,7 +40,15 @@ struct AppSettingsView: View {
                         .font(.footnote.monospaced())
                         .textSelection(.enabled)
 
+                    Text(viewModel.receiverPlatform.uploadServerCommand)
+                        .font(.footnote.monospaced())
+                        .textSelection(.enabled)
+
                     Text(viewModel.receiverPlatform.ipHint)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text("Recommended upload method: HTTP over local network. Bluetooth is not used for Mac/Windows upload in this app.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

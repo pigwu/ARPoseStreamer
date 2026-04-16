@@ -19,10 +19,14 @@ struct ContentView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
 
-                        Text(viewModel.recordingStatus)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text(viewModel.recordingStatus)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text(viewModel.uploadStatus)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                     VStack(spacing: 20) {
