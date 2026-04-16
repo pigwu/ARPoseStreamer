@@ -53,8 +53,11 @@ Short version:
 1. open the app
 2. enter the host IP
 3. tap `Start Streaming`
-4. allow camera access
-5. allow local network access
+4. optionally tap `Start Video Recording`
+5. allow camera access
+6. allow local network access
+
+Recorded videos are saved inside the app Documents directory and can be exported later through Files or Finder file sharing.
 
 ## Validation Checklist
 

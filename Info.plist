@@ -6,9 +6,13 @@
     <string>This app uses the camera for AR pose tracking and relative position estimation.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>This app uses the local network to stream AR pose data to a remote receiver.</string>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
     <key>UIRequiredDeviceCapabilities</key>
     <array>
         <string>arkit</string>
     </array>
+    <key>UIFileSharingEnabled</key>
+    <true/>
 </dict>
 </plist>

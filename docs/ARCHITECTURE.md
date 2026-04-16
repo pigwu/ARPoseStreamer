@@ -44,6 +44,7 @@ Responsibilities:
 - convert pose to the chosen coordinate convention
 - package pose into a compact UDP payload
 - stream to the configured host IP on port `5555`
+- optionally record camera video to a local MP4 file
 
 ## Host Side
 

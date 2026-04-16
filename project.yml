@@ -23,6 +23,7 @@ targets:
       - path: ContentView.swift
       - path: PositionViewModel.swift
       - path: ARPoseUDPSender.swift
+      - path: ARSessionVideoRecorder.swift
     settings:
       base:
         GENERATE_INFOPLIST_FILE: NO

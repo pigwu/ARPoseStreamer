@@ -21,6 +21,10 @@ struct ContentView: View {
                 Text(viewModel.sendStatus)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+
+                Text(viewModel.recordingStatus)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
@@ -66,6 +70,25 @@ struct ContentView: View {
                 .background(Color(.secondarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
 
+                Button(viewModel.isRecordingVideo ? "Stop & Save Video" : "Start Video Recording") {
+                    if viewModel.isRecordingVideo {
+                        viewModel.stopRecording()
+                    } else {
+                        viewModel.startRecording()
+                    }
+                }
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+                .background(viewModel.isRecordingVideo ? Color.orange : Color.green)
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+                Text("Recorded videos are stored in the app's Documents folder and can be exported through Files or Finder file sharing.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
                 Text("The app will request camera and local network access for AR tracking and UDP pose streaming.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -74,7 +97,7 @@ struct ContentView: View {
         }
         .padding(24)
         .onDisappear {
-            viewModel.stopSending()
+            viewModel.shutdown()
         }
     }
 }

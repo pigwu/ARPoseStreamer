@@ -81,6 +81,7 @@ It is especially useful when you want a clean building block for:
 - UDP output to a configurable host IP on port `5555`
 - compact pose packets
 - cross-platform Python receiver
+- local video recording to the app Documents folder
 - SwiftUI control panel on iPhone
 - XcodeGen project spec included
 
@@ -156,7 +157,8 @@ On the iPhone:
 1. Open the app
 2. Enter the receiver IP
 3. Tap `Start Streaming`
-4. Allow:
+4. Use `Start Video Recording` if you want to save camera video locally
+5. Allow:
    - camera access
    - local network access
 
@@ -172,6 +174,8 @@ The receiver should show:
 Note:
 
 `approx_lat` is only meaningful when the iPhone and receiver clocks are reasonably synchronized.
+
+Recorded videos are stored in the app Documents directory. With file sharing enabled, they can be accessed later through Files or Finder.
 
 ## Sample Receiver Output
 
@@ -208,6 +212,7 @@ Detailed docs:
 - `run_receiver_mac.sh`: macOS helper launcher
 - `run_receiver_windows.ps1`: Windows helper launcher
 - `INSTALL_IPHONE_APP.md`: iPhone installation guide
+- `ARSessionVideoRecorder.swift`: local MP4 recording helper
 
 ## Packet Format
 

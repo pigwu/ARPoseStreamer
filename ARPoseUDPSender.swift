@@ -1,6 +1,7 @@
 import Foundation
 import ARKit
 import Network
+import CoreMedia
 import simd
 
 final class ARPoseUDPSender: NSObject, ARSessionDelegate {
@@ -61,8 +62,10 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
     let session = ARSession()
 
+    var onSampleUpdated: ((PoseSample) -> Void)?
     var onSampleSent: ((PoseSample) -> Void)?
     var onError: ((Error) -> Void)?
+    var onRecordingStatusChange: ((VideoRecordingStatus) -> Void)?
 
     private let coordinateSystem: CoordinateSystem
     private let payloadEncoding: PayloadEncoding
@@ -70,6 +73,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     private let arQueue = DispatchQueue(label: "umi.pose.ar", qos: .userInitiated)
     private let networkQueue = DispatchQueue(label: "umi.pose.udp", qos: .userInitiated)
     private let zUpAlignment = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0))
+    private let videoRecorder = ARSessionVideoRecorder()
 
     private var host: NWEndpoint.Host
     private var port: NWEndpoint.Port
@@ -79,6 +83,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     private var sequenceNumber: UInt32 = 0
     private var shouldResetOriginOnNextFrame = true
     private var isConnectionReady = false
+    private var isSessionRunning = false
+    private var isStreamingEnabled = false
+    private var isRecordingEnabled = false
 
     init?(
         hostIP: String,
@@ -98,6 +105,23 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         super.init()
 
         session.delegate = self
+        videoRecorder.onStatusChange = { [weak self] status in
+            self?.arQueue.async {
+                switch status {
+                case .idle, .saved, .failed:
+                    self?.isRecordingEnabled = false
+                    if self?.isStreamingEnabled == false {
+                        self?.pauseSessionIfNeeded()
+                    }
+                case .recording, .saving:
+                    break
+                }
+            }
+
+            DispatchQueue.main.async {
+                self?.onRecordingStatusChange?(status)
+            }
+        }
     }
 
     deinit {
@@ -105,24 +129,29 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     }
 
     func start() {
+        isStreamingEnabled = true
+
         networkQueue.async { [weak self] in
             self?.connectUDP()
         }
 
         arQueue.async { [weak self] in
-            self?.startSession()
+            self?.startSessionIfNeeded()
         }
     }
 
     func stop() {
-        arQueue.async { [weak self] in
-            self?.session.pause()
-        }
+        isStreamingEnabled = false
 
         networkQueue.async { [weak self] in
-            self?.isConnectionReady = false
-            self?.connection?.cancel()
-            self?.connection = nil
+            self?.disconnectUDP()
+        }
+
+        arQueue.async { [weak self] in
+            guard let self else { return }
+            if !self.isRecordingEnabled {
+                self.pauseSessionIfNeeded()
+            }
         }
     }
 
@@ -147,17 +176,49 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         }
     }
 
+    func startRecording() {
+        isRecordingEnabled = true
+
+        arQueue.async { [weak self] in
+            self?.startSessionIfNeeded()
+            self?.videoRecorder.startRecording()
+        }
+    }
+
+    func stopRecording() {
+        isRecordingEnabled = false
+
+        arQueue.async { [weak self] in
+            guard let self else { return }
+            self.videoRecorder.stopRecording { [weak self] _ in
+                guard let self else { return }
+
+                self.arQueue.async {
+                    if !self.isStreamingEnabled {
+                        self.pauseSessionIfNeeded()
+                    }
+                }
+            }
+        }
+    }
+
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard case .normal = frame.camera.trackingState else { return }
         let cameraTransform = frame.camera.transform
         let frameTimestamp = frame.timestamp
+        let capturedImage = frame.capturedImage
 
         arQueue.async { [weak self] in
-            self?.processFrame(transform: cameraTransform, frameTimestamp: frameTimestamp)
+            self?.processFrame(
+                transform: cameraTransform,
+                pixelBuffer: capturedImage,
+                frameTimestamp: frameTimestamp
+            )
         }
     }
 
-    private func startSession() {
+    private func startSessionIfNeeded() {
+        guard !isSessionRunning else { return }
         guard ARWorldTrackingConfiguration.isSupported else { return }
 
         let configuration = ARWorldTrackingConfiguration()
@@ -167,6 +228,13 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         configuration.videoFormat = preferredVideoFormat()
 
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        isSessionRunning = true
+    }
+
+    private func pauseSessionIfNeeded() {
+        guard isSessionRunning else { return }
+        session.pause()
+        isSessionRunning = false
     }
 
     private func preferredVideoFormat() -> ARConfiguration.VideoFormat {
@@ -197,6 +265,8 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     }
 
     private func connectUDP(port: NWEndpoint.Port? = nil) {
+        guard connection == nil else { return }
+
         let parameters = NWParameters.udp
         parameters.allowLocalEndpointReuse = true
         parameters.includePeerToPeer = true
@@ -227,8 +297,14 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         connection.start(queue: networkQueue)
     }
 
-    private func processFrame(transform: simd_float4x4, frameTimestamp: TimeInterval) {
-        guard frameTimestamp - lastSentTimestamp >= minimumSendInterval * 0.95 else { return }
+    private func disconnectUDP() {
+        isConnectionReady = false
+        connection?.cancel()
+        connection = nil
+    }
+
+    private func processFrame(transform: simd_float4x4, pixelBuffer: CVPixelBuffer, frameTimestamp: TimeInterval) {
+        guard isStreamingEnabled || isRecordingEnabled else { return }
 
         if shouldResetOriginOnNextFrame || originTransform == nil {
             originTransform = transform
@@ -240,6 +316,19 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         } ?? transform
 
         let sample = makePoseSample(from: relativeTransform)
+        let presentationTime = CMTime(seconds: frameTimestamp, preferredTimescale: 600)
+
+        DispatchQueue.main.async { [sample, weak self] in
+            self?.onSampleUpdated?(sample)
+        }
+
+        if isRecordingEnabled {
+            videoRecorder.appendFrame(pixelBuffer: pixelBuffer, at: presentationTime)
+        }
+
+        guard isStreamingEnabled else { return }
+        guard frameTimestamp - lastSentTimestamp >= minimumSendInterval * 0.95 else { return }
+
         let payload = encode(sample)
         lastSentTimestamp = frameTimestamp
 
