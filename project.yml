@@ -7,6 +7,7 @@ settings:
   base:
     PRODUCT_BUNDLE_IDENTIFIER: com.example.ARPoseStreamer
     INFOPLIST_FILE: Info.plist
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     SWIFT_VERSION: 5.9
     IPHONEOS_DEPLOYMENT_TARGET: 17.0
     TARGETED_DEVICE_FAMILY: 1
@@ -19,13 +20,17 @@ targets:
     platform: iOS
     deploymentTarget: "17.0"
     sources:
+      - path: Assets.xcassets
       - path: ARPositionApp.swift
       - path: ContentView.swift
       - path: AppSettingsView.swift
+      - path: CaptureHistoryView.swift
+      - path: ActivityShareSheet.swift
       - path: PositionViewModel.swift
       - path: ARPoseUDPSender.swift
       - path: ARSessionVideoRecorder.swift
       - path: PoseDataSessionRecorder.swift
+      - path: CaptureLibraryStore.swift
     settings:
       base:
         GENERATE_INFOPLIST_FILE: NO

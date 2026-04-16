@@ -4,35 +4,39 @@ import Charts
 struct ContentView: View {
     @StateObject private var viewModel = PositionViewModel()
     @State private var isShowingSettings = false
+    @State private var isShowingHistory = false
+    @State private var isSidebarPresented = false
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 22) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(viewModel.targetSummary)
-                        .font(.headline)
+            ZStack(alignment: .leading) {
+                VStack(spacing: 22) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(viewModel.targetSummary)
+                            .font(.headline)
 
-                    Text(viewModel.sendStatus)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        Text(viewModel.sendStatus)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
 
-                    Text(viewModel.recordingStatus)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                        Text(viewModel.recordingStatus)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                VStack(spacing: 20) {
-                    AxisValueView(axis: "X", value: viewModel.formattedValue(for: viewModel.position.x))
-                    AxisValueView(axis: "Y", value: viewModel.formattedValue(for: viewModel.position.y))
-                    AxisValueView(axis: "Z", value: viewModel.formattedValue(for: viewModel.position.z))
-                }
-                .frame(maxWidth: .infinity)
+                    VStack(spacing: 20) {
+                        AxisValueView(axis: "X", value: viewModel.formattedValue(for: viewModel.position.x))
+                        AxisValueView(axis: "Y", value: viewModel.formattedValue(for: viewModel.position.y))
+                        AxisValueView(axis: "Z", value: viewModel.formattedValue(for: viewModel.position.z))
+                    }
+                    .frame(maxWidth: .infinity)
 
-                PositionChartView(samples: viewModel.positionHistory)
-                    .frame(height: 220)
+                    if viewModel.showPositionChart {
+                        PositionChartView(samples: viewModel.positionHistory)
+                            .frame(height: 220)
+                    }
 
-                VStack(spacing: 12) {
                     Text(viewModel.latestPacketSummary)
                         .font(.footnote.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -41,123 +45,132 @@ struct ContentView: View {
                         .background(Color(.secondarySystemBackground))
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-                    Button(viewModel.isSending ? "Stop Streaming" : "Start Streaming") {
-                        if viewModel.isSending {
-                            viewModel.stopSending()
-                        } else {
-                            viewModel.startSending()
-                        }
-                    }
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(viewModel.isSending ? Color.red : Color.accentColor)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-
-                    Button("Reset Origin") {
-                        viewModel.resetOrigin()
-                    }
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-
-                    Button(viewModel.isRecordingVideo ? "Stop & Save Video" : "Start Video Recording") {
-                        if viewModel.isRecordingVideo {
-                            viewModel.stopRecording()
-                        } else {
-                            viewModel.startRecording()
-                        }
-                    }
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(viewModel.isRecordingVideo ? Color.orange : Color.green)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-
-                    if let lastSavedVideoURL = viewModel.lastSavedVideoURL {
-                        ShareLink(item: lastSavedVideoURL) {
-                            Label("Share Last Video", systemImage: "square.and.arrow.up")
-                                .font(.headline)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 16)
-                        }
-                        .background(Color.blue)
-                        .foregroundStyle(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    }
-
-                    if let lastPoseCSVURL = viewModel.lastPoseCSVURL {
-                        ShareLink(item: lastPoseCSVURL) {
-                            Label("Share Last Pose CSV", systemImage: "square.and.arrow.up")
-                                .font(.headline)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 16)
-                        }
-                        .background(Color.purple)
-                        .foregroundStyle(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    }
-
-                    if let lastManifestURL = viewModel.lastManifestURL {
-                        ShareLink(item: lastManifestURL) {
-                            Label("Share Capture Manifest", systemImage: "doc.badge.gearshape")
-                                .font(.headline)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 16)
-                        }
-                        .background(Color.indigo)
-                        .foregroundStyle(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    }
-
-                    Text("Last saved video: \(viewModel.lastSavedVideoName)")
+                    Text("Latest capture: \(viewModel.lastCaptureSessionName)")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                    Text("Last capture session: \(viewModel.lastCaptureSessionName)")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Text(viewModel.videoAccessHint)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-
-                    Text("If a host is connected, pose data is streamed in real time. If not, pose CSV and capture metadata can still be exported later.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-
-                    Text("The app requests camera access for AR tracking and local network access for UDP pose streaming.")
+                    Text("Use the side menu for streaming, recording, history, and settings.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
-            }
-            .padding(24)
-            .navigationTitle("ARPoseStreamer")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        isShowingSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
+                .padding(24)
+                .navigationTitle("ARPoseStreamer")
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                isSidebarPresented.toggle()
+                            }
+                        } label: {
+                            Image(systemName: "line.3.horizontal")
+                        }
                     }
+                }
+
+                if isSidebarPresented {
+                    Color.black.opacity(0.25)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                isSidebarPresented = false
+                            }
+                        }
+
+                    SidebarDrawer(
+                        viewModel: viewModel,
+                        onOpenHistory: {
+                            isShowingHistory = true
+                            isSidebarPresented = false
+                        },
+                        onOpenSettings: {
+                            isShowingSettings = true
+                            isSidebarPresented = false
+                        }
+                    )
+                    .transition(.move(edge: .leading))
                 }
             }
             .sheet(isPresented: $isShowingSettings) {
                 AppSettingsView(viewModel: viewModel)
             }
+            .sheet(isPresented: $isShowingHistory) {
+                NavigationStack {
+                    CaptureHistoryView(viewModel: viewModel)
+                }
+            }
         }
         .onDisappear {
             viewModel.shutdown()
         }
+    }
+}
+
+private struct SidebarDrawer: View {
+    @ObservedObject var viewModel: PositionViewModel
+    let onOpenHistory: () -> Void
+    let onOpenSettings: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Menu")
+                .font(.title2.bold())
+
+            Button(viewModel.isSending ? "Stop Streaming" : "Start Streaming") {
+                if viewModel.isSending {
+                    viewModel.stopSending()
+                } else {
+                    viewModel.startSending()
+                }
+            }
+            .buttonStyle(.borderedProminent)
+
+            Button(viewModel.isRecordingVideo ? "Stop & Save Video" : "Start Video Recording") {
+                if viewModel.isRecordingVideo {
+                    viewModel.stopRecording()
+                } else {
+                    viewModel.startRecording()
+                }
+            }
+            .buttonStyle(.borderedProminent)
+
+            Button("Reset Origin") {
+                viewModel.resetOrigin()
+            }
+            .buttonStyle(.bordered)
+
+            Divider()
+
+            Button("Past Records") {
+                onOpenHistory()
+            }
+            .buttonStyle(.bordered)
+
+            Button("Settings") {
+                onOpenSettings()
+            }
+            .buttonStyle(.bordered)
+
+            if let lastSavedVideoURL = viewModel.lastSavedVideoURL {
+                ShareLink(item: lastSavedVideoURL) {
+                    Label("Share Last Video", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Spacer()
+
+            Text(viewModel.videoAccessHint)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .padding(20)
+        .frame(width: 300, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.leading, 12)
+        .padding(.vertical, 12)
     }
 }
 

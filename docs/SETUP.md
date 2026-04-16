@@ -51,15 +51,16 @@ Short version:
 ## iPhone App Usage
 
 1. open the app
-2. open the settings sheet
-3. enter the host IP and choose the receiver OS
-4. tap `Start Streaming`
-5. optionally tap `Start Video Recording`
+2. open the side menu
+3. open the settings sheet
+4. enter the host IP and choose the receiver OS
+5. start streaming or video recording from the side menu
 6. allow camera access
 7. allow local network access
 
 Recorded videos are saved inside the app Documents directory and can be exported later through Files or Finder file sharing.
 Pose CSV and capture manifest files are also saved locally, so offline sessions can be uploaded later even without a live host connection.
+Each capture segment is stored as a separate historical record and can be renamed later in the app.
 
 ## Validation Checklist
 

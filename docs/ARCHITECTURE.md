@@ -46,6 +46,7 @@ Responsibilities:
 - stream to the configured host IP on port `5555`
 - optionally record camera video to a local MP4 file
 - store pose CSV and capture manifest for offline export
+- register each capture in a persistent local history library
 
 ## Host Side
 

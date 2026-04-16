@@ -83,6 +83,8 @@ It is especially useful when you want a clean building block for:
 - cross-platform Python receiver
 - local video recording to the app Documents folder
 - settings panel for receiver and export configuration
+- hidden side menu for operational actions
+- capture history with renaming and re-upload prompts
 - live X/Y/Z history chart
 - local pose CSV + manifest export for offline upload
 - SwiftUI control panel on iPhone
@@ -158,15 +160,15 @@ Short version:
 On the iPhone:
 
 1. Open the app
-2. Open `Settings`
+2. Use the side menu button to open settings
 3. Enter the receiver IP and choose the receiver OS
-4. Tap `Start Streaming`
-5. Use `Start Video Recording` if you want to save camera video locally
-6. Allow:
+4. Start streaming or recording from the side menu
+5. Allow:
    - camera access
    - local network access
 
 If a host is reachable, pose is streamed in real time. If you are not connected, the app still saves pose logs locally so they can be exported later.
+Multiple recording or streaming segments are saved as separate capture records, named by time by default.
 
 ### Verify
 
@@ -213,6 +215,9 @@ Detailed docs:
 - `ARPositionApp.swift`: SwiftUI app entry
 - `ContentView.swift`: iPhone UI
 - `AppSettingsView.swift`: settings sheet for receiver and export options
+- `CaptureHistoryView.swift`: past records, rename, and re-upload UI
+- `CaptureLibraryStore.swift`: persistent metadata for all capture sessions
+- `ActivityShareSheet.swift`: upload / export share bridge
 - `PositionViewModel.swift`: app state and sender wiring
 - `PoseDataSessionRecorder.swift`: local pose CSV + manifest recorder
 - `Info.plist`: iOS permission strings

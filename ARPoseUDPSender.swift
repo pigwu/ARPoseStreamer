@@ -116,8 +116,8 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
                 if status.isTerminal {
                     self?.isRecordingEnabled = false
+                    self?.finishPoseSessionIfNeeded()
                     if self?.isStreamingEnabled == false {
-                        self?.finishPoseSessionIfNeeded()
                         self?.pauseSessionIfNeeded()
                     }
                 }

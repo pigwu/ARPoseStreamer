@@ -23,6 +23,10 @@ struct AppSettingsView: View {
                     }
                 }
 
+                Section("Display") {
+                    Toggle("Show Position Chart", isOn: $viewModel.showPositionChart)
+                }
+
                 Section("Receiver Help") {
                     LabeledContent("Target") {
                         Text(viewModel.targetSummary)
@@ -46,6 +50,12 @@ struct AppSettingsView: View {
                     Text("Saved files appear in the app Documents directory.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+
+                Section("Capture Library") {
+                    NavigationLink("Manage Past Records") {
+                        CaptureHistoryView(viewModel: viewModel)
+                    }
                 }
             }
             .navigationTitle("Settings")
