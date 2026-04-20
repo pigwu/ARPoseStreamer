@@ -7,20 +7,34 @@ import struct
 import subprocess
 import sys
 import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal, Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QClipboard
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QRadioButton, QButtonGroup, QLineEdit, QGroupBox
+    QPushButton, QLabel, QRadioButton, QButtonGroup, QLineEdit, QGroupBox, QCheckBox
 )
 
 # UDP packet format (from udp_pose_receiver.py)
 FLOAT32_PACKET = struct.Struct("<Id7f")
+
+
+def get_local_ip():
+    """Get local IP address"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
 
 def decode_packet(packet: bytes, encoding: str):
     """Decode UDP packet (reused from udp_pose_receiver.py)"""
@@ -37,6 +51,94 @@ def decode_packet(packet: bytes, encoding: str):
     sequence = int(fields[0])
     values = [float(x) for x in fields[1:]]
     return (sequence, *values)
+
+
+class UploadHandler(BaseHTTPRequestHandler):
+    """HTTP upload handler for receiving files from iPhone"""
+    upload_root = Path("uploads")
+
+    def do_POST(self):
+        if self.path != "/upload":
+            self.send_error(404, "Unknown endpoint")
+            return
+
+        capture_id = self.headers.get("X-Capture-ID")
+        component = self.headers.get("X-Capture-Component")
+        original_filename = self.headers.get("X-Original-Filename")
+        upload_kind = self.headers.get("X-Upload-Kind")
+        content_length = self.headers.get("Content-Length")
+
+        if not capture_id or not component or not original_filename or not upload_kind or not content_length:
+            self.send_error(400, "Missing required headers")
+            return
+
+        try:
+            body_length = int(content_length)
+        except ValueError:
+            self.send_error(400, "Invalid Content-Length")
+            return
+
+        safe_capture_id = capture_id.replace("/", "_").replace("\\", "_")
+        safe_filename = Path(original_filename).name
+        target_dir = self.upload_root / safe_capture_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path = target_dir / f"{component}__{safe_filename}"
+        file_path.write_bytes(self.rfile.read(body_length))
+
+        response = {
+            "ok": True,
+            "capture_id": safe_capture_id,
+            "component": component,
+            "upload_kind": upload_kind,
+            "saved_to": str(file_path.resolve()),
+        }
+
+        import json
+        encoded = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, format, *args):
+        # Suppress log messages
+        pass
+
+
+class UploadServerThread(QThread):
+    """Background thread for HTTP upload server"""
+    server_started = pyqtSignal(str)  # Emits server URL
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, port=8000, upload_dir="uploads"):
+        super().__init__()
+        self.port = port
+        self.upload_dir = Path(upload_dir)
+        self.server = None
+        self.running = False
+
+    def run(self):
+        try:
+            UploadHandler.upload_root = self.upload_dir
+            self.upload_dir.mkdir(parents=True, exist_ok=True)
+
+            self.server = HTTPServer(('0.0.0.0', self.port), UploadHandler)
+            self.running = True
+
+            local_ip = get_local_ip()
+            self.server_started.emit(f"http://{local_ip}:{self.port}")
+
+            while self.running:
+                self.server.handle_request()
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+    def stop(self):
+        self.running = False
+        if self.server:
+            self.server.shutdown()
 
 
 class RingBuffer:
@@ -337,14 +439,17 @@ class ControlPanel(QWidget):
     """Control panel widget"""
     start_clicked = pyqtSignal()
     stop_clicked = pyqtSignal()
+    upload_server_toggled = pyqtSignal(bool)  # True = start, False = stop
     reset_origin_clicked = pyqtSignal()
     open_folder_clicked = pyqtSignal()
     mode_changed = pyqtSignal(bool)  # True = all history, False = last 5s
 
-    def __init__(self, host="0.0.0.0", port=5555):
+    def __init__(self, host="0.0.0.0", port=5555, upload_port=8000):
         super().__init__()
         self.host = host
         self.port = port
+        self.upload_port = upload_port
+        self.local_ip = get_local_ip()
         self.init_ui()
 
     def init_ui(self):
@@ -352,31 +457,48 @@ class ControlPanel(QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(15)
 
-        # Connection group
-        conn_group = QGroupBox("Connection")
-        conn_layout = QVBoxLayout()
+        # Local IP Info group
+        ip_group = QGroupBox("Local IP (for iPhone)")
+        ip_layout = QVBoxLayout()
 
-        self.host_input = QLineEdit(self.host)
-        self.host_input.setPlaceholderText("Host (e.g., 0.0.0.0)")
-        conn_layout.addWidget(QLabel("Host:"))
-        conn_layout.addWidget(self.host_input)
+        ip_container = QHBoxLayout()
+        self.ip_label = QLabel(self.local_ip)
+        self.ip_label.setStyleSheet("color: #00d9ff; font-size: 16px; font-weight: bold;")
+        ip_container.addWidget(self.ip_label)
 
-        self.port_input = QLineEdit(str(self.port))
-        self.port_input.setPlaceholderText("Port (e.g., 5555)")
-        conn_layout.addWidget(QLabel("Port:"))
-        conn_layout.addWidget(self.port_input)
+        self.copy_ip_btn = QPushButton("Copy")
+        self.copy_ip_btn.setFixedWidth(60)
+        self.copy_ip_btn.clicked.connect(self.copy_ip_to_clipboard)
+        ip_container.addWidget(self.copy_ip_btn)
 
-        self.start_btn = QPushButton("Start")
-        self.start_btn.clicked.connect(self.start_clicked.emit)
-        conn_layout.addWidget(self.start_btn)
+        ip_layout.addLayout(ip_container)
 
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.clicked.connect(self.stop_clicked.emit)
-        self.stop_btn.setEnabled(False)
-        conn_layout.addWidget(self.stop_btn)
+        # Port info
+        port_info = QLabel(f"UDP Port: {self.port}\nUpload Port: {self.upload_port}")
+        port_info.setStyleSheet("color: #a0a0a0; font-size: 11px;")
+        ip_layout.addWidget(port_info)
 
-        conn_group.setLayout(conn_layout)
-        layout.addWidget(conn_group)
+        ip_group.setLayout(ip_layout)
+        layout.addWidget(ip_group)
+
+        # Services group
+        services_group = QGroupBox("Services")
+        services_layout = QVBoxLayout()
+
+        # UDP Receiver checkbox
+        self.udp_checkbox = QCheckBox("Enable UDP Receiver")
+        self.udp_checkbox.setChecked(False)
+        self.udp_checkbox.stateChanged.connect(self.on_udp_toggled)
+        services_layout.addWidget(self.udp_checkbox)
+
+        # Upload Server checkbox
+        self.upload_checkbox = QCheckBox("Enable Upload Server")
+        self.upload_checkbox.setChecked(False)
+        self.upload_checkbox.stateChanged.connect(self.on_upload_toggled)
+        services_layout.addWidget(self.upload_checkbox)
+
+        services_group.setLayout(services_layout)
+        layout.addWidget(services_group)
 
         # Display mode group
         display_group = QGroupBox("Display Mode")
@@ -416,25 +538,44 @@ class ControlPanel(QWidget):
         layout.addStretch()
 
         self.setLayout(layout)
-        self.setFixedWidth(250)
+        self.setFixedWidth(280)
+
+    def copy_ip_to_clipboard(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.local_ip)
+        # Visual feedback
+        original_text = self.copy_ip_btn.text()
+        self.copy_ip_btn.setText("Copied!")
+        QTimer.singleShot(1000, lambda: self.copy_ip_btn.setText(original_text))
+
+    def on_udp_toggled(self, state):
+        if state == Qt.CheckState.Checked.value:
+            self.start_clicked.emit()
+        else:
+            self.stop_clicked.emit()
+
+    def on_upload_toggled(self, state):
+        self.upload_server_toggled.emit(state == Qt.CheckState.Checked.value)
 
     def get_connection_params(self):
-        return self.host_input.text(), int(self.port_input.text())
+        return self.host, self.port
 
-    def set_running(self, running):
-        self.start_btn.setEnabled(not running)
-        self.stop_btn.setEnabled(running)
-        self.host_input.setEnabled(not running)
-        self.port_input.setEnabled(not running)
+    def set_udp_running(self, running):
+        self.udp_checkbox.setChecked(running)
+
+    def set_upload_running(self, running):
+        self.upload_checkbox.setChecked(running)
 
 
 class MainWindow(QMainWindow):
     """Main application window"""
-    def __init__(self, host="0.0.0.0", port=5555):
+    def __init__(self, host="0.0.0.0", port=5555, upload_port=8000):
         super().__init__()
         self.host = host
         self.port = port
+        self.upload_port = upload_port
         self.receiver_thread = None
+        self.upload_server_thread = None
         self.trajectory_manager = TrajectoryManager()
         self.current_position = None
 
@@ -465,9 +606,10 @@ class MainWindow(QMainWindow):
         top_layout.setSpacing(0)
 
         # Control panel
-        self.control_panel = ControlPanel(self.host, self.port)
+        self.control_panel = ControlPanel(self.host, self.port, self.upload_port)
         self.control_panel.start_clicked.connect(self.start_receiver)
         self.control_panel.stop_clicked.connect(self.stop_receiver)
+        self.control_panel.upload_server_toggled.connect(self.toggle_upload_server)
         self.control_panel.reset_origin_clicked.connect(self.reset_origin)
         self.control_panel.open_folder_clicked.connect(self.open_data_folder)
         self.control_panel.mode_changed.connect(self.change_display_mode)
@@ -552,6 +694,20 @@ class MainWindow(QMainWindow):
                 border-radius: 9px;
                 background-color: #00d9ff;
             }
+            QCheckBox {
+                spacing: 5px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 2px solid #0f3460;
+                border-radius: 4px;
+                background-color: #1a1a2e;
+            }
+            QCheckBox::indicator:checked {
+                border: 2px solid #00d9ff;
+                background-color: #00d9ff;
+            }
             QLabel {
                 color: #eaeaea;
             }
@@ -569,7 +725,7 @@ class MainWindow(QMainWindow):
         self.receiver_thread.error_occurred.connect(self.on_error)
         self.receiver_thread.start()
 
-        self.control_panel.set_running(True)
+        self.control_panel.set_udp_running(True)
 
     def stop_receiver(self):
         if self.receiver_thread is not None:
@@ -577,8 +733,39 @@ class MainWindow(QMainWindow):
             self.receiver_thread.wait()
             self.receiver_thread = None
 
-        self.control_panel.set_running(False)
+        self.control_panel.set_udp_running(False)
         self.stats_panel.set_disconnected()
+
+    def toggle_upload_server(self, enable):
+        if enable:
+            self.start_upload_server()
+        else:
+            self.stop_upload_server()
+
+    def start_upload_server(self):
+        if self.upload_server_thread is not None:
+            return
+
+        self.upload_server_thread = UploadServerThread(self.upload_port, "uploads")
+        self.upload_server_thread.server_started.connect(self.on_upload_server_started)
+        self.upload_server_thread.error_occurred.connect(self.on_upload_server_error)
+        self.upload_server_thread.start()
+
+    def stop_upload_server(self):
+        if self.upload_server_thread is not None:
+            self.upload_server_thread.stop()
+            self.upload_server_thread.wait()
+            self.upload_server_thread = None
+
+        self.control_panel.set_upload_running(False)
+
+    def on_upload_server_started(self, url):
+        print(f"[INFO] Upload server started: {url}")
+        self.control_panel.set_upload_running(True)
+
+    def on_upload_server_error(self, error_msg):
+        print(f"[ERROR] Upload server error: {error_msg}")
+        self.control_panel.set_upload_running(False)
 
     def on_packet_received(self, data):
         position = data['position']
@@ -615,6 +802,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.stop_receiver()
+        self.stop_upload_server()
         event.accept()
 
 
@@ -638,6 +826,7 @@ def main():
     parser = argparse.ArgumentParser(description="ARPose 3D Visualizer")
     parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind to")
     parser.add_argument("--port", type=int, default=5555, help="UDP port to bind to")
+    parser.add_argument("--upload-port", type=int, default=8000, help="HTTP upload server port")
     args = parser.parse_args()
 
     # Enable high DPI support
@@ -647,7 +836,7 @@ def main():
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(sys.argv)
-    window = MainWindow(args.host, args.port)
+    window = MainWindow(args.host, args.port, args.upload_port)
     window.show()
     sys.exit(app.exec())
 
