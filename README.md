@@ -102,7 +102,7 @@ It is especially useful when you want a clean building block for:
 
 ### 3D Visualizer (Recommended)
 
-The project now includes a cross-platform 3D visualizer with real-time trajectory display.
+The project now includes a cross-platform 3D visualizer with real-time trajectory display and integrated upload server.
 
 **Install dependencies:**
 
@@ -132,7 +132,24 @@ Or use the launcher scripts:
 - Time-gradient colors (cyan → red)
 - Live stats: FPS, packet count, dropped packets, latency
 - Resettable coordinate origin
+- **Local IP display with copy button** (for iPhone setup)
+- **Integrated upload server** (no separate command needed)
+- **Checkbox controls** for UDP receiver and upload server
 - Dark theme UI
+
+**Building Standalone Executable:**
+
+You can build a standalone .exe (Windows) or .app (macOS) that doesn't require Python:
+
+```bash
+# Windows
+.\build_windows.ps1
+
+# macOS
+./build_macos.sh
+```
+
+See [BUILD.md](BUILD.md) for detailed instructions.
 
 ### Command-Line Receiver
 
