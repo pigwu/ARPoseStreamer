@@ -78,25 +78,65 @@ It is especially useful when you want a clean building block for:
 
 ## Highlights
 
+- **3D Visualizer**: Real-time trajectory visualization with PyQt6 and OpenGL
+- **Dual display modes**: View all history or last 5 seconds
+- **Time-gradient colors**: Trajectory colors fade from cyan (new) to red (old)
+- **Live monitoring**: FPS, packet count, dropped packets, latency display
+- **Cross-platform**: Works on macOS and Windows
 - ARKit world tracking
-- resettable relative origin
+- Resettable relative origin
 - 60 Hz oriented streaming pipeline
 - UDP output to a configurable host IP on port `5555`
 - HTTP upload to a configurable host IP and upload port
-- compact pose packets
-- cross-platform Python receiver
-- local video recording to the app Documents folder
-- settings panel for receiver and export configuration
-- hidden side menu for operational actions
-- capture history with renaming and re-upload prompts
-- 5-second relative 3D trajectory view
-- local pose CSV + manifest export for offline upload
+- Compact pose packets
+- Cross-platform Python receiver (CLI and GUI)
+- Local video recording to the app Documents folder
+- Settings panel for receiver and export configuration
+- Hidden side menu for operational actions
+- Capture history with renaming and re-upload prompts
+- Local pose CSV + manifest export for offline upload
 - SwiftUI control panel on iPhone
 - XcodeGen project spec included
 
 ## Quick Start
 
-### Receiver
+### 3D Visualizer (Recommended)
+
+The project now includes a cross-platform 3D visualizer with real-time trajectory display.
+
+**Install dependencies:**
+
+```bash
+pip install -r requirements_visualizer.txt
+```
+
+**Run the visualizer:**
+
+On macOS:
+```bash
+python3 udp_pose_visualizer.py
+```
+
+On Windows:
+```powershell
+py udp_pose_visualizer.py
+```
+
+Or use the launcher scripts:
+- macOS: `./run_visualizer_mac.sh`
+- Windows: `.\run_visualizer_windows.ps1`
+
+**Features:**
+- Real-time 3D trajectory visualization
+- Display modes: all history or last 5 seconds
+- Time-gradient colors (cyan → red)
+- Live stats: FPS, packet count, dropped packets, latency
+- Resettable coordinate origin
+- Dark theme UI
+
+### Command-Line Receiver
+
+For headless operation or scripting, use the command-line receiver:
 
 On macOS:
 
@@ -245,9 +285,13 @@ Detailed docs:
 - `Assets.xcassets`: app icon resources
 - `Info.plist`: iOS permission strings
 - `project.yml`: XcodeGen project spec
-- `udp_pose_receiver.py`: Python UDP receiver for macOS and Windows
-- `run_receiver_mac.sh`: macOS helper launcher
-- `run_receiver_windows.ps1`: Windows helper launcher
+- `udp_pose_receiver.py`: Python UDP receiver (CLI) for macOS and Windows
+- `udp_pose_visualizer.py`: Python 3D visualizer (GUI) with real-time trajectory display
+- `requirements_visualizer.txt`: Python dependencies for the 3D visualizer
+- `run_receiver_mac.sh`: macOS helper launcher for CLI receiver
+- `run_receiver_windows.ps1`: Windows helper launcher for CLI receiver
+- `run_visualizer_mac.sh`: macOS helper launcher for 3D visualizer
+- `run_visualizer_windows.ps1`: Windows helper launcher for 3D visualizer
 - `INSTALL_IPHONE_APP.md`: iPhone installation guide
 - `ARSessionVideoRecorder.swift`: local MP4 recording helper
 
