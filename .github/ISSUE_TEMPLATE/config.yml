@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Setup and installation guide
+    url: https://github.com/pigwu/ARPoseStreamer/blob/main/INSTALL_IPHONE_APP.md
+    about: Check the iPhone installation guide before filing setup questions.
