@@ -104,6 +104,24 @@ It is especially useful when you want a clean building block for:
 
 The project now includes a cross-platform 3D visualizer with real-time trajectory display and integrated upload server.
 
+#### Option 1: Download Pre-built Executable (No Python Required)
+
+For users who only need to receive pose data without building the iPhone app:
+
+**Windows:**
+1. Download `ARPose Visualizer.exe` from the [Releases](https://github.com/pigwu/ARPoseStreamer/releases) page
+2. Double-click to run (no installation needed)
+3. If Windows Defender shows a warning, click "More info" → "Run anyway"
+
+**macOS:**
+1. Download `ARPose Visualizer.app` from the [Releases](https://github.com/pigwu/ARPoseStreamer/releases) page
+2. Right-click the app and select "Open" (first time only)
+3. If macOS shows a security warning, go to System Preferences → Security & Privacy → "Open Anyway"
+
+The standalone executable includes all dependencies and doesn't require Python installation.
+
+#### Option 2: Run from Source (For Developers)
+
 **Install dependencies:**
 
 ```bash
@@ -130,7 +148,7 @@ Or use the launcher scripts:
 - Real-time 3D trajectory visualization
 - Display modes: all history or last 5 seconds
 - Time-gradient colors (cyan → red)
-- Live stats: FPS, packet count, dropped packets, latency
+- Live stats: FPS, packet count, dropped packets, latency, uploads
 - Resettable coordinate origin
 - **Local IP display with copy button** (for iPhone setup)
 - **Integrated upload server** (no separate command needed)

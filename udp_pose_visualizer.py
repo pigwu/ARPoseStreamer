@@ -56,6 +56,7 @@ def decode_packet(packet: bytes, encoding: str):
 class UploadHandler(BaseHTTPRequestHandler):
     """HTTP upload handler for receiving files from iPhone"""
     upload_root = Path("uploads")
+    file_received_callback = None
 
     def do_POST(self):
         if self.path != "/upload":
@@ -86,6 +87,10 @@ class UploadHandler(BaseHTTPRequestHandler):
         file_path = target_dir / f"{component}__{safe_filename}"
         file_path.write_bytes(self.rfile.read(body_length))
 
+        # Notify callback
+        if self.file_received_callback:
+            self.file_received_callback(safe_capture_id, safe_filename)
+
         response = {
             "ok": True,
             "capture_id": safe_capture_id,
@@ -110,6 +115,7 @@ class UploadHandler(BaseHTTPRequestHandler):
 class UploadServerThread(QThread):
     """Background thread for HTTP upload server"""
     server_started = pyqtSignal(str)  # Emits server URL
+    file_received = pyqtSignal(str, str)  # Emits (capture_id, filename)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, port=8000, upload_dir="uploads"):
@@ -122,9 +128,11 @@ class UploadServerThread(QThread):
     def run(self):
         try:
             UploadHandler.upload_root = self.upload_dir
+            UploadHandler.file_received_callback = self.on_file_received
             self.upload_dir.mkdir(parents=True, exist_ok=True)
 
             self.server = HTTPServer(('0.0.0.0', self.port), UploadHandler)
+            self.server.timeout = 0.5  # Non-blocking with timeout
             self.running = True
 
             local_ip = get_local_ip()
@@ -135,10 +143,16 @@ class UploadServerThread(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
 
+    def on_file_received(self, capture_id, filename):
+        self.file_received.emit(capture_id, filename)
+
     def stop(self):
         self.running = False
         if self.server:
-            self.server.shutdown()
+            try:
+                self.server.server_close()
+            except:
+                pass
 
 
 class RingBuffer:
@@ -407,9 +421,18 @@ class StatsPanel(QWidget):
         self.pos_label.setStyleSheet("color: #00d9ff;")
         layout.addWidget(self.pos_label)
 
+        layout.addSpacing(20)
+
+        # Upload status
+        self.upload_label = QLabel("Uploads: 0")
+        self.upload_label.setStyleSheet("color: #a0a0a0;")
+        layout.addWidget(self.upload_label)
+
         self.setLayout(layout)
         self.setStyleSheet("background-color: #16213e;")
         self.setFixedHeight(40)
+
+        self.upload_count = 0
 
     def update_stats(self, stats):
         self.status_label.setText("● Connected")
@@ -433,6 +456,13 @@ class StatsPanel(QWidget):
     def set_disconnected(self):
         self.status_label.setText("● Disconnected")
         self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
+
+    def increment_upload_count(self, filename):
+        self.upload_count += 1
+        self.upload_label.setText(f"Uploads: {self.upload_count}")
+        self.upload_label.setStyleSheet("color: #00d9ff;")
+        # Flash effect
+        QTimer.singleShot(500, lambda: self.upload_label.setStyleSheet("color: #a0a0a0;"))
 
 
 class ControlPanel(QWidget):
@@ -748,6 +778,7 @@ class MainWindow(QMainWindow):
 
         self.upload_server_thread = UploadServerThread(self.upload_port, "uploads")
         self.upload_server_thread.server_started.connect(self.on_upload_server_started)
+        self.upload_server_thread.file_received.connect(self.on_file_received)
         self.upload_server_thread.error_occurred.connect(self.on_upload_server_error)
         self.upload_server_thread.start()
 
@@ -762,6 +793,10 @@ class MainWindow(QMainWindow):
     def on_upload_server_started(self, url):
         print(f"[INFO] Upload server started: {url}")
         self.control_panel.set_upload_running(True)
+
+    def on_file_received(self, capture_id, filename):
+        print(f"[INFO] File received: {capture_id}/{filename}")
+        self.stats_panel.increment_upload_count(filename)
 
     def on_upload_server_error(self, error_msg):
         print(f"[ERROR] Upload server error: {error_msg}")

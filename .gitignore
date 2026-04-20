@@ -26,3 +26,8 @@ logs/
 
 # VS Code
 .vscode/
+
+# PyInstaller
+dist/
+build/
+*.spec
