@@ -618,6 +618,22 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def check_dependencies():
+    """Check if all required dependencies are available"""
+    try:
+        import OpenGL
+        from PyQt6.QtWidgets import QApplication
+        import pyqtgraph.opengl as gl
+        return True
+    except ImportError as e:
+        print(f"[ERROR] Missing dependency: {e}")
+        print("\nPlease install dependencies with:")
+        print("  pip install -r requirements_visualizer.txt")
+        print("\nOr run the dependency checker:")
+        print("  python check_visualizer_deps.py")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="ARPose 3D Visualizer")
     parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind to")
@@ -637,4 +653,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if not check_dependencies():
+        sys.exit(1)
     main()

@@ -1,12 +1,24 @@
 import argparse
 import csv
+import signal
 import socket
 import struct
+import sys
 import time
 from pathlib import Path
 
 
 FLOAT32_PACKET = struct.Struct("<Id7f")
+
+# Global flag for graceful shutdown
+running = True
+
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    global running
+    print("\n[INFO] Shutting down receiver...")
+    running = False
 
 
 def decode_packet(packet: bytes, encoding: str) -> tuple[int, float, float, float, float, float, float, float, float]:
@@ -26,6 +38,8 @@ def decode_packet(packet: bytes, encoding: str) -> tuple[int, float, float, floa
 
 
 def main() -> None:
+    global running
+
     parser = argparse.ArgumentParser(description="Receive AR pose packets over UDP.")
     parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind to.")
     parser.add_argument("--port", type=int, default=5555, help="UDP port to bind to.")
@@ -43,8 +57,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Register signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.host, args.port))
+    sock.settimeout(0.5)  # Add timeout to allow checking running flag
 
     csv_file = None
     csv_writer = None
@@ -71,13 +89,28 @@ def main() -> None:
     prev_recv_time = None
     prev_sequence = None
     print(f"Listening for UDP pose packets on {args.host}:{args.port} ({args.encoding})")
+    print("Press Ctrl+C to stop\n")
 
     try:
-        while True:
-            packet, address = sock.recvfrom(4096)
+        while running:
+            try:
+                packet, address = sock.recvfrom(4096)
+            except socket.timeout:
+                continue  # Check running flag and continue
+            except Exception as e:
+                if running:
+                    print(f"Error receiving packet: {e}")
+                continue
+
             recv_time = time.time()
             monotonic_recv_time = time.monotonic()
-            sequence, sender_time, x, y, z, qx, qy, qz, qw = decode_packet(packet, args.encoding)
+
+            try:
+                sequence, sender_time, x, y, z, qx, qy, qz, qw = decode_packet(packet, args.encoding)
+            except Exception as e:
+                if running:
+                    print(f"Error decoding packet: {e}")
+                continue
             approx_latency_ms = max(0.0, (recv_time - sender_time) * 1000.0)
 
             if prev_recv_time is None:
@@ -101,9 +134,12 @@ def main() -> None:
                 csv_writer.writerow([f"{recv_time:.6f}", sequence, sender_time, x, y, z, qx, qy, qz, qw, f"{approx_latency_ms:.3f}"])
                 csv_file.flush()
     finally:
+        print("\n[INFO] Closing receiver...")
         if csv_file is not None:
             csv_file.close()
+            print(f"[INFO] CSV log saved to: {args.csv_log}")
         sock.close()
+        print("[INFO] Receiver stopped successfully")
 
 
 if __name__ == "__main__":
