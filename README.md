@@ -1,12 +1,31 @@
 # ARPoseStreamer
 
+<div align="center">
+
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform: iOS](https://img.shields.io/badge/platform-iOS-blue.svg)
 ![Receiver: macOS%20%7C%20Windows](https://img.shields.io/badge/receiver-macOS%20%7C%20Windows-lightgrey.svg)
 
-ARPoseStreamer is a lightweight iPhone ARKit app and cross-platform UDP receiver for streaming relative camera pose to a host machine.
+**A lightweight iPhone ARKit app and cross-platform UDP receiver for streaming relative camera pose to a host machine.**
 
 ![ARPoseStreamer workflow](docs/assets/overview.svg)
+
+</div>
+
+## 📸 Screenshots
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/visualizer-main.png" alt="3D Visualizer" />
+      <p align="center"><b>3D Trajectory Visualizer</b><br/>Real-time pose visualization with integrated upload server</p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/iphone-app.png" alt="iPhone App" />
+      <p align="center"><b>iPhone ARKit App</b><br/>Live AR camera view with pose overlay</p>
+    </td>
+  </tr>
+</table>
 
 It is built for robotics, teleoperation, computer vision, and rapid lab experiments where you want:
 
