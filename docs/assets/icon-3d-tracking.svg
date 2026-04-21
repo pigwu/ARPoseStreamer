@@ -1,0 +1,50 @@
+<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="iconBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="100" cy="100" r="90" fill="url(#iconBg)" opacity="0.1"/>
+  <circle cx="100" cy="100" r="80" fill="none" stroke="url(#iconBg)" stroke-width="2" opacity="0.3"/>
+
+  <!-- 3D coordinate system -->
+  <g transform="translate(100, 100)" filter="url(#glow)">
+    <!-- Z axis (blue) -->
+    <line x1="0" y1="0" x2="-30" y2="-30" stroke="#4A90E2" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="-30" cy="-30" r="5" fill="#4A90E2"/>
+
+    <!-- X axis (red) -->
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#E24A4A" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="40" cy="0" r="5" fill="#E24A4A"/>
+
+    <!-- Y axis (green) -->
+    <line x1="0" y1="0" x2="0" y2="-50" stroke="#4AE24A" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="0" cy="-50" r="5" fill="#4AE24A"/>
+
+    <!-- Center point -->
+    <circle cx="0" cy="0" r="8" fill="#ffffff" stroke="#667eea" stroke-width="2"/>
+
+    <!-- Trajectory path -->
+    <path d="M -20,-20 Q 0,-30 20,-15 T 35,5"
+          stroke="#00d2ff"
+          stroke-width="3"
+          fill="none"
+          stroke-linecap="round"
+          opacity="0.8"/>
+  </g>
+
+  <!-- Labels -->
+  <text x="145" y="105" fill="#E24A4A" font-size="16" font-family="Arial" font-weight="bold">X</text>
+  <text x="105" y="45" fill="#4AE24A" font-size="16" font-family="Arial" font-weight="bold">Y</text>
+  <text x="65" y="65" fill="#4A90E2" font-size="16" font-family="Arial" font-weight="bold">Z</text>
+</svg>

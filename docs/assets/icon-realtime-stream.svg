@@ -1,0 +1,65 @@
+<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="streamBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f093fb;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#f5576c;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow2">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <circle cx="100" cy="100" r="90" fill="url(#streamBg)" opacity="0.1"/>
+  <circle cx="100" cy="100" r="80" fill="none" stroke="url(#streamBg)" stroke-width="2" opacity="0.3"/>
+
+  <!-- Data stream visualization -->
+  <g filter="url(#glow2)">
+    <!-- Source point -->
+    <circle cx="50" cy="100" r="12" fill="#00d2ff" opacity="0.3"/>
+    <circle cx="50" cy="100" r="8" fill="#00d2ff"/>
+
+    <!-- Destination point -->
+    <circle cx="150" cy="100" r="12" fill="#f5576c" opacity="0.3"/>
+    <circle cx="150" cy="100" r="8" fill="#f5576c"/>
+
+    <!-- Data packets -->
+    <circle cx="70" cy="100" r="4" fill="#00d2ff">
+      <animate attributeName="cx" from="50" to="150" dur="1.5s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.5;1" dur="1.5s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="90" cy="100" r="4" fill="#00d2ff">
+      <animate attributeName="cx" from="50" to="150" dur="1.5s" begin="0.3s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.5;1" dur="1.5s" begin="0.3s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="110" cy="100" r="4" fill="#00d2ff">
+      <animate attributeName="cx" from="50" to="150" dur="1.5s" begin="0.6s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.5;1" dur="1.5s" begin="0.6s" repeatCount="indefinite"/>
+    </circle>
+
+    <!-- Connection line -->
+    <line x1="50" y1="100" x2="150" y2="100" stroke="#00d2ff" stroke-width="2" stroke-dasharray="5,5" opacity="0.3"/>
+
+    <!-- Wave effect -->
+    <path d="M 50,100 Q 75,85 100,100 T 150,100"
+          stroke="#00d2ff"
+          stroke-width="1"
+          fill="none"
+          opacity="0.5">
+      <animate attributeName="d"
+               values="M 50,100 Q 75,85 100,100 T 150,100;
+                       M 50,100 Q 75,115 100,100 T 150,100;
+                       M 50,100 Q 75,85 100,100 T 150,100"
+               dur="2s"
+               repeatCount="indefinite"/>
+    </path>
+  </g>
+
+  <!-- Labels -->
+  <text x="100" y="140" fill="#00d2ff" font-size="14" font-family="Arial" text-anchor="middle" font-weight="bold">UDP</text>
+  <text x="100" y="155" fill="#666" font-size="11" font-family="Arial" text-anchor="middle">60 FPS</text>
+</svg>
