@@ -20,6 +20,16 @@ pyinstaller --name "ARPose Visualizer" \
     --hidden-import="OpenGL.GLU" \
     --hidden-import="OpenGL.GLUT" \
     --hidden-import="pyqtgraph.opengl" \
+    --exclude-module torch \
+    --exclude-module pandas \
+    --exclude-module scipy \
+    --exclude-module matplotlib \
+    --exclude-module IPython \
+    --exclude-module jupyter \
+    --exclude-module notebook \
+    --exclude-module sympy \
+    --exclude-module PIL \
+    --exclude-module tkinter \
     udp_pose_visualizer.py
 
 echo ""
