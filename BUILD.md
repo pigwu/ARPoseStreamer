@@ -8,6 +8,8 @@ This guide explains how to build standalone executables for the ARPose desktop t
 2. All dependencies installed: `pip install -r requirements_visualizer.txt`
 3. PyInstaller will be automatically installed by the build script
 
+The build scripts force `QT_API=pyqt6` and exclude other Qt bindings so PyInstaller does not accidentally collect multiple Qt packages from a shared Python environment.
+
 ## Building on Windows
 
 1. Open PowerShell in the project directory

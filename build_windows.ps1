@@ -1,6 +1,9 @@
 # Build script for ARPose desktop tools
 # Creates standalone executables for Windows
 
+$ErrorActionPreference = "Stop"
+$env:QT_API = "pyqt6"
+
 # Install PyInstaller if not already installed
 Write-Host "Checking PyInstaller..."
 pip show pyinstaller > $null
@@ -17,6 +20,7 @@ function Build-DesktopTool {
 
     Write-Host "`nBuilding $Name..."
     pyinstaller --name $Name `
+        --clean `
         --windowed `
         --onefile `
         --icon=Assets.xcassets/AppIcon.appiconset/Icon-1024.png `
@@ -26,6 +30,9 @@ function Build-DesktopTool {
         --hidden-import="OpenGL.GLU" `
         --hidden-import="OpenGL.GLUT" `
         --hidden-import="pyqtgraph.opengl" `
+        --exclude-module PyQt5 `
+        --exclude-module PySide2 `
+        --exclude-module PySide6 `
         --exclude-module torch `
         --exclude-module pandas `
         --exclude-module scipy `
@@ -37,6 +44,10 @@ function Build-DesktopTool {
         --exclude-module PIL `
         --exclude-module tkinter `
         $EntryPoint
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller failed while building $Name"
+    }
 }
 
 # Build the executables

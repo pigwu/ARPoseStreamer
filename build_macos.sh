@@ -2,6 +2,9 @@
 # Build script for ARPose desktop tools
 # Creates standalone applications for macOS
 
+set -euo pipefail
+export QT_API=pyqt6
+
 echo "Checking PyInstaller..."
 if ! pip show pyinstaller > /dev/null 2>&1; then
     echo "Installing PyInstaller..."
@@ -15,6 +18,7 @@ build_desktop_tool() {
     echo ""
     echo "Building ${name}..."
     pyinstaller --name "${name}" \
+        --clean \
         --windowed \
         --onefile \
         --icon=Assets.xcassets/AppIcon.appiconset/Icon-1024.png \
@@ -24,6 +28,9 @@ build_desktop_tool() {
         --hidden-import="OpenGL.GLU" \
         --hidden-import="OpenGL.GLUT" \
         --hidden-import="pyqtgraph.opengl" \
+        --exclude-module PyQt5 \
+        --exclude-module PySide2 \
+        --exclude-module PySide6 \
         --exclude-module torch \
         --exclude-module pandas \
         --exclude-module scipy \
