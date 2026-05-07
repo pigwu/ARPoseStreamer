@@ -68,11 +68,21 @@ Assumptions:
 Accepted line formats:
 
 ```text
+AP2,2,source,seq,t,x,y,z,qx,qy,qz,qw,checksum
 seq,t,x,y,z,qx,qy,qz,qw
 t,x,y,z,qx,qy,qz,qw
 x,y,z,qx,qy,qz,qw
 ```
 
 Quaternion order is `xyzw`. Commas, semicolons, spaces, and tabs are accepted as delimiters.
-The mirrored UDP payload uses the same 40-byte binary layout as the ARKit stream and defaults to port `5556`.
-For mirrored sensor packets, `sender_time` is the iPhone receive time. If the serial line includes `t`, it is preserved in the local sensor CSV log but not in the mirrored UDP packet.
+The recommended `AP2` checksum is FNV-1a UInt32 over the comma-joined payload before the checksum field, for example `AP2,2,imu,42,12.345,...`.
+
+The mirrored UDP payload defaults to port `5556` and now uses an `APS2` binary packet when sent by the iPhone app:
+
+```text
+magic="APS2", version=2, flags, sequence, sensor_time, iphone_receive_time,
+x, y, z, qx, qy, qz, qw, checksum
+```
+
+The checksum is FNV-1a UInt32 over all bytes before the checksum field. Legacy 40-byte packets are still accepted by the desktop validator.
+For mirrored sensor packets, `iphone_receive_time` is always present. If the serial line includes `t`, it is preserved as `sensor_time` for drift-aware calibration.

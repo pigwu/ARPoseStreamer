@@ -97,10 +97,13 @@ Expected setup:
 Accepted serial line formats:
 
 ```text
+AP2,2,source,seq,t,x,y,z,qx,qy,qz,qw,checksum
 seq,t,x,y,z,qx,qy,qz,qw
 t,x,y,z,qx,qy,qz,qw
 x,y,z,qx,qy,qz,qw
 ```
+
+The Settings screen can list visible iOS ExternalAccessory devices and their `protocolStrings`. Use that list to copy the real accessory protocol into the app setting and `Info.plist`.
 
 Start the validator on the host:
 
@@ -119,9 +122,19 @@ The validator renders ARKit in cyan and the wired sensor in amber from an extern
 The validator also includes adaptive calibration. After both streams receive enough motion, it estimates:
 
 - sensor-to-ARKit time offset
+- sensor clock drift when sensor timestamps are available
 - residual timing error after pairing
 - sensor-to-ARKit scale
 - sensor-to-ARKit rotation and translation
 - a fixed quaternion orientation correction
+- calibration quality, inlier ratio, and motion coverage
 
 Use `Apply adaptive calibration` to render and score the sensor stream after applying the estimated transform. The calibration needs real motion to be observable; move the phone/sensor together through forward/back, left/right, up/down, and rotation before trusting the estimate. Static data is not enough to infer axes or delay.
+
+The validator can also run offline from CSV logs:
+
+```bash
+python pose_tracking_validator.py --arkit-csv pose.csv --sensor-csv sensor_pose.csv
+```
+
+Use `Save Calibration` and `Load Calibration` in the validator to reuse a stable sensor-to-ARKit transform for the same hardware mounting.

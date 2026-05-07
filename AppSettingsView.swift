@@ -34,14 +34,73 @@ struct AppSettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
 
+                    Button("Refresh Accessories") {
+                        viewModel.refreshConnectedAccessories()
+                    }
+
                     LabeledContent("Mirror Target") {
                         Text(viewModel.sensorTargetSummary)
                             .multilineTextAlignment(.trailing)
                     }
 
-                    Text("Expected serial lines: seq,t,x,y,z,qx,qy,qz,qw or t,x,y,z,qx,qy,qz,qw. Quaternion order is xyzw.")
+                    if viewModel.connectedAccessories.isEmpty {
+                        Text("No ExternalAccessory devices are currently visible to iOS.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(viewModel.connectedAccessories) { accessory in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(accessory.name)
+                                    .font(.headline)
+                                if !accessory.subtitle.isEmpty {
+                                    Text(accessory.subtitle)
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Text(accessory.protocolStrings.joined(separator: "\n"))
+                                    .font(.footnote.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+
+                    Text("Expected serial lines: AP2,2,source,seq,t,x,y,z,qx,qy,qz,qw,checksum or legacy seq,t,x,y,z,qx,qy,qz,qw. Quaternion order is xyzw.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+
+                Section("Sensor Diagnostics") {
+                    LabeledContent("Bytes") {
+                        Text("\(viewModel.wiredSensorStats.bytesRead)")
+                    }
+                    LabeledContent("Lines") {
+                        Text("\(viewModel.wiredSensorStats.linesRead)")
+                    }
+                    LabeledContent("Samples") {
+                        Text("\(viewModel.wiredSensorStats.parsedSamples)")
+                    }
+                    LabeledContent("Parse Failures") {
+                        Text("\(viewModel.wiredSensorStats.parseFailures)")
+                    }
+                    if !viewModel.wiredSensorStats.connectedAccessoryName.isEmpty {
+                        LabeledContent("Connected") {
+                            Text(viewModel.wiredSensorStats.connectedAccessoryName)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                    if !viewModel.wiredSensorStats.lastRawLine.isEmpty {
+                        Text(viewModel.wiredSensorStats.lastRawLine)
+                            .font(.footnote.monospaced())
+                            .lineLimit(4)
+                            .textSelection(.enabled)
+                    }
+                    if !viewModel.wiredSensorStats.lastParseFailure.isEmpty {
+                        Text("Last parse failure: \(viewModel.wiredSensorStats.lastParseFailure)")
+                            .font(.footnote.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(4)
+                            .textSelection(.enabled)
+                    }
                 }
 
                 Section("Display") {
@@ -88,6 +147,9 @@ struct AppSettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .onAppear {
+                viewModel.refreshConnectedAccessories()
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") {

@@ -5,12 +5,20 @@ import simd
 
 struct SensorPoseSample {
     let sequence: UInt32
+    let source: String
+    let protocolVersion: Int
     let sensorTimestamp: TimeInterval?
     let receivedTimestamp: TimeInterval
     let position: SIMD3<Float>
     let orientation: simd_quatf
+    let checksumValid: Bool?
+    let rawLine: String?
 
     var binaryData: Data {
+        binaryV2Data
+    }
+
+    var binaryV1Data: Data {
         let vectorScalars: [UInt32] = [
             position.x.bitPattern.littleEndian,
             position.y.bitPattern.littleEndian,
@@ -31,6 +39,115 @@ struct SensorPoseSample {
 
         return data
     }
+
+    var binaryV2Data: Data {
+        var data = Data()
+        data.append(contentsOf: [0x41, 0x50, 0x53, 0x32])
+        Self.append(UInt16(2), to: &data)
+
+        var flags: UInt16 = 0
+        if sensorTimestamp != nil { flags |= 1 << 0 }
+        if checksumValid == true { flags |= 1 << 1 }
+        if checksumValid == false { flags |= 1 << 2 }
+        Self.append(flags, to: &data)
+        Self.append(sequence, to: &data)
+
+        Self.append(sensorTimestamp ?? .nan, to: &data)
+        Self.append(receivedTimestamp, to: &data)
+
+        let vectorScalars: [UInt32] = [
+            position.x.bitPattern.littleEndian,
+            position.y.bitPattern.littleEndian,
+            position.z.bitPattern.littleEndian,
+            orientation.vector.x.bitPattern.littleEndian,
+            orientation.vector.y.bitPattern.littleEndian,
+            orientation.vector.z.bitPattern.littleEndian,
+            orientation.vector.w.bitPattern.littleEndian
+        ]
+        vectorScalars.withUnsafeBytes { data.append(contentsOf: $0) }
+
+        let checksum = Self.fnv1a(data)
+        Self.append(checksum, to: &data)
+        return data
+    }
+
+    private static func append(_ value: UInt16, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func append(_ value: UInt32, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func append(_ value: Double, to data: inout Data) {
+        var littleEndian = value.bitPattern.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func fnv1a(_ data: Data) -> UInt32 {
+        var hash: UInt32 = 2166136261
+        for byte in data {
+            hash ^= UInt32(byte)
+            hash &*= 16777619
+        }
+        return hash
+    }
+}
+
+struct WiredSensorAccessoryInfo: Identifiable, Hashable {
+    let name: String
+    let manufacturer: String
+    let modelNumber: String
+    let serialNumber: String
+    let firmwareRevision: String
+    let hardwareRevision: String
+    let protocolStrings: [String]
+
+    var id: String {
+        [name, manufacturer, modelNumber, serialNumber].joined(separator: "|")
+    }
+
+    var subtitle: String {
+        [manufacturer, modelNumber, serialNumber]
+            .filter { !$0.isEmpty }
+            .joined(separator: "  ")
+    }
+}
+
+struct WiredSensorRuntimeStats {
+    var bytesRead: Int = 0
+    var linesRead: Int = 0
+    var parsedSamples: Int = 0
+    var parseFailures: Int = 0
+    var lastRawLine: String = ""
+    var lastParseFailure: String = ""
+    var connectedAccessoryName: String = ""
+}
+
+enum WiredSensorAccessoryScanner {
+    static func currentAccessories() -> [WiredSensorAccessoryInfo] {
+        EAAccessoryManager.shared().connectedAccessories.map { accessory in
+            WiredSensorAccessoryInfo(
+                name: safe(accessory.name),
+                manufacturer: safe(accessory.manufacturer),
+                modelNumber: safe(accessory.modelNumber),
+                serialNumber: safe(accessory.serialNumber),
+                firmwareRevision: safe(accessory.firmwareRevision),
+                hardwareRevision: safe(accessory.hardwareRevision),
+                protocolStrings: safe(accessory.protocolStrings)
+            )
+        }
+    }
+
+    private static func safe(_ value: String?) -> String {
+        value ?? ""
+    }
+
+    private static func safe(_ value: [String]?) -> [String] {
+        value ?? []
+    }
 }
 
 final class SensorPoseLineParser {
@@ -45,6 +162,10 @@ final class SensorPoseLineParser {
                 character == "," || character == ";" || character == " " || character == "\t"
             }
             .map(String.init)
+
+        if let first = tokens.first?.uppercased(), first == "AP2" || first == "ARPOSE2" {
+            return parseV2(tokens: tokens, rawLine: trimmed, receivedTimestamp: receivedTimestamp)
+        }
 
         if let first = tokens.first, Double(first) == nil {
             tokens.removeFirst()
@@ -84,7 +205,11 @@ final class SensorPoseLineParser {
         sequence: UInt32,
         sensorTimestamp: TimeInterval?,
         receivedTimestamp: TimeInterval,
-        fields: [Double]
+        fields: [Double],
+        source: String = "legacy",
+        protocolVersion: Int = 1,
+        checksumValid: Bool? = nil,
+        rawLine: String? = nil
     ) -> SensorPoseSample? {
         guard fields.count == 7 else { return nil }
 
@@ -95,10 +220,49 @@ final class SensorPoseLineParser {
 
         return SensorPoseSample(
             sequence: sequence,
+            source: source,
+            protocolVersion: protocolVersion,
             sensorTimestamp: sensorTimestamp,
             receivedTimestamp: receivedTimestamp,
             position: position,
-            orientation: simd_quatf(vector: rawQuaternion / norm)
+            orientation: simd_quatf(vector: rawQuaternion / norm),
+            checksumValid: checksumValid,
+            rawLine: rawLine
+        )
+    }
+
+    private func parseV2(tokens: [String], rawLine: String, receivedTimestamp: TimeInterval) -> SensorPoseSample? {
+        guard tokens.count == 12 || tokens.count == 13 else { return nil }
+        let hasVersion = tokens.count == 13
+        let version = hasVersion ? Int(tokens[1]) ?? 2 : 2
+        let sourceIndex = hasVersion ? 2 : 1
+        let sequenceIndex = hasVersion ? 3 : 2
+        let sensorTimeIndex = hasVersion ? 4 : 3
+        let fieldsStart = hasVersion ? 5 : 4
+
+        let payloadTokens = Array(tokens.dropLast())
+        let expectedChecksum = parseChecksum(tokens.last ?? "")
+        let actualChecksum = Self.fnv1a(payloadTokens.joined(separator: ","))
+        let checksumValid = expectedChecksum.map { $0 == actualChecksum }
+        if checksumValid == false { return nil }
+
+        guard let sequenceValue = Double(tokens[sequenceIndex]), let sensorTime = Double(tokens[sensorTimeIndex]) else {
+            return nil
+        }
+
+        let fieldTokens = tokens[fieldsStart..<(fieldsStart + 7)]
+        let fields = fieldTokens.compactMap(Double.init)
+        guard fields.count == 7 else { return nil }
+
+        return makeSample(
+            sequence: sequence(from: sequenceValue),
+            sensorTimestamp: sensorTime,
+            receivedTimestamp: receivedTimestamp,
+            fields: fields,
+            source: tokens[sourceIndex],
+            protocolVersion: version,
+            checksumValid: checksumValid,
+            rawLine: rawLine
         )
     }
 
@@ -109,6 +273,23 @@ final class SensorPoseLineParser {
 
     private func sequence(from value: Double) -> UInt32 {
         UInt32(min(max(value, 0), Double(UInt32.max)))
+    }
+
+    private func parseChecksum(_ value: String) -> UInt32? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.hasPrefix("0x") {
+            return UInt32(trimmed.dropFirst(2), radix: 16)
+        }
+        return UInt32(trimmed)
+    }
+
+    private static func fnv1a(_ payload: String) -> UInt32 {
+        var hash: UInt32 = 2166136261
+        for byte in payload.utf8 {
+            hash ^= UInt32(byte)
+            hash &*= 16777619
+        }
+        return hash
     }
 }
 
@@ -133,6 +314,8 @@ final class WiredSensorSerialReceiver: NSObject, StreamDelegate {
     var onSampleReceived: ((SensorPoseSample) -> Void)?
     var onStatusChanged: ((String) -> Void)?
     var onError: ((Error) -> Void)?
+    var onStatsChanged: ((WiredSensorRuntimeStats) -> Void)?
+    var onParseFailure: ((String) -> Void)?
 
     private let parser = SensorPoseLineParser()
     private var accessoryProtocol = ""
@@ -142,6 +325,7 @@ final class WiredSensorSerialReceiver: NSObject, StreamDelegate {
     private var readBuffer = Data()
     private var isRunning = false
     private var lastFlowStatusTime: TimeInterval = 0
+    private var stats = WiredSensorRuntimeStats()
 
     func start(protocolString: String) {
         let trimmedProtocol = protocolString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -152,6 +336,8 @@ final class WiredSensorSerialReceiver: NSObject, StreamDelegate {
 
         accessoryProtocol = trimmedProtocol
         isRunning = true
+        stats = WiredSensorRuntimeStats()
+        publishStats()
 
         NotificationCenter.default.addObserver(
             self,
@@ -228,6 +414,8 @@ final class WiredSensorSerialReceiver: NSObject, StreamDelegate {
         inputStream?.open()
         outputStream?.open()
 
+        stats.connectedAccessoryName = accessory.name
+        publishStats()
         onStatusChanged?("Sensor connected: \(accessory.name)")
     }
 
@@ -251,6 +439,7 @@ final class WiredSensorSerialReceiver: NSObject, StreamDelegate {
         while inputStream.hasBytesAvailable {
             let count = inputStream.read(&chunk, maxLength: chunk.count)
             if count > 0 {
+                stats.bytesRead += count
                 readBuffer.append(contentsOf: chunk[0..<count])
                 drainCompleteLines()
             } else if count < 0, let error = inputStream.streamError {
@@ -273,9 +462,21 @@ final class WiredSensorSerialReceiver: NSObject, StreamDelegate {
             readBuffer.removeSubrange(readBuffer.startIndex...newlineIndex)
 
             guard let line = String(data: lineData, encoding: .utf8) else { continue }
-            guard let sample = parser.parse(line: line) else { continue }
+            let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            stats.linesRead += 1
+            stats.lastRawLine = trimmedLine
 
+            guard let sample = parser.parse(line: line) else {
+                stats.parseFailures += 1
+                stats.lastParseFailure = trimmedLine
+                onParseFailure?(trimmedLine)
+                publishStats()
+                continue
+            }
+
+            stats.parsedSamples += 1
             onSampleReceived?(sample)
+            publishStats()
 
             let now = Date().timeIntervalSince1970
             if now - lastFlowStatusTime > 1.0 {
@@ -283,6 +484,10 @@ final class WiredSensorSerialReceiver: NSObject, StreamDelegate {
                 onStatusChanged?("Sensor receiving")
             }
         }
+    }
+
+    private func publishStats() {
+        onStatsChanged?(stats)
     }
 }
 
@@ -390,6 +595,8 @@ final class WiredSensorPoseBridge {
     var onSampleForwarded: ((SensorPoseSample) -> Void)?
     var onStatusChanged: ((String) -> Void)?
     var onError: ((Error) -> Void)?
+    var onStatsChanged: ((WiredSensorRuntimeStats) -> Void)?
+    var onParseFailure: ((String) -> Void)?
 
     private let receiver = WiredSensorSerialReceiver()
     private let sender: SensorPoseUDPSender
@@ -407,6 +614,12 @@ final class WiredSensorPoseBridge {
         }
         receiver.onError = { [weak self] error in
             self?.onError?(error)
+        }
+        receiver.onStatsChanged = { [weak self] stats in
+            self?.onStatsChanged?(stats)
+        }
+        receiver.onParseFailure = { [weak self] line in
+            self?.onParseFailure?(line)
         }
         sender.onStatusChanged = { [weak self] status in
             self?.onStatusChanged?(status)

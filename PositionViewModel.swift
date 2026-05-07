@@ -72,6 +72,16 @@ struct ReuploadPrompt: Identifiable {
     let previousUploadDate: Date
 }
 
+struct WiredSensorStatsViewState {
+    var bytesRead = 0
+    var linesRead = 0
+    var parsedSamples = 0
+    var parseFailures = 0
+    var lastRawLine = ""
+    var lastParseFailure = ""
+    var connectedAccessoryName = ""
+}
+
 @MainActor
 final class PositionViewModel: ObservableObject {
     @Published var hostIP: String {
@@ -104,6 +114,8 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var uploadStatus = "Upload idle"
     @Published private(set) var latestPacketSummary = "No packets yet"
     @Published private(set) var latestSensorSummary = "No sensor packets yet"
+    @Published private(set) var wiredSensorStats = WiredSensorStatsViewState()
+    @Published private(set) var connectedAccessories: [WiredSensorAccessoryInfo] = []
     @Published private(set) var recordingStatus = VideoRecordingStatus.idle.message
     @Published private(set) var isSending = false
     @Published private(set) var isSensorStreaming = false
@@ -155,6 +167,11 @@ final class PositionViewModel: ObservableObject {
         captureRecords = captureLibraryStore.loadRecords().sorted { $0.createdAt > $1.createdAt }
 
         configureSender()
+        refreshConnectedAccessories()
+    }
+
+    func refreshConnectedAccessories() {
+        connectedAccessories = WiredSensorAccessoryScanner.currentAccessories()
     }
 
     func startSending() {
@@ -204,6 +221,7 @@ final class PositionViewModel: ObservableObject {
         }
 
         sensorRecorder.startSessionIfNeeded()
+        sensorRecorder.appendEvent(kind: "sensor_start", detail: "protocol=\(trimmedProtocol) host=\(hostIP) port=\(port)")
         lastSensorLogName = sensorRecorder.currentFileName
         sensorBridge.start(accessoryProtocol: trimmedProtocol)
         isSensorStreaming = true
@@ -212,6 +230,7 @@ final class PositionViewModel: ObservableObject {
 
     func stopWiredSensor() {
         sensorBridge?.stop()
+        sensorRecorder.appendEvent(kind: "sensor_stop", detail: sensorStatus)
         sensorRecorder.finishSession()
         isSensorStreaming = false
         sensorStatus = "Sensor idle"
@@ -480,6 +499,7 @@ final class PositionViewModel: ObservableObject {
         newBridge?.onStatusChanged = { [weak self] status in
             Task { @MainActor [weak self] in
                 self?.sensorStatus = status
+                self?.sensorRecorder.appendEvent(kind: "status", detail: status)
             }
         }
 
@@ -490,6 +510,27 @@ final class PositionViewModel: ObservableObject {
                 } else {
                     self?.sensorStatus = "Sensor error: \(error.localizedDescription)"
                 }
+                self?.sensorRecorder.appendEvent(kind: "error", detail: error.localizedDescription)
+            }
+        }
+
+        newBridge?.onStatsChanged = { [weak self] stats in
+            Task { @MainActor [weak self] in
+                self?.wiredSensorStats = WiredSensorStatsViewState(
+                    bytesRead: stats.bytesRead,
+                    linesRead: stats.linesRead,
+                    parsedSamples: stats.parsedSamples,
+                    parseFailures: stats.parseFailures,
+                    lastRawLine: stats.lastRawLine,
+                    lastParseFailure: stats.lastParseFailure,
+                    connectedAccessoryName: stats.connectedAccessoryName
+                )
+            }
+        }
+
+        newBridge?.onParseFailure = { [weak self] line in
+            Task { @MainActor [weak self] in
+                self?.sensorRecorder.appendEvent(kind: "parse_failure", detail: line)
             }
         }
     }

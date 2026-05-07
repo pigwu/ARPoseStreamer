@@ -1,5 +1,7 @@
 import argparse
 import bisect
+import csv
+import json
 import math
 import socket
 import struct
@@ -7,6 +9,8 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pyqtgraph.opengl as gl
@@ -14,6 +18,7 @@ from PyQt6.QtCore import QThread, QTimer, pyqtSignal, Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -25,6 +30,8 @@ from PyQt6.QtWidgets import (
 
 
 FLOAT32_PACKET = struct.Struct("<Id7f")
+V2_PACKET = struct.Struct("<4sHHIdd7fI")
+V2_MAGIC = b"APS2"
 
 
 @dataclass(frozen=True)
@@ -35,14 +42,43 @@ class PoseSample:
     recv_time: float
     position: np.ndarray
     quaternion: np.ndarray
+    sensor_time: Optional[float] = None
+    protocol_version: int = 1
+    checksum_valid: Optional[bool] = None
 
 
 def decode_packet(packet: bytes):
+    if len(packet) == V2_PACKET.size and packet[:4] == V2_MAGIC:
+        return decode_v2_packet(packet)
+
     if len(packet) != FLOAT32_PACKET.size:
         raise ValueError(f"Expected {FLOAT32_PACKET.size} bytes, got {len(packet)}")
     sequence, sender_time, x, y, z, qx, qy, qz, qw = FLOAT32_PACKET.unpack(packet)
     quat = normalize_quaternion(np.array([qx, qy, qz, qw], dtype=float))
-    return sequence, sender_time, np.array([x, y, z], dtype=float), quat
+    return sequence, sender_time, np.array([x, y, z], dtype=float), quat, None, 1, None
+
+
+def decode_v2_packet(packet: bytes):
+    payload = packet[:-4]
+    checksum = struct.unpack("<I", packet[-4:])[0]
+    checksum_valid = fnv1a_bytes(payload) == checksum
+    magic, version, flags, sequence, sensor_time, received_time, x, y, z, qx, qy, qz, qw, _ = V2_PACKET.unpack(packet)
+    if magic != V2_MAGIC:
+        raise ValueError("Invalid APS2 packet magic")
+    if not checksum_valid:
+        raise ValueError("Invalid APS2 packet checksum")
+
+    has_sensor_time = bool(flags & 1)
+    quat = normalize_quaternion(np.array([qx, qy, qz, qw], dtype=float))
+    return sequence, received_time, np.array([x, y, z], dtype=float), quat, sensor_time if has_sensor_time else None, version, checksum_valid
+
+
+def fnv1a_bytes(payload):
+    value = 2166136261
+    for byte in payload:
+        value ^= byte
+        value = (value * 16777619) & 0xFFFFFFFF
+    return value
 
 
 def normalize_quaternion(quaternion):
@@ -150,6 +186,62 @@ def nearest_by_sender_time(samples, target_time, max_delta_seconds):
     return best, best_delta
 
 
+def load_pose_csv(path, stream):
+    samples = []
+    with Path(path).open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for index, row in enumerate(reader):
+            try:
+                sequence = int(float(row.get("sequence", index)))
+                sender_time = first_float(row, ["sender_time", "received_time", "time", "timestamp"])
+                frame_time = first_float(row, ["frame_time", "received_time", "recv_time"], default=sender_time)
+                sensor_time = first_float(row, ["sensor_time"], default=None)
+                position = np.array([
+                    float(row["x"]),
+                    float(row["y"]),
+                    float(row["z"]),
+                ], dtype=float)
+                quaternion = normalize_quaternion(np.array([
+                    float(row["qx"]),
+                    float(row["qy"]),
+                    float(row["qz"]),
+                    float(row["qw"]),
+                ], dtype=float))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            samples.append(
+                PoseSample(
+                    stream=stream,
+                    sequence=sequence,
+                    sender_time=sender_time,
+                    recv_time=frame_time,
+                    position=position,
+                    quaternion=quaternion,
+                    sensor_time=sensor_time,
+                    protocol_version=int(float(row.get("protocol_version", 1) or 1)),
+                    checksum_valid=parse_bool(row.get("checksum_valid")),
+                )
+            )
+    return samples
+
+
+def first_float(row, keys, default=None):
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return float(value)
+    if default is None:
+        raise ValueError(f"Missing required numeric field from {keys}")
+    return default
+
+
+def parse_bool(value):
+    if value is None or value == "":
+        return None
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
 class SimilarityTransform:
     def __init__(self, scale=1.0, rotation=None, translation=None, orientation_delta=None):
         self.scale = scale
@@ -164,12 +256,30 @@ class SimilarityTransform:
         rotated = quaternion_multiply(matrix_to_quaternion(self.rotation), quaternion)
         return quaternion_multiply(self.orientation_delta, rotated)
 
+    def to_dict(self):
+        return {
+            "scale": self.scale,
+            "rotation": self.rotation.tolist(),
+            "translation": self.translation.tolist(),
+            "orientation_delta": self.orientation_delta.tolist(),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            scale=float(data.get("scale", 1.0)),
+            rotation=np.array(data.get("rotation", np.eye(3).tolist()), dtype=float),
+            translation=np.array(data.get("translation", [0.0, 0.0, 0.0]), dtype=float),
+            orientation_delta=np.array(data.get("orientation_delta", [0.0, 0.0, 0.0, 1.0]), dtype=float),
+        )
+
 
 class CalibrationResult:
     def __init__(self):
         self.enabled = False
         self.transform = SimilarityTransform()
         self.time_offset = 0.0
+        self.time_slope = 1.0
         self.mean_time_error = None
         self.time_rmse = None
         self.max_time_error = None
@@ -177,6 +287,54 @@ class CalibrationResult:
         self.angle_rmse = None
         self.pair_count = 0
         self.scale = 1.0
+        self.quality = "waiting"
+        self.motion_coverage = "none"
+        self.inlier_ratio = 0.0
+
+    def sensor_to_arkit_time(self, sensor_time):
+        return self.time_slope * sensor_time + self.time_offset
+
+    def arkit_to_sensor_time(self, arkit_time):
+        if abs(self.time_slope) < 1e-9:
+            return arkit_time - self.time_offset
+        return (arkit_time - self.time_offset) / self.time_slope
+
+    def to_dict(self):
+        return {
+            "enabled": self.enabled,
+            "transform": self.transform.to_dict(),
+            "time_offset": self.time_offset,
+            "time_slope": self.time_slope,
+            "mean_time_error": self.mean_time_error,
+            "time_rmse": self.time_rmse,
+            "max_time_error": self.max_time_error,
+            "position_rmse": self.position_rmse,
+            "angle_rmse": self.angle_rmse,
+            "pair_count": self.pair_count,
+            "scale": self.scale,
+            "quality": self.quality,
+            "motion_coverage": self.motion_coverage,
+            "inlier_ratio": self.inlier_ratio,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        result = cls()
+        result.enabled = bool(data.get("enabled", True))
+        result.transform = SimilarityTransform.from_dict(data.get("transform", {}))
+        result.time_offset = float(data.get("time_offset", 0.0))
+        result.time_slope = float(data.get("time_slope", 1.0))
+        result.mean_time_error = data.get("mean_time_error")
+        result.time_rmse = data.get("time_rmse")
+        result.max_time_error = data.get("max_time_error")
+        result.position_rmse = data.get("position_rmse")
+        result.angle_rmse = data.get("angle_rmse")
+        result.pair_count = int(data.get("pair_count", 0))
+        result.scale = float(data.get("scale", result.transform.scale))
+        result.quality = data.get("quality", "loaded")
+        result.motion_coverage = data.get("motion_coverage", "loaded")
+        result.inlier_ratio = float(data.get("inlier_ratio", 1.0))
+        return result
 
 
 class AdaptiveCalibrator:
@@ -199,7 +357,7 @@ class AdaptiveCalibrator:
         best = None
 
         for offset in candidate_offsets:
-            pairs = self.make_pairs(arkit_list, sensor_list, offset)
+            pairs = self.make_pairs(arkit_list, sensor_list, time_offset=offset, time_slope=1.0)
             if len(pairs) < self.min_pairs:
                 continue
             if not self.has_enough_motion(pairs):
@@ -214,22 +372,41 @@ class AdaptiveCalibrator:
             return self.result
 
         _, offset, pairs, transform, position_rmse = best
+        time_slope, time_offset = self.estimate_time_model(pairs)
+        pairs = self.make_pairs(arkit_list, sensor_list, time_offset=time_offset, time_slope=time_slope)
+        if len(pairs) >= self.min_pairs:
+            transform, position_rmse = self.estimate_similarity(pairs)
+            pairs, inlier_ratio = self.filter_inliers(pairs, transform)
+            if len(pairs) >= self.min_pairs:
+                transform, position_rmse = self.estimate_similarity(pairs)
+        else:
+            time_slope = 1.0
+            time_offset = offset
+            inlier_ratio = 1.0
+
         angle_rmse = self.estimate_orientation_delta(transform, pairs)
 
         result = CalibrationResult()
         result.enabled = True
         result.transform = transform
-        result.time_offset = float(offset)
-        result.mean_time_error, result.time_rmse, result.max_time_error = self.time_error_stats(pairs, offset)
+        result.time_offset = float(time_offset)
+        result.time_slope = float(time_slope)
+        result.mean_time_error, result.time_rmse, result.max_time_error = self.time_error_stats(pairs, time_offset, time_slope)
         result.position_rmse = position_rmse
         result.angle_rmse = angle_rmse
         result.pair_count = len(pairs)
         result.scale = transform.scale
+        result.motion_coverage = self.motion_coverage(pairs)
+        result.inlier_ratio = inlier_ratio
+        result.quality = self.quality_label(result)
         self.result = result
         return result
 
-    def make_pairs(self, arkit_samples, sensor_samples, offset):
-        sensor_times = [sample.sender_time + offset for sample in sensor_samples]
+    def sample_time(self, sample):
+        return sample.sensor_time if sample.sensor_time is not None else sample.sender_time
+
+    def make_pairs(self, arkit_samples, sensor_samples, time_offset, time_slope=1.0):
+        sensor_times = [time_slope * self.sample_time(sample) + time_offset for sample in sensor_samples]
         pairs = []
         for arkit in arkit_samples:
             index = bisect.bisect_left(sensor_times, arkit.sender_time)
@@ -244,6 +421,32 @@ class AdaptiveCalibrator:
             if delta <= self.pairing_window:
                 pairs.append((arkit, sensor))
         return pairs
+
+    def estimate_time_model(self, pairs):
+        sensor_times = np.array([self.sample_time(pair[1]) for pair in pairs], dtype=float)
+        arkit_times = np.array([pair[0].sender_time for pair in pairs], dtype=float)
+        if len(sensor_times) < 2 or float(np.ptp(sensor_times)) < 1e-6:
+            return 1.0, float(np.mean(arkit_times - sensor_times))
+
+        slope, intercept = np.polyfit(sensor_times, arkit_times, 1)
+        slope = float(np.clip(slope, 0.98, 1.02))
+        intercept = float(np.mean(arkit_times - slope * sensor_times))
+        return slope, intercept
+
+    def filter_inliers(self, pairs, transform):
+        errors = np.array([
+            np.linalg.norm(transform.apply_position(pair[1].position) - pair[0].position)
+            for pair in pairs
+        ], dtype=float)
+        if len(errors) < self.min_pairs:
+            return pairs, 1.0
+        median = float(np.median(errors))
+        mad = float(np.median(np.abs(errors - median)))
+        threshold = median + max(0.03, 3.0 * 1.4826 * mad)
+        inliers = [pair for pair, error in zip(pairs, errors) if error <= threshold]
+        if len(inliers) < self.min_pairs:
+            return pairs, 1.0
+        return inliers, len(inliers) / len(pairs)
 
     def has_enough_motion(self, pairs):
         arkit_points = np.array([pair[0].position for pair in pairs], dtype=float)
@@ -282,12 +485,32 @@ class AdaptiveCalibrator:
         rmse = float(np.sqrt(np.mean(np.sum((aligned - arkit_points) ** 2, axis=1))))
         return transform, rmse
 
-    def time_error_stats(self, pairs, offset):
-        errors = np.array([pair[1].sender_time + offset - pair[0].sender_time for pair in pairs], dtype=float)
+    def time_error_stats(self, pairs, offset, slope=1.0):
+        errors = np.array([slope * self.sample_time(pair[1]) + offset - pair[0].sender_time for pair in pairs], dtype=float)
         mean_error = float(np.mean(errors))
         rmse = float(np.sqrt(np.mean(errors * errors)))
         max_error = float(np.max(np.abs(errors)))
         return mean_error, rmse, max_error
+
+    def motion_coverage(self, pairs):
+        arkit_points = np.array([pair[0].position for pair in pairs], dtype=float)
+        if len(arkit_points) < 2:
+            return "none"
+        span = np.ptp(arkit_points, axis=0)
+        axes = [name for name, value in zip(["x", "y", "z"], span) if value >= self.min_motion_span]
+        return "none" if not axes else "".join(axes)
+
+    def quality_label(self, result):
+        if result.pair_count < self.min_pairs:
+            return "waiting"
+        coverage_count = 0 if result.motion_coverage == "none" else len(result.motion_coverage)
+        position_ok = result.position_rmse is not None and result.position_rmse < 0.05
+        timing_ok = result.time_rmse is not None and result.time_rmse < 0.02
+        if coverage_count >= 3 and position_ok and timing_ok and result.inlier_ratio >= 0.75:
+            return "good"
+        if coverage_count >= 2 and result.inlier_ratio >= 0.5:
+            return "weak"
+        return "unstable"
 
     def estimate_orientation_delta(self, transform, pairs):
         rotation_quaternion = matrix_to_quaternion(transform.rotation)
@@ -345,7 +568,7 @@ class PoseReceiverThread(QThread):
                 monotonic_time = time.monotonic()
 
                 try:
-                    sequence, sender_time, position, quaternion = decode_packet(packet)
+                    sequence, sender_time, position, quaternion, sensor_time, protocol_version, checksum_valid = decode_packet(packet)
                 except Exception as exc:
                     self.error_occurred.emit(self.stream_name, str(exc))
                     continue
@@ -367,6 +590,9 @@ class PoseReceiverThread(QThread):
                     recv_time=recv_time,
                     position=position,
                     quaternion=quaternion,
+                    sensor_time=sensor_time,
+                    protocol_version=protocol_version,
+                    checksum_valid=checksum_valid,
                 )
                 self.sample_received.emit(sample)
                 self.status_updated.emit(
@@ -377,6 +603,7 @@ class PoseReceiverThread(QThread):
                         "packets": self.packet_count,
                         "drops": self.drop_count,
                         "latency_ms": max(0.0, (recv_time - sender_time) * 1000.0),
+                        "protocol_version": protocol_version,
                     },
                 )
         except Exception as exc:
@@ -428,6 +655,9 @@ class PoseTrack:
             recv_time=sample.recv_time,
             position=sample.position - origin,
             quaternion=sample.quaternion,
+            sensor_time=sample.sensor_time,
+            protocol_version=sample.protocol_version,
+            checksum_valid=sample.checksum_valid,
         )
 
 
@@ -475,6 +705,9 @@ class CalibratedSensorTrack:
             recv_time=sample.recv_time,
             position=position - origin,
             quaternion=self.calibration_result.transform.apply_quaternion(sample.quaternion),
+            sensor_time=sample.sensor_time,
+            protocol_version=sample.protocol_version,
+            checksum_valid=sample.checksum_valid,
         )
 
     def reset_origin(self):
@@ -599,7 +832,7 @@ class StatsPanel(QWidget):
 
     def update_stream(self, stream, stats):
         text = (
-            f"{stream}: {stats['fps']:.1f} fps | packets {stats['packets']} | "
+            f"{stream}: {stats['fps']:.1f} fps | packets {stats['packets']} | v{stats.get('protocol_version', 1)} | "
             f"drops {stats['drops']} | latency {stats['latency_ms']:.1f} ms"
         )
         if stream == "arkit":
@@ -635,14 +868,16 @@ class StatsPanel(QWidget):
             f"mean residual {mean_time_text} | rmse {time_rmse_text} | max {max_time_text}"
         )
         self.calibration_label.setText(
-            f"Calibration {mode}: dt {result.time_offset * 1000.0:+.0f} ms | "
+            f"Calibration {mode}: {result.quality} | dt {result.time_offset * 1000.0:+.0f} ms | "
+            f"slope {result.time_slope:.8f} | "
             f"scale {result.scale:.4f} | pos rmse {position_text} | "
-            f"angle rmse {angle_text} | pairs {result.pair_count}"
+            f"angle rmse {angle_text} | pairs {result.pair_count} | "
+            f"inliers {result.inlier_ratio:.0%} | motion {result.motion_coverage}"
         )
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, host, arkit_port, sensor_port, pairing_window, max_time_offset):
+    def __init__(self, host, arkit_port, sensor_port, pairing_window, max_time_offset, arkit_csv=None, sensor_csv=None):
         super().__init__()
         self.host = host
         self.arkit_port = arkit_port
@@ -656,13 +891,43 @@ class MainWindow(QMainWindow):
         self.apply_calibration = False
         self.show_all = False
         self.last_calibration_update = 0.0
+        self.calibration_file = Path("calibration.json")
+        self.arkit_csv = arkit_csv
+        self.sensor_csv = sensor_csv
 
         self.init_ui()
         self.apply_stylesheet()
+        self.load_offline_inputs_if_needed()
 
         self.render_timer = QTimer()
         self.render_timer.timeout.connect(self.update_render)
         self.render_timer.start(33)
+
+    def load_offline_inputs_if_needed(self):
+        if not self.arkit_csv or not self.sensor_csv:
+            return
+        for sample in load_pose_csv(self.arkit_csv, "arkit"):
+            self.tracks["arkit"].append(sample)
+        for sample in load_pose_csv(self.sensor_csv, "sensor"):
+            self.tracks["sensor"].append(sample)
+
+        result = self.calibrator.update(self.tracks["arkit"].samples, self.tracks["sensor"].samples)
+        self.calibrated_sensor_track.calibration_result = result
+        self.stats_panel.update_stream("arkit", {
+            "fps": 0.0,
+            "packets": len(self.tracks["arkit"].samples),
+            "drops": 0,
+            "latency_ms": 0.0,
+            "protocol_version": self.tracks["arkit"].samples[-1].protocol_version if self.tracks["arkit"].samples else 1,
+        })
+        self.stats_panel.update_stream("sensor", {
+            "fps": 0.0,
+            "packets": len(self.tracks["sensor"].samples),
+            "drops": 0,
+            "latency_ms": 0.0,
+            "protocol_version": self.tracks["sensor"].samples[-1].protocol_version if self.tracks["sensor"].samples else 1,
+        })
+        self.stats_panel.update_calibration(result, self.apply_calibration)
 
     def init_ui(self):
         self.setWindowTitle("ARPose Tracking Validator")
@@ -684,12 +949,16 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("Start Validation")
         self.stop_button = QPushButton("Stop")
         self.reset_button = QPushButton("Reset Origins")
+        self.save_calibration_button = QPushButton("Save Calibration")
+        self.load_calibration_button = QPushButton("Load Calibration")
         self.show_all_checkbox = QCheckBox("Show all history")
         self.apply_calibration_checkbox = QCheckBox("Apply adaptive calibration")
 
         self.start_button.clicked.connect(self.start_receivers)
         self.stop_button.clicked.connect(self.stop_receivers)
         self.reset_button.clicked.connect(self.reset_origins)
+        self.save_calibration_button.clicked.connect(self.save_calibration)
+        self.load_calibration_button.clicked.connect(self.load_calibration)
         self.show_all_checkbox.stateChanged.connect(self.change_history_mode)
         self.apply_calibration_checkbox.stateChanged.connect(self.change_calibration_mode)
 
@@ -697,6 +966,8 @@ class MainWindow(QMainWindow):
             self.start_button,
             self.stop_button,
             self.reset_button,
+            self.save_calibration_button,
+            self.load_calibration_button,
             self.show_all_checkbox,
             self.apply_calibration_checkbox,
         ]:
@@ -790,6 +1061,32 @@ class MainWindow(QMainWindow):
         self.calibrated_sensor_track.reset_origin()
         self.stats_panel.update_calibration(self.calibrator.result, self.apply_calibration)
 
+    def save_calibration(self):
+        if not self.calibrator.result.enabled:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Calibration", str(self.calibration_file), "JSON Files (*.json)")
+        if not path:
+            return
+        payload = self.calibrator.result.to_dict()
+        payload["saved_at"] = time.time()
+        payload["format"] = "arpose_calibration_v1"
+        Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        self.calibration_file = Path(path)
+
+    def load_calibration(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Calibration", str(self.calibration_file), "JSON Files (*.json)")
+        if not path:
+            return
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        result = CalibrationResult.from_dict(data)
+        result.enabled = True
+        result.quality = data.get("quality", "loaded")
+        self.calibrator.result = result
+        self.calibrated_sensor_track.calibration_result = result
+        self.calibrated_sensor_track.reset_origin()
+        self.calibration_file = Path(path)
+        self.stats_panel.update_calibration(result, self.apply_calibration)
+
     def on_sample(self, sample):
         self.tracks[sample.stream].append(sample)
         self.update_calibration_if_needed()
@@ -829,7 +1126,7 @@ class MainWindow(QMainWindow):
         if self.apply_calibration and self.calibrator.result.enabled:
             target_stream = "sensor" if sample.stream == "arkit" else "arkit"
             if sample.stream == "arkit":
-                target_time = sample.sender_time - self.calibrator.result.time_offset
+                target_time = self.calibrator.result.arkit_to_sensor_time(sample.sender_time)
                 other, delta = nearest_by_sender_time(
                     self.tracks[target_stream].samples,
                     target_time,
@@ -839,7 +1136,8 @@ class MainWindow(QMainWindow):
                     return None
                 return sample, other, delta
 
-            target_time = sample.sender_time + self.calibrator.result.time_offset
+            sample_time = self.calibrator.sample_time(sample)
+            target_time = self.calibrator.result.sensor_to_arkit_time(sample_time)
             other, delta = nearest_by_sender_time(
                 self.tracks[target_stream].samples,
                 target_time,
@@ -907,10 +1205,20 @@ def main():
         default=0.5,
         help="Maximum sensor time offset to scan during adaptive calibration, in seconds.",
     )
+    parser.add_argument("--arkit-csv", default=None, help="Offline ARKit pose CSV path.")
+    parser.add_argument("--sensor-csv", default=None, help="Offline wired sensor pose CSV path.")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
-    window = MainWindow(args.host, args.arkit_port, args.sensor_port, args.pairing_window, args.max_time_offset)
+    window = MainWindow(
+        args.host,
+        args.arkit_port,
+        args.sensor_port,
+        args.pairing_window,
+        args.max_time_offset,
+        arkit_csv=args.arkit_csv,
+        sensor_csv=args.sensor_csv,
+    )
     window.show()
     sys.exit(app.exec())
 

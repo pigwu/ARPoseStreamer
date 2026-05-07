@@ -114,6 +114,7 @@ It is especially useful when you want a clean building block for:
 
 - **3D Visualizer**: Real-time trajectory visualization with PyQt6 and OpenGL
 - **Tracking validator**: Dual-stream external camera rendering with adaptive sensor-to-ARKit calibration
+- **Offline validation**: Load ARKit and sensor CSV logs, save/load calibration JSON, and inspect timing drift
 - **Dual display modes**: View all history or last 5 seconds
 - **Time-gradient colors**: Trajectory colors fade from cyan (new) to red (old)
 - **Live monitoring**: FPS, packet count, dropped packets, latency display
