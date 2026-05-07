@@ -1,5 +1,5 @@
-# Build script for ARPose Visualizer
-# Creates a standalone executable for Windows
+# Build script for ARPose desktop tools
+# Creates standalone executables for Windows
 
 # Install PyInstaller if not already installed
 Write-Host "Checking PyInstaller..."
@@ -9,30 +9,42 @@ if ($LASTEXITCODE -ne 0) {
     pip install pyinstaller
 }
 
-# Build the executable
-Write-Host "`nBuilding ARPose Visualizer..."
-pyinstaller --name "ARPose Visualizer" `
-    --windowed `
-    --onefile `
-    --icon=Assets.xcassets/AppIcon.appiconset/Icon-1024.png `
-    --add-data "requirements_visualizer.txt;." `
-    --hidden-import="OpenGL" `
-    --hidden-import="OpenGL.GL" `
-    --hidden-import="OpenGL.GLU" `
-    --hidden-import="OpenGL.GLUT" `
-    --hidden-import="pyqtgraph.opengl" `
-    --exclude-module torch `
-    --exclude-module pandas `
-    --exclude-module scipy `
-    --exclude-module matplotlib `
-    --exclude-module IPython `
-    --exclude-module jupyter `
-    --exclude-module notebook `
-    --exclude-module sympy `
-    --exclude-module PIL `
-    --exclude-module tkinter `
-    udp_pose_visualizer.py
+function Build-DesktopTool {
+    param(
+        [Parameter(Mandatory=$true)] [string] $Name,
+        [Parameter(Mandatory=$true)] [string] $EntryPoint
+    )
+
+    Write-Host "`nBuilding $Name..."
+    pyinstaller --name $Name `
+        --windowed `
+        --onefile `
+        --icon=Assets.xcassets/AppIcon.appiconset/Icon-1024.png `
+        --add-data "requirements_visualizer.txt;." `
+        --hidden-import="OpenGL" `
+        --hidden-import="OpenGL.GL" `
+        --hidden-import="OpenGL.GLU" `
+        --hidden-import="OpenGL.GLUT" `
+        --hidden-import="pyqtgraph.opengl" `
+        --exclude-module torch `
+        --exclude-module pandas `
+        --exclude-module scipy `
+        --exclude-module matplotlib `
+        --exclude-module IPython `
+        --exclude-module jupyter `
+        --exclude-module notebook `
+        --exclude-module sympy `
+        --exclude-module PIL `
+        --exclude-module tkinter `
+        $EntryPoint
+}
+
+# Build the executables
+Build-DesktopTool -Name "ARPose Visualizer" -EntryPoint "udp_pose_visualizer.py"
+Build-DesktopTool -Name "ARPose Tracking Validator" -EntryPoint "pose_tracking_validator.py"
 
 Write-Host "`nBuild complete!"
-Write-Host "Executable location: dist\ARPose Visualizer.exe"
+Write-Host "Executable locations:"
+Write-Host "  dist\ARPose Visualizer.exe"
+Write-Host "  dist\ARPose Tracking Validator.exe"
 Write-Host "`nYou can now run the application by double-clicking the .exe file"

@@ -1,6 +1,6 @@
 # Building Standalone Executable
 
-This guide explains how to build a standalone executable of ARPose Visualizer that can be distributed without requiring Python installation.
+This guide explains how to build standalone executables for the ARPose desktop tools that can be distributed without requiring Python installation.
 
 ## Prerequisites
 
@@ -15,8 +15,10 @@ This guide explains how to build a standalone executable of ARPose Visualizer th
    ```powershell
    .\build_windows.ps1
    ```
-3. The executable will be created at: `dist\ARPose Visualizer.exe`
-4. You can distribute this single .exe file
+3. The executables will be created at:
+   - `dist\ARPose Visualizer.exe`
+   - `dist\ARPose Tracking Validator.exe`
+4. You can distribute these .exe files
 
 ## Building on macOS
 
@@ -25,8 +27,10 @@ This guide explains how to build a standalone executable of ARPose Visualizer th
    ```bash
    ./build_macos.sh
    ```
-3. The application will be created at: `dist/ARPose Visualizer.app`
-4. You can distribute this .app bundle
+3. The applications will be created at:
+   - `dist/ARPose Visualizer.app`
+   - `dist/ARPose Tracking Validator.app`
+4. You can distribute these .app bundles
 
 ## Distribution
 
