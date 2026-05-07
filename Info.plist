@@ -31,6 +31,10 @@
     <string>This app uses the camera for AR pose tracking and relative position estimation.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>This app uses the local network to stream AR pose data to a remote receiver.</string>
+    <key>UISupportedExternalAccessoryProtocols</key>
+    <array>
+        <string>com.example.sensor.pose</string>
+    </array>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
     <key>UIRequiredDeviceCapabilities</key>

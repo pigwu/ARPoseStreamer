@@ -19,11 +19,29 @@ struct AppSettingsView: View {
                     TextField("Upload Port", text: $viewModel.uploadPort)
                         .keyboardType(.numberPad)
 
+                    TextField("Sensor UDP Port", text: $viewModel.sensorPort)
+                        .keyboardType(.numberPad)
+
                     Picker("Receiver OS", selection: $viewModel.receiverPlatform) {
                         ForEach(ReceiverPlatform.allCases) { platform in
                             Text(platform.displayName).tag(platform)
                         }
                     }
+                }
+
+                Section("Wired Sensor") {
+                    TextField("Accessory Protocol", text: $viewModel.sensorAccessoryProtocol)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    LabeledContent("Mirror Target") {
+                        Text(viewModel.sensorTargetSummary)
+                            .multilineTextAlignment(.trailing)
+                    }
+
+                    Text("Expected serial lines: seq,t,x,y,z,qx,qy,qz,qw or t,x,y,z,qx,qy,qz,qw. Quaternion order is xyzw.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Display") {

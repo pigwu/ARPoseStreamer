@@ -129,6 +129,9 @@ private struct BottomDashboard: View {
                 if viewModel.recordingStatus != "Video idle" {
                     StatusChip(text: viewModel.recordingStatus)
                 }
+                if viewModel.sensorStatus != "Sensor idle" {
+                    StatusChip(text: viewModel.sensorStatus)
+                }
             }
 
             if viewModel.uploadStatus != "Upload idle" {
@@ -156,10 +159,28 @@ private struct BottomDashboard: View {
             }
 
             HStack {
+                Text(viewModel.latestSensorSummary)
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.72))
+                    .lineLimit(2)
+
+                Spacer()
+            }
+
+            HStack {
                 Text("Latest capture: \(viewModel.lastCaptureSessionName)")
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.72))
                 Spacer()
+            }
+
+            if viewModel.lastSensorLogName != "No sensor log yet" {
+                HStack {
+                    Text("Sensor log: \(viewModel.lastSensorLogName)")
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.72))
+                    Spacer()
+                }
             }
         }
         .padding(16)
@@ -194,6 +215,15 @@ private struct SidebarDrawer: View {
                     viewModel.stopRecording()
                 } else {
                     viewModel.startRecording()
+                }
+            }
+            .buttonStyle(.borderedProminent)
+
+            Button(viewModel.isSensorStreaming ? "Stop Wired Sensor" : "Start Wired Sensor") {
+                if viewModel.isSensorStreaming {
+                    viewModel.stopWiredSensor()
+                } else {
+                    viewModel.startWiredSensor()
                 }
             }
             .buttonStyle(.borderedProminent)

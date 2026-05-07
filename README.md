@@ -113,14 +113,17 @@ It is especially useful when you want a clean building block for:
 ## Highlights
 
 - **3D Visualizer**: Real-time trajectory visualization with PyQt6 and OpenGL
+- **Tracking validator**: Dual-stream external camera rendering with adaptive sensor-to-ARKit calibration
 - **Dual display modes**: View all history or last 5 seconds
 - **Time-gradient colors**: Trajectory colors fade from cyan (new) to red (old)
 - **Live monitoring**: FPS, packet count, dropped packets, latency display
 - **Cross-platform**: Works on macOS and Windows
 - ARKit world tracking
+- Optional wired sensor mirror for iOS-supported ExternalAccessory hardware
 - Resettable relative origin
 - 60 Hz oriented streaming pipeline
 - UDP output to a configurable host IP on port `5555`
+- Wired sensor UDP mirror to port `5556` for tracking validation
 - HTTP upload to a configurable host IP and upload port
 - Compact pose packets
 - Cross-platform Python receiver (CLI and GUI)
@@ -356,6 +359,7 @@ Detailed docs:
 - `project.yml`: XcodeGen project spec
 - `udp_pose_receiver.py`: Python UDP receiver (CLI) for macOS and Windows
 - `udp_pose_visualizer.py`: Python 3D visualizer (GUI) with real-time trajectory display
+- `pose_tracking_validator.py`: Python dual-stream validator for ARKit and wired sensor pose streams
 - `requirements_visualizer.txt`: Python dependencies for the 3D visualizer
 - `run_receiver_mac.sh`: macOS helper launcher for CLI receiver
 - `run_receiver_windows.ps1`: Windows helper launcher for CLI receiver

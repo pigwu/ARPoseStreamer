@@ -83,6 +83,12 @@ final class PositionViewModel: ObservableObject {
     @Published var uploadPort: String {
         didSet { UserDefaults.standard.set(uploadPort, forKey: Self.uploadPortKey) }
     }
+    @Published var sensorPort: String {
+        didSet { UserDefaults.standard.set(sensorPort, forKey: Self.sensorPortKey) }
+    }
+    @Published var sensorAccessoryProtocol: String {
+        didSet { UserDefaults.standard.set(sensorAccessoryProtocol, forKey: Self.sensorAccessoryProtocolKey) }
+    }
     @Published var receiverPlatform: ReceiverPlatform {
         didSet { UserDefaults.standard.set(receiverPlatform.rawValue, forKey: Self.receiverPlatformKey) }
     }
@@ -91,16 +97,21 @@ final class PositionViewModel: ObservableObject {
     }
 
     @Published private(set) var position: SIMD3<Float> = .zero
+    @Published private(set) var sensorPosition: SIMD3<Float> = .zero
     @Published private(set) var positionHistory: [PositionHistorySample] = []
     @Published private(set) var sendStatus = "Idle"
+    @Published private(set) var sensorStatus = "Sensor idle"
     @Published private(set) var uploadStatus = "Upload idle"
     @Published private(set) var latestPacketSummary = "No packets yet"
+    @Published private(set) var latestSensorSummary = "No sensor packets yet"
     @Published private(set) var recordingStatus = VideoRecordingStatus.idle.message
     @Published private(set) var isSending = false
+    @Published private(set) var isSensorStreaming = false
     @Published private(set) var isRecordingVideo = false
     @Published private(set) var lastSavedVideoURL: URL?
     @Published private(set) var lastSavedVideoName = "No saved video yet"
     @Published private(set) var lastCaptureSessionName = "No capture exported yet"
+    @Published private(set) var lastSensorLogName = "No sensor log yet"
     @Published private(set) var captureRecords: [CaptureRecord] = []
     @Published private(set) var uploadingRecordIDs: Set<UUID> = []
     @Published var pendingReuploadPrompt: ReuploadPrompt?
@@ -108,7 +119,9 @@ final class PositionViewModel: ObservableObject {
     private let maxHistorySamples = 120
     private let captureLibraryStore = CaptureLibraryStore()
     private let captureUploadService = CaptureUploadService()
+    private let sensorRecorder = SensorPoseStreamRecorder()
     private var sender: ARPoseUDPSender?
+    private var sensorBridge: WiredSensorPoseBridge?
 
     var previewSession: ARSession? {
         sender?.session
@@ -126,11 +139,17 @@ final class PositionViewModel: ObservableObject {
         "HTTP upload server at \(hostIP):\(uploadPort)"
     }
 
+    var sensorTargetSummary: String {
+        "Wired sensor mirror at \(hostIP):\(sensorPort)"
+    }
+
     init() {
         let defaults = UserDefaults.standard
         hostIP = defaults.string(forKey: Self.hostIPKey) ?? "192.168.1.10"
         hostPort = defaults.string(forKey: Self.hostPortKey) ?? "5555"
         uploadPort = defaults.string(forKey: Self.uploadPortKey) ?? "8000"
+        sensorPort = defaults.string(forKey: Self.sensorPortKey) ?? "5556"
+        sensorAccessoryProtocol = defaults.string(forKey: Self.sensorAccessoryProtocolKey) ?? "com.example.sensor.pose"
         receiverPlatform = ReceiverPlatform(rawValue: defaults.string(forKey: Self.receiverPlatformKey) ?? ReceiverPlatform.macOS.rawValue) ?? .macOS
         showPositionChart = defaults.object(forKey: Self.showPositionChartKey) as? Bool ?? true
         captureRecords = captureLibraryStore.loadRecords().sorted { $0.createdAt > $1.createdAt }
@@ -161,6 +180,43 @@ final class PositionViewModel: ObservableObject {
         sendStatus = "Stopped"
     }
 
+    func startWiredSensor() {
+        guard let port = normalizedPort(sensorPort) else {
+            sensorStatus = "Invalid sensor UDP port"
+            return
+        }
+
+        let trimmedProtocol = sensorAccessoryProtocol.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedProtocol.isEmpty else {
+            sensorStatus = "External accessory protocol is empty"
+            return
+        }
+
+        if sensorBridge == nil {
+            configureSensorBridge(port: port)
+        } else {
+            sensorBridge?.updateDestination(hostIP: hostIP, port: port)
+        }
+
+        guard let sensorBridge else {
+            sensorStatus = "Could not create sensor bridge"
+            return
+        }
+
+        sensorRecorder.startSessionIfNeeded()
+        lastSensorLogName = sensorRecorder.currentFileName
+        sensorBridge.start(accessoryProtocol: trimmedProtocol)
+        isSensorStreaming = true
+        sensorStatus = "Waiting for wired sensor"
+    }
+
+    func stopWiredSensor() {
+        sensorBridge?.stop()
+        sensorRecorder.finishSession()
+        isSensorStreaming = false
+        sensorStatus = "Sensor idle"
+    }
+
     func startRecording() {
         if sender == nil {
             configureSender()
@@ -186,6 +242,10 @@ final class PositionViewModel: ObservableObject {
 
         if isSending {
             stopSending()
+        }
+
+        if isSensorStreaming {
+            stopWiredSensor()
         }
 
         sender?.stopPreview()
@@ -384,6 +444,56 @@ final class PositionViewModel: ObservableObject {
         }
     }
 
+    private func configureSensorBridge(port: UInt16) {
+        let newBridge = WiredSensorPoseBridge(hostIP: hostIP, port: port)
+        sensorBridge = newBridge
+
+        newBridge?.onSampleReceived = { [weak self] sample in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+
+                self.sensorPosition = sample.position
+                self.sensorRecorder.append(sample: sample)
+                self.lastSensorLogName = self.sensorRecorder.currentFileName
+                self.latestSensorSummary = String(
+                    format: "#%u  rx  x=%.3f  y=%.3f  z=%.3f",
+                    sample.sequence,
+                    sample.position.x,
+                    sample.position.y,
+                    sample.position.z
+                )
+            }
+        }
+
+        newBridge?.onSampleForwarded = { [weak self] sample in
+            Task { @MainActor [weak self] in
+                self?.latestSensorSummary = String(
+                    format: "#%u  forwarded  x=%.3f  y=%.3f  z=%.3f",
+                    sample.sequence,
+                    sample.position.x,
+                    sample.position.y,
+                    sample.position.z
+                )
+            }
+        }
+
+        newBridge?.onStatusChanged = { [weak self] status in
+            Task { @MainActor [weak self] in
+                self?.sensorStatus = status
+            }
+        }
+
+        newBridge?.onError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                if let wiredError = error as? WiredSensorError, case .noMatchingAccessory = wiredError {
+                    self?.sensorStatus = "Waiting for wired sensor"
+                } else {
+                    self?.sensorStatus = "Sensor error: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     private func normalizedPort(_ value: String) -> UInt16? {
         UInt16(value)
     }
@@ -410,6 +520,8 @@ final class PositionViewModel: ObservableObject {
     private static let hostIPKey = "ARPoseStreamer.hostIP"
     private static let hostPortKey = "ARPoseStreamer.hostPort"
     private static let uploadPortKey = "ARPoseStreamer.uploadPort"
+    private static let sensorPortKey = "ARPoseStreamer.sensorPort"
+    private static let sensorAccessoryProtocolKey = "ARPoseStreamer.sensorAccessoryProtocol"
     private static let receiverPlatformKey = "ARPoseStreamer.receiverPlatform"
     private static let showPositionChartKey = "ARPoseStreamer.showPositionChart"
 }
