@@ -1228,6 +1228,11 @@ class MainWindow(QMainWindow):
             if len(arkit_positions) > 0 and len(sensor_positions) > 0:
                 sensor_positions = self.align_trajectories(arkit_positions, sensor_positions)
 
+        # Align first frame for better visualization (both calibrated and uncalibrated modes)
+        if len(arkit_positions) > 0 and len(sensor_positions) > 0:
+            offset = arkit_positions[0] - sensor_positions[0]
+            sensor_positions = sensor_positions + offset
+
         # Debug: print lengths
         if len(sensor_positions) == 0:
             print(f"Warning: sensor_positions is empty! apply_calibration={self.apply_calibration}, calibrated_track exists={self.calibrated_sensor_track is not None}")
