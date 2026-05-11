@@ -1329,7 +1329,7 @@ def main():
     parser.add_argument(
         "--max-time-offset",
         type=float,
-        default=0.5,
+        default=5.0,
         help="Maximum sensor time offset to scan during adaptive calibration, in seconds.",
     )
     parser.add_argument("--arkit-csv", default=None, help="Offline ARKit pose CSV path.")
