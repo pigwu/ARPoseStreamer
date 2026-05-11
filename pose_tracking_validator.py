@@ -193,7 +193,8 @@ def load_pose_csv(path, stream):
         for index, row in enumerate(reader):
             try:
                 sequence = int(float(row.get("sequence", index)))
-                sender_time = first_float(row, ["sender_time", "received_time", "time", "timestamp"])
+                # Prefer relative_time for synchronization, fall back to absolute timestamps
+                sender_time = first_float(row, ["relative_time", "time", "sender_time", "received_time", "timestamp"])
                 frame_time = first_float(row, ["frame_time", "received_time", "recv_time"], default=sender_time)
                 sensor_time = first_float(row, ["sensor_time"], default=None, required=False)
                 position = np.array([
