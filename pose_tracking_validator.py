@@ -195,7 +195,7 @@ def load_pose_csv(path, stream):
                 sequence = int(float(row.get("sequence", index)))
                 sender_time = first_float(row, ["sender_time", "received_time", "time", "timestamp"])
                 frame_time = first_float(row, ["frame_time", "received_time", "recv_time"], default=sender_time)
-                sensor_time = first_float(row, ["sensor_time"], default=None)
+                sensor_time = first_float(row, ["sensor_time"], default=None, required=False)
                 position = np.array([
                     float(row["x"]),
                     float(row["y"]),
@@ -226,12 +226,12 @@ def load_pose_csv(path, stream):
     return samples
 
 
-def first_float(row, keys, default=None):
+def first_float(row, keys, default=None, required=True):
     for key in keys:
         value = row.get(key)
         if value not in (None, ""):
             return float(value)
-    if default is None:
+    if required and default is None:
         raise ValueError(f"Missing required numeric field from {keys}")
     return default
 
