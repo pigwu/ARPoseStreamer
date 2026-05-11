@@ -1206,6 +1206,11 @@ class MainWindow(QMainWindow):
             sensor_positions = sensor_track.positions(window)
             sensor_pose = sensor_track.latest_relative()
 
+        # Align first frame positions for better visualization
+        if len(arkit_positions) > 0 and len(sensor_positions) > 0:
+            offset = arkit_positions[0] - sensor_positions[0]
+            sensor_positions = sensor_positions + offset
+
         self.view.update_scene(arkit_positions, sensor_positions, arkit_pose, sensor_pose)
 
     def load_arkit_csv(self):
