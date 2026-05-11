@@ -1206,9 +1206,9 @@ class MainWindow(QMainWindow):
             sensor_positions = sensor_track.positions(window)
             sensor_pose = sensor_track.latest_relative()
 
-        # Align coordinate systems using first 100 frames
-        if len(arkit_positions) > 0 and len(sensor_positions) > 0:
-            sensor_positions = self.align_trajectories(arkit_positions, sensor_positions)
+            # Only apply manual alignment when calibration is NOT applied
+            if len(arkit_positions) > 0 and len(sensor_positions) > 0:
+                sensor_positions = self.align_trajectories(arkit_positions, sensor_positions)
 
         self.view.update_scene(arkit_positions, sensor_positions, arkit_pose, sensor_pose)
 
