@@ -1193,15 +1193,19 @@ class MainWindow(QMainWindow):
     def update_render(self):
         window = None if self.show_all else 5.0
         arkit_positions = self.tracks["arkit"].positions(window)
-        sensor_track = self.calibrated_sensor_track if self.apply_calibration else self.tracks["sensor"]
         arkit_pose = self.tracks["arkit"].latest_relative()
-        arkit_origin = self.tracks["arkit"].origin if self.apply_calibration else None
+
+        # Always show both tracks, even when calibration is applied
         if self.apply_calibration:
+            sensor_track = self.calibrated_sensor_track
+            arkit_origin = self.tracks["arkit"].origin
             sensor_positions = sensor_track.positions(window, reference_origin=arkit_origin)
             sensor_pose = sensor_track.latest_relative(reference_origin=arkit_origin)
         else:
+            sensor_track = self.tracks["sensor"]
             sensor_positions = sensor_track.positions(window)
             sensor_pose = sensor_track.latest_relative()
+
         self.view.update_scene(arkit_positions, sensor_positions, arkit_pose, sensor_pose)
 
     def load_arkit_csv(self):
