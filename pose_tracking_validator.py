@@ -633,7 +633,13 @@ class PoseTrack:
     def positions(self, last_seconds=None):
         if not self.samples:
             return np.empty((0, 3), dtype=float)
-        cutoff = None if last_seconds is None else time.time() - last_seconds
+
+        # For CSV data, recv_time is relative time, not Unix timestamp
+        # Only apply time filtering for live data (recv_time > 1e9 indicates Unix timestamp)
+        cutoff = None
+        if last_seconds is not None and self.samples and self.samples[0].recv_time > 1e9:
+            cutoff = time.time() - last_seconds
+
         points = []
         origin = self.origin if self.origin is not None else np.zeros(3, dtype=float)
         for sample in self.samples:
@@ -669,10 +675,20 @@ class CalibratedSensorTrack:
         self.origin = None
 
     def positions(self, last_seconds=None, reference_origin=None):
-        if not self.calibration_result.enabled or not self.source_track.samples:
+        if not self.calibration_result.enabled:
+            print(f"CalibratedSensorTrack.positions: calibration not enabled!")
             return np.empty((0, 3), dtype=float)
 
-        cutoff = None if last_seconds is None else time.time() - last_seconds
+        if not self.source_track.samples:
+            print(f"CalibratedSensorTrack.positions: no source samples!")
+            return np.empty((0, 3), dtype=float)
+
+        # For CSV data, recv_time is relative time, not Unix timestamp
+        # Only apply time filtering for live data (recv_time > 1e9 indicates Unix timestamp)
+        cutoff = None
+        if last_seconds is not None and self.source_track.samples and self.source_track.samples[0].recv_time > 1e9:
+            cutoff = time.time() - last_seconds
+
         points = []
         for sample in self.source_track.samples:
             if cutoff is not None and sample.recv_time < cutoff:
@@ -680,9 +696,11 @@ class CalibratedSensorTrack:
             points.append(self.calibration_result.transform.apply_position(sample.position))
 
         if not points:
+            print(f"CalibratedSensorTrack.positions: no points after filtering!")
             return np.empty((0, 3), dtype=float)
 
         points = np.array(points, dtype=float)
+        print(f"CalibratedSensorTrack.positions: returning {len(points)} points")
         if reference_origin is not None:
             return points - reference_origin
         if self.origin is None:
@@ -1196,7 +1214,7 @@ class MainWindow(QMainWindow):
         arkit_pose = self.tracks["arkit"].latest_relative()
 
         # Always show both tracks, even when calibration is applied
-        if self.apply_calibration:
+        if self.apply_calibration and self.calibrated_sensor_track is not None:
             sensor_track = self.calibrated_sensor_track
             arkit_origin = self.tracks["arkit"].origin
             sensor_positions = sensor_track.positions(window, reference_origin=arkit_origin)
@@ -1209,6 +1227,10 @@ class MainWindow(QMainWindow):
             # Only apply manual alignment when calibration is NOT applied
             if len(arkit_positions) > 0 and len(sensor_positions) > 0:
                 sensor_positions = self.align_trajectories(arkit_positions, sensor_positions)
+
+        # Debug: print lengths
+        if len(sensor_positions) == 0:
+            print(f"Warning: sensor_positions is empty! apply_calibration={self.apply_calibration}, calibrated_track exists={self.calibrated_sensor_track is not None}")
 
         self.view.update_scene(arkit_positions, sensor_positions, arkit_pose, sensor_pose)
 
