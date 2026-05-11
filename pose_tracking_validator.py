@@ -946,7 +946,14 @@ class MainWindow(QMainWindow):
 
         service_box = QGroupBox("Streams")
         service_layout = QVBoxLayout()
-        self.start_button = QPushButton("Start Validation")
+
+        self.load_arkit_csv_button = QPushButton("Load iPhone CSV")
+        self.load_sensor_csv_button = QPushButton("Load Robot Arm CSV")
+        self.arkit_csv_label = QLabel("iPhone: Not loaded")
+        self.sensor_csv_label = QLabel("Robot Arm: Not loaded")
+        self.clear_data_button = QPushButton("Clear All Data")
+
+        self.start_button = QPushButton("Start Live Validation")
         self.stop_button = QPushButton("Stop")
         self.reset_button = QPushButton("Reset Origins")
         self.save_calibration_button = QPushButton("Save Calibration")
@@ -954,6 +961,9 @@ class MainWindow(QMainWindow):
         self.show_all_checkbox = QCheckBox("Show all history")
         self.apply_calibration_checkbox = QCheckBox("Apply adaptive calibration")
 
+        self.load_arkit_csv_button.clicked.connect(self.load_arkit_csv)
+        self.load_sensor_csv_button.clicked.connect(self.load_sensor_csv)
+        self.clear_data_button.clicked.connect(self.clear_all_data)
         self.start_button.clicked.connect(self.start_receivers)
         self.stop_button.clicked.connect(self.stop_receivers)
         self.reset_button.clicked.connect(self.reset_origins)
@@ -962,7 +972,17 @@ class MainWindow(QMainWindow):
         self.show_all_checkbox.stateChanged.connect(self.change_history_mode)
         self.apply_calibration_checkbox.stateChanged.connect(self.change_calibration_mode)
 
+        self.arkit_csv_label.setWordWrap(True)
+        self.sensor_csv_label.setWordWrap(True)
+        self.arkit_csv_label.setStyleSheet("font-size: 11px; color: #a0a8b0;")
+        self.sensor_csv_label.setStyleSheet("font-size: 11px; color: #a0a8b0;")
+
         for widget in [
+            self.load_arkit_csv_button,
+            self.arkit_csv_label,
+            self.load_sensor_csv_button,
+            self.sensor_csv_label,
+            self.clear_data_button,
             self.start_button,
             self.stop_button,
             self.reset_button,
@@ -1182,6 +1202,113 @@ class MainWindow(QMainWindow):
             sensor_positions = sensor_track.positions(window)
             sensor_pose = sensor_track.latest_relative()
         self.view.update_scene(arkit_positions, sensor_positions, arkit_pose, sensor_pose)
+
+    def load_arkit_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load iPhone Pose CSV",
+            str(Path.home()),
+            "CSV Files (*.csv);;All Files (*.*)"
+        )
+        if not path:
+            return
+
+        self.stop_receivers()
+        self.tracks["arkit"] = PoseTrack()
+
+        try:
+            samples = load_pose_csv(path, "arkit")
+            for sample in samples:
+                self.tracks["arkit"].append(sample)
+
+            self.arkit_csv = path
+            filename = Path(path).name
+            self.arkit_csv_label.setText(f"iPhone: {filename} ({len(samples)} samples)")
+            self.stats_panel.update_stream("arkit", {
+                "fps": 0.0,
+                "packets": len(samples),
+                "drops": 0,
+                "latency_ms": 0.0,
+                "protocol_version": samples[-1].protocol_version if samples else 1,
+            })
+
+            if self.sensor_csv:
+                self.update_calibration_from_loaded_data()
+
+        except Exception as e:
+            self.arkit_csv_label.setText(f"iPhone: Error loading file")
+            print(f"Error loading ARKit CSV: {e}")
+
+    def load_sensor_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Robot Arm Pose CSV",
+            str(Path.home()),
+            "CSV Files (*.csv);;All Files (*.*)"
+        )
+        if not path:
+            return
+
+        self.stop_receivers()
+        self.tracks["sensor"] = PoseTrack()
+
+        try:
+            samples = load_pose_csv(path, "sensor")
+            for sample in samples:
+                self.tracks["sensor"].append(sample)
+
+            self.sensor_csv = path
+            filename = Path(path).name
+            self.sensor_csv_label.setText(f"Robot Arm: {filename} ({len(samples)} samples)")
+            self.stats_panel.update_stream("sensor", {
+                "fps": 0.0,
+                "packets": len(samples),
+                "drops": 0,
+                "latency_ms": 0.0,
+                "protocol_version": samples[-1].protocol_version if samples else 1,
+            })
+
+            if self.arkit_csv:
+                self.update_calibration_from_loaded_data()
+
+        except Exception as e:
+            self.sensor_csv_label.setText(f"Robot Arm: Error loading file")
+            print(f"Error loading sensor CSV: {e}")
+
+    def update_calibration_from_loaded_data(self):
+        if not self.tracks["arkit"].samples or not self.tracks["sensor"].samples:
+            return
+
+        result = self.calibrator.update(self.tracks["arkit"].samples, self.tracks["sensor"].samples)
+        self.calibrated_sensor_track.calibration_result = result
+        self.stats_panel.update_calibration(result, self.apply_calibration)
+
+    def clear_all_data(self):
+        self.stop_receivers()
+        self.tracks["arkit"] = PoseTrack()
+        self.tracks["sensor"] = PoseTrack()
+        self.calibrator = AdaptiveCalibrator(max_time_offset=self.max_time_offset, pairing_window=self.pairing_window)
+        self.calibrated_sensor_track = CalibratedSensorTrack(self.tracks["sensor"], self.calibrator.result)
+        self.arkit_csv = None
+        self.sensor_csv = None
+        self.arkit_csv_label.setText("iPhone: Not loaded")
+        self.sensor_csv_label.setText("Robot Arm: Not loaded")
+        self.stats_panel.update_stream("arkit", {
+            "fps": 0.0,
+            "packets": 0,
+            "drops": 0,
+            "latency_ms": 0.0,
+            "protocol_version": 1,
+        })
+        self.stats_panel.update_stream("sensor", {
+            "fps": 0.0,
+            "packets": 0,
+            "drops": 0,
+            "latency_ms": 0.0,
+            "protocol_version": 1,
+        })
+        self.stats_panel.update_error(None, None, None)
+        self.stats_panel.update_calibration(self.calibrator.result, self.apply_calibration)
 
     def closeEvent(self, event):
         self.stop_receivers()
