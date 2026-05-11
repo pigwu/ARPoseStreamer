@@ -1206,12 +1206,71 @@ class MainWindow(QMainWindow):
             sensor_positions = sensor_track.positions(window)
             sensor_pose = sensor_track.latest_relative()
 
-        # Align first frame positions for better visualization
+        # Align coordinate systems using first 100 frames
         if len(arkit_positions) > 0 and len(sensor_positions) > 0:
-            offset = arkit_positions[0] - sensor_positions[0]
-            sensor_positions = sensor_positions + offset
+            sensor_positions = self.align_trajectories(arkit_positions, sensor_positions)
 
         self.view.update_scene(arkit_positions, sensor_positions, arkit_pose, sensor_pose)
+
+    def align_trajectories(self, arkit_pos, sensor_pos, align_frames=100):
+        """Align sensor trajectory to arkit using first N frames to eliminate coordinate system differences"""
+        if len(arkit_pos) < 2 or len(sensor_pos) < 2:
+            return sensor_pos
+
+        # Use first N frames for alignment
+        n = min(align_frames, len(arkit_pos), len(sensor_pos))
+        arkit_subset = arkit_pos[:n]
+        sensor_subset = sensor_pos[:n]
+
+        # Find motion start (skip static initial frames)
+        motion_threshold = 0.001  # 1mm
+        arkit_start = 0
+        for i in range(1, len(arkit_subset)):
+            if np.linalg.norm(arkit_subset[i] - arkit_subset[0]) > motion_threshold:
+                arkit_start = i
+                break
+
+        sensor_start = 0
+        for i in range(1, len(sensor_subset)):
+            if np.linalg.norm(sensor_subset[i] - sensor_subset[0]) > motion_threshold:
+                sensor_start = i
+                break
+
+        # Align motion start points
+        arkit_motion = arkit_subset[arkit_start:]
+        sensor_motion = sensor_subset[sensor_start:]
+
+        if len(arkit_motion) < 10 or len(sensor_motion) < 10:
+            # Not enough motion data, use simple first frame alignment
+            offset = arkit_pos[0] - sensor_pos[0]
+            return sensor_pos + offset
+
+        # Compute centroids
+        arkit_centroid = np.mean(arkit_motion, axis=0)
+        sensor_centroid = np.mean(sensor_motion, axis=0)
+
+        # Center the point sets
+        arkit_centered = arkit_motion - arkit_centroid
+        sensor_centered = sensor_motion - sensor_centroid
+
+        # Compute optimal rotation using SVD (Kabsch algorithm)
+        n_pairs = min(len(arkit_centered), len(sensor_centered))
+        H = sensor_centered[:n_pairs].T @ arkit_centered[:n_pairs]
+        U, _, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+
+        # Ensure proper rotation (det(R) = 1)
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+
+        # Compute translation
+        t = arkit_centroid - R @ sensor_centroid
+
+        # Apply transformation to all sensor positions
+        sensor_aligned = (R @ sensor_pos.T).T + t
+
+        return sensor_aligned
 
     def load_arkit_csv(self):
         path, _ = QFileDialog.getOpenFileName(
