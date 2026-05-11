@@ -1362,6 +1362,9 @@ class MainWindow(QMainWindow):
             if self.arkit_csv:
                 self.update_calibration_from_loaded_data()
 
+            # Update calibrated_sensor_track to reference the new sensor track
+            self.calibrated_sensor_track.source_track = self.tracks["sensor"]
+
         except Exception as e:
             self.sensor_csv_label.setText(f"Robot Arm: Error loading file")
             print(f"Error loading sensor CSV: {e}")
