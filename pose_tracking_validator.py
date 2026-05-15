@@ -1519,7 +1519,7 @@ class CalibrationPlotter:
 
 
 class OfflinePoseCalibrationPipeline:
-    def __init__(self, max_pair_delta=0.05, smooth_window=11):
+    def __init__(self, max_pair_delta=0.05, smooth_window=11, cross_validate_scale=False, cv_folds=5, skip_world_refinement=False):
         self.loader = PoseDataLoader()
         self.time_sync = TimeSynchronizer(smooth_window=smooth_window)
         self.scale_calibrator = ScaleCalibrator()
@@ -1528,7 +1528,9 @@ class OfflinePoseCalibrationPipeline:
         self.hand_eye_refiner = HandEyeRefiner()
         self.evaluator = CalibrationEvaluator()
         self.stage_evaluator = StageEvaluator()
-        self.cross_validator = CrossValidator()
+        self.cross_validator = CrossValidator(fold_count=cv_folds)
+        self.cross_validate_scale = cross_validate_scale
+        self.skip_world_refinement = skip_world_refinement
 
     def run(self, arkit_csv, robot_csv):
         arkit_series = self.loader.load_series(arkit_csv, "arkit")
@@ -1567,27 +1569,33 @@ class OfflinePoseCalibrationPipeline:
             scale_result.scale_factor,
         )
         initial_evaluation = self.evaluator.evaluate(hand_eye_result)
-        refined_hand_eye_result, refined_scale = self.hand_eye_refiner.refine(
-            hand_eye_result,
-            arkit_series,
-            scale_result.scale_factor,
-        )
+        if self.skip_world_refinement:
+            refined_hand_eye_result = hand_eye_result
+            refined_scale = scale_result.scale_factor
+        else:
+            refined_hand_eye_result, refined_scale = self.hand_eye_refiner.refine(
+                hand_eye_result,
+                arkit_series,
+                scale_result.scale_factor,
+            )
         evaluation_result = self.evaluator.evaluate(refined_hand_eye_result)
         stage_evaluations = self.stage_evaluator.evaluate_stages(
             refined_hand_eye_result,
             arkit_series,
             scale_result.scale_factor,
         )
-        cross_validation = self.cross_validator.evaluate_scale_generalization(
-            refined_hand_eye_result.matched_pairs,
-            scale_result.initial_scale_factor,
-            self.hand_eye_calibrator,
-            self.hand_eye_refiner,
-            self.evaluator,
-            robot_series,
-            arkit_series,
-            time_sync_result.arkit_time_shifted,
-        )
+        cross_validation = None
+        if self.cross_validate_scale:
+            cross_validation = self.cross_validator.evaluate_scale_generalization(
+                refined_hand_eye_result.matched_pairs,
+                scale_result.initial_scale_factor,
+                self.hand_eye_calibrator,
+                self.hand_eye_refiner,
+                self.evaluator,
+                robot_series,
+                arkit_series,
+                time_sync_result.arkit_time_shifted,
+            )
         return OfflineCalibrationResult(
             time_sync=time_sync_result,
             scale=scale_result,
@@ -2809,6 +2817,22 @@ def main():
         default="offline_calibration_output",
         help="Root directory for offline result JSON and generated plots. Each run gets its own timestamped subfolder.",
     )
+    parser.add_argument(
+        "--cross-validate-scale",
+        action="store_true",
+        help="Run block-wise cross-validation to quantify scale overfitting risk.",
+    )
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=5,
+        help="Number of blocked folds used when --cross-validate-scale is enabled.",
+    )
+    parser.add_argument(
+        "--skip-world-refinement",
+        action="store_true",
+        help="Skip the optional session-level T_base_world refinement step.",
+    )
     args = parser.parse_args()
 
     if args.mode == "offline":
@@ -2818,6 +2842,9 @@ def main():
         pipeline = OfflinePoseCalibrationPipeline(
             max_pair_delta=args.max_pair_delta,
             smooth_window=args.smooth_window,
+            cross_validate_scale=args.cross_validate_scale,
+            cv_folds=args.cv_folds,
+            skip_world_refinement=args.skip_world_refinement,
         )
         result = pipeline.run(args.arkit_csv, args.sensor_csv)
         print_offline_result(result)
