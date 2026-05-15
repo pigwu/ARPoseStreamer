@@ -8,6 +8,8 @@
 
 **A lightweight iPhone ARKit app and cross-platform UDP receiver for streaming relative camera pose to a host machine.**
 
+**Language / 语言**: [English](README.md) | [简体中文](docs/README.zh-CN.md)
+
 ![ARPoseStreamer Hero](docs/assets/hero-banner.svg)
 
 </div>
@@ -68,6 +70,7 @@ Mac / Windows receiver
 ## Table Of Contents
 
 - [What It Does](#what-it-does)
+- [Offline Calibration](#offline-calibration)
 - [Why This Repo Exists](#why-this-repo-exists)
 - [Highlights](#highlights)
 - [Quick Start](#quick-start)
@@ -98,6 +101,31 @@ Default frame convention:
 
 - right-handed
 - `Z-up`
+
+## Offline Calibration
+
+This repository now includes an offline calibration and validation pipeline for aligning ARKit camera poses with robot end-effector poses.
+
+What it estimates:
+
+- time synchronization (`time_shift`)
+- kinematic scale initialization (`initial_scale_factor`)
+- geometry-refined effective scale (`scale_factor`)
+- hand-eye extrinsic (`T_cam2gripper`)
+- session-level world alignment (`T_base_world`)
+- reconstruction, relative-motion, and cross-validation metrics
+
+What it is for:
+
+- validating ARKit pose quality against robot ground truth
+- converting ARKit camera pose into robot gripper pose
+- quantifying overfitting risk with block-wise cross-validation
+- generating plots and JSON artifacts for technical review
+
+Calibration docs:
+
+- [Calibration Overview (EN)](docs/CALIBRATION_OVERVIEW.en.md)
+- [Calibration Overview (简体中文)](docs/CALIBRATION_OVERVIEW.zh-CN.md)
 
 ## Why This Repo Exists
 

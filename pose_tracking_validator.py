@@ -3,6 +3,7 @@ import bisect
 import csv
 import json
 import math
+import re
 import socket
 import struct
 import sys
@@ -13,20 +14,83 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import pyqtgraph.opengl as gl
-from PyQt6.QtCore import QThread, QTimer, pyqtSignal, Qt
-from PyQt6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QFileDialog,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QMainWindow,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
+
+try:
+    import pyqtgraph.opengl as gl
+    from PyQt6.QtCore import QThread, QTimer, pyqtSignal, Qt
+    from PyQt6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QFileDialog,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QMainWindow,
+        QPushButton,
+        QVBoxLayout,
+        QWidget,
+    )
+    GUI_DEPENDENCIES_AVAILABLE = True
+except ImportError:
+    GUI_DEPENDENCIES_AVAILABLE = False
+
+    class _MissingGuiBase:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("GUI mode requires PyQt6 and pyqtgraph. Install requirements_visualizer.txt first.")
+
+    class _DummyQtNamespace:
+        AlignTop = 0
+
+    class _DummyGLModule:
+        GLViewWidget = _MissingGuiBase
+        GLLinePlotItem = _MissingGuiBase
+        GLScatterPlotItem = _MissingGuiBase
+        GLGridItem = _MissingGuiBase
+        GLAxisItem = _MissingGuiBase
+
+    def pyqtSignal(*args, **kwargs):
+        return None
+
+    gl = _DummyGLModule()
+    QThread = _MissingGuiBase
+    QTimer = _MissingGuiBase
+    Qt = _DummyQtNamespace()
+    QApplication = _MissingGuiBase
+    QCheckBox = _MissingGuiBase
+    QFileDialog = _MissingGuiBase
+    QGroupBox = _MissingGuiBase
+    QHBoxLayout = _MissingGuiBase
+    QLabel = _MissingGuiBase
+    QMainWindow = _MissingGuiBase
+    QPushButton = _MissingGuiBase
+    QVBoxLayout = _MissingGuiBase
+    QWidget = _MissingGuiBase
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    from scipy.signal import correlate, correlation_lags, savgol_filter
+except ImportError:
+    correlate = None
+    correlation_lags = None
+    savgol_filter = None
+
+try:
+    from scipy.optimize import least_squares, minimize_scalar
+except ImportError:
+    least_squares = None
+    minimize_scalar = None
+
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 
 
 FLOAT32_PACKET = struct.Struct("<Id7f")
@@ -243,6 +307,92 @@ def parse_bool(value):
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
+def compose_transform(rotation, translation):
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = np.asarray(rotation, dtype=float)
+    transform[:3, 3] = np.asarray(translation, dtype=float).reshape(3)
+    return transform
+
+
+def pose_to_matrix(position, quaternion, translation_scale=1.0):
+    return compose_transform(
+        quaternion_to_matrix(quaternion),
+        np.asarray(position, dtype=float) * float(translation_scale),
+    )
+
+
+def invert_transform(transform):
+    rotation = np.asarray(transform[:3, :3], dtype=float)
+    translation = np.asarray(transform[:3, 3], dtype=float)
+    inverse = np.eye(4, dtype=float)
+    inverse[:3, :3] = rotation.T
+    inverse[:3, 3] = -rotation.T @ translation
+    return inverse
+
+
+def relative_transform(first, second):
+    return invert_transform(first) @ second
+
+
+def smooth_signal(values, preferred_window=11, polyorder=2):
+    if savgol_filter is None:
+        return np.asarray(values, dtype=float)
+
+    data = np.asarray(values, dtype=float)
+    if data.size < 5:
+        return data
+
+    window = min(int(preferred_window), int(data.size))
+    if window % 2 == 0:
+        window -= 1
+    if window <= polyorder:
+        return data
+    return savgol_filter(data, window_length=window, polyorder=min(polyorder, window - 1), mode="interp")
+
+
+def average_transform(transforms):
+    if not transforms:
+        raise ValueError("At least one transform is required for averaging.")
+
+    translations = np.array([transform[:3, 3] for transform in transforms], dtype=float)
+    quaternions = [matrix_to_quaternion(transform[:3, :3]) for transform in transforms]
+    return compose_transform(
+        quaternion_to_matrix(average_quaternion(quaternions)),
+        np.mean(translations, axis=0),
+    )
+
+
+def rotation_matrix_to_rotvec(rotation):
+    if cv2 is None:
+        raise ImportError("OpenCV is required for Rodrigues rotation conversions.")
+    rotvec, _ = cv2.Rodrigues(np.asarray(rotation, dtype=float))
+    return rotvec.reshape(3)
+
+
+def rotvec_to_rotation_matrix(rotvec):
+    if cv2 is None:
+        raise ImportError("OpenCV is required for Rodrigues rotation conversions.")
+    rotation, _ = cv2.Rodrigues(np.asarray(rotvec, dtype=float).reshape(3, 1))
+    return rotation
+
+
+def slugify_for_path(value):
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
+    text = text.strip("._-")
+    return text or "run"
+
+
+def prepare_run_output_dir(base_output_dir, arkit_csv, sensor_csv):
+    base_dir = Path(base_output_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    arkit_stem = slugify_for_path(Path(arkit_csv).stem)
+    sensor_stem = slugify_for_path(Path(sensor_csv).stem)
+    run_dir = base_dir / f"{timestamp}_{arkit_stem}__{sensor_stem}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
 class SimilarityTransform:
     def __init__(self, scale=1.0, rotation=None, translation=None, orientation_delta=None):
         self.scale = scale
@@ -336,6 +486,1242 @@ class CalibrationResult:
         result.motion_coverage = data.get("motion_coverage", "loaded")
         result.inlier_ratio = float(data.get("inlier_ratio", 1.0))
         return result
+
+
+@dataclass(frozen=True)
+class TrajectorySeries:
+    name: str
+    samples: list[PoseSample]
+    time: np.ndarray
+    position: np.ndarray
+    quaternion: np.ndarray
+
+    @classmethod
+    def from_samples(cls, name, samples):
+        ordered = sorted(samples, key=lambda sample: sample.sender_time)
+        time_values = np.array([sample.sender_time for sample in ordered], dtype=float)
+        if time_values.size == 0:
+            raise ValueError(f"{name} data is empty.")
+        time_values = time_values - float(np.min(time_values))
+        positions = np.array([sample.position for sample in ordered], dtype=float)
+        quaternions = np.array([normalize_quaternion(sample.quaternion) for sample in ordered], dtype=float)
+        return cls(name=name, samples=ordered, time=time_values, position=positions, quaternion=quaternions)
+
+
+@dataclass(frozen=True)
+class VelocityProfile:
+    time: np.ndarray
+    speed: np.ndarray
+    label: str
+
+
+@dataclass(frozen=True)
+class TimeSyncResult:
+    time_shift: float
+    arkit_time_shifted: np.ndarray
+    resample_time: np.ndarray
+    robot_speed_interp: np.ndarray
+    arkit_speed_interp: np.ndarray
+    correlation: np.ndarray
+    lag_samples: np.ndarray
+    dt: float
+    robot_profile: VelocityProfile
+    arkit_profile: VelocityProfile
+
+
+@dataclass(frozen=True)
+class ScaleCalibrationResult:
+    scale_factor: float
+    initial_scale_factor: float
+    max_v_robot: float
+    max_v_arkit: float
+    arkit_scaled_profile: VelocityProfile
+
+
+@dataclass(frozen=True)
+class MatchedFramePair:
+    robot_index: int
+    arkit_index: int
+    time_delta: float
+    robot_time: float
+    arkit_time_shifted: float
+    T_base_gripper: np.ndarray
+    T_world_cam: np.ndarray
+    T_target_cam: np.ndarray
+
+
+@dataclass(frozen=True)
+class HandEyeResult:
+    R_cam2gripper: np.ndarray
+    t_cam2gripper: np.ndarray
+    T_cam2gripper: np.ndarray
+    T_base_world: np.ndarray
+    matched_pairs: list[MatchedFramePair]
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    relative_errors_mm: np.ndarray
+    mean_relative_error_mm: float
+    max_relative_error_mm: float
+    absolute_errors_mm: np.ndarray
+    axis_errors_mm: np.ndarray
+    mean_absolute_error_mm: float
+    rmse_absolute_error_mm: float
+    max_absolute_error_mm: float
+    predicted_camera_positions: np.ndarray
+    predicted_gripper_positions: np.ndarray
+    robot_positions: np.ndarray
+    pair_time_deltas_ms: np.ndarray
+
+
+@dataclass(frozen=True)
+class StageEvaluationResult:
+    name: str
+    absolute_errors_mm: np.ndarray
+    mean_absolute_error_mm: float
+    rmse_absolute_error_mm: float
+    max_absolute_error_mm: float
+
+
+@dataclass(frozen=True)
+class CrossValidationFoldResult:
+    fold_index: int
+    best_scale: float
+    train_best_abs_mean_mm: float
+    val_best_abs_mean_mm: float
+    train_best_rel_mean_mm: float
+    val_best_rel_mean_mm: float
+    train_init_abs_mean_mm: float
+    val_init_abs_mean_mm: float
+    train_init_rel_mean_mm: float
+    val_init_rel_mean_mm: float
+    best_abs_gap_mm: float
+    init_abs_gap_mm: float
+
+
+@dataclass(frozen=True)
+class CrossValidationSummary:
+    fold_count: int
+    best_scale_mean: float
+    best_scale_std: float
+    train_best_abs_mean_mm: float
+    val_best_abs_mean_mm: float
+    best_abs_gap_mean_mm: float
+    train_init_abs_mean_mm: float
+    val_init_abs_mean_mm: float
+    init_abs_gap_mean_mm: float
+    val_abs_improvement_mm: float
+    folds: list[CrossValidationFoldResult]
+
+
+@dataclass(frozen=True)
+class OfflineCalibrationResult:
+    time_sync: TimeSyncResult
+    scale: ScaleCalibrationResult
+    initial_hand_eye: HandEyeResult
+    initial_evaluation: EvaluationResult
+    hand_eye: HandEyeResult
+    evaluation: EvaluationResult
+    stage_evaluations: list[StageEvaluationResult]
+    cross_validation: Optional[CrossValidationSummary] = None
+
+    @property
+    def time_shift(self):
+        return self.time_sync.time_shift
+
+    @property
+    def scale_factor(self):
+        return self.scale.scale_factor
+
+
+class PoseDataLoader:
+    def load_series(self, path, stream_name):
+        samples = load_pose_csv(path, stream_name)
+        if len(samples) < 3:
+            raise ValueError(f"{stream_name} requires at least 3 valid samples, got {len(samples)}.")
+        return TrajectorySeries.from_samples(stream_name, samples)
+
+
+class TimeSynchronizer:
+    def __init__(self, smooth_window=11, active_motion_ratio=0.05, local_refine_range=0.35, local_refine_step=0.002):
+        self.smooth_window = smooth_window
+        self.active_motion_ratio = active_motion_ratio
+        self.local_refine_range = local_refine_range
+        self.local_refine_step = local_refine_step
+
+    def compute_velocity_profile(self, series, label):
+        if len(series.time) < 3:
+            raise ValueError(f"{label} requires at least 3 samples to estimate velocity.")
+        velocity = np.gradient(series.position, series.time, axis=0, edge_order=2)
+        speed = np.linalg.norm(velocity, axis=1)
+        speed = smooth_signal(speed, preferred_window=self.smooth_window)
+        return VelocityProfile(time=series.time.copy(), speed=speed, label=label)
+
+    def synchronize(self, robot_series, arkit_series):
+        if correlate is None or correlation_lags is None:
+            raise ImportError("scipy is required for cross-correlation time synchronization. Install scipy first.")
+
+        robot_profile = self.compute_velocity_profile(robot_series, "Robot speed")
+        arkit_profile = self.compute_velocity_profile(arkit_series, "ARKit speed")
+        dt = self.estimate_common_dt(robot_profile.time, arkit_profile.time)
+
+        coarse_shift, correlation, lag_samples = self.estimate_shift_from_active_windows(robot_profile, arkit_profile, dt)
+        time_shift = self.refine_shift_locally(robot_profile, arkit_profile, coarse_shift)
+        arkit_time_shifted = arkit_series.time + time_shift
+
+        overlap_start = max(float(robot_profile.time[0]), float(np.min(arkit_time_shifted)))
+        overlap_end = min(float(robot_profile.time[-1]), float(np.max(arkit_time_shifted)))
+        if overlap_end <= overlap_start:
+            raise ValueError("Time range is too short for synchronization after applying the estimated shift.")
+
+        resample_time = np.arange(overlap_start, overlap_end + 0.5 * dt, dt, dtype=float)
+        robot_interp = np.interp(resample_time, robot_profile.time, robot_profile.speed)
+        arkit_interp = np.interp(resample_time, arkit_time_shifted, arkit_profile.speed)
+
+        return TimeSyncResult(
+            time_shift=time_shift,
+            arkit_time_shifted=arkit_time_shifted,
+            resample_time=resample_time,
+            robot_speed_interp=robot_interp,
+            arkit_speed_interp=arkit_interp,
+            correlation=correlation,
+            lag_samples=lag_samples,
+            dt=dt,
+            robot_profile=robot_profile,
+            arkit_profile=arkit_profile,
+        )
+
+    def estimate_shift_from_active_windows(self, robot_profile, arkit_profile, dt):
+        robot_start, robot_end = self.active_window(robot_profile)
+        arkit_start, arkit_end = self.active_window(arkit_profile)
+
+        robot_time = np.arange(robot_start, robot_end + 0.5 * dt, dt, dtype=float)
+        arkit_time = np.arange(arkit_start, arkit_end + 0.5 * dt, dt, dtype=float)
+        robot_interp = np.interp(robot_time, robot_profile.time, robot_profile.speed)
+        arkit_interp = np.interp(arkit_time, arkit_profile.time, arkit_profile.speed)
+        robot_zero_mean = robot_interp - np.mean(robot_interp)
+        arkit_zero_mean = arkit_interp - np.mean(arkit_interp)
+
+        correlation = correlate(robot_zero_mean, arkit_zero_mean, mode="full", method="fft")
+        lag_samples = correlation_lags(len(robot_zero_mean), len(arkit_zero_mean), mode="full")
+        best_index = int(np.argmax(correlation))
+        coarse_shift = (float(robot_time[0]) - float(arkit_time[0])) + float(lag_samples[best_index]) * dt
+        return coarse_shift, correlation, lag_samples
+
+    def active_window(self, profile):
+        threshold = self.active_motion_ratio * float(np.max(profile.speed))
+        active_indices = np.flatnonzero(profile.speed >= threshold)
+        if active_indices.size == 0:
+            return float(profile.time[0]), float(profile.time[-1])
+        return float(profile.time[active_indices[0]]), float(profile.time[active_indices[-1]])
+
+    def refine_shift_locally(self, robot_profile, arkit_profile, initial_shift):
+        best_shift = float(initial_shift)
+        best_score = float("inf")
+        candidate_shifts = np.arange(
+            initial_shift - self.local_refine_range,
+            initial_shift + self.local_refine_range + 0.5 * self.local_refine_step,
+            self.local_refine_step,
+            dtype=float,
+        )
+
+        for shift in candidate_shifts:
+            score = self.shift_alignment_score(robot_profile, arkit_profile, shift)
+            if score < best_score:
+                best_score = score
+                best_shift = float(shift)
+        return best_shift
+
+    def shift_alignment_score(self, robot_profile, arkit_profile, shift):
+        shifted_time = arkit_profile.time + float(shift)
+        overlap_start = max(float(robot_profile.time[0]), float(np.min(shifted_time)))
+        overlap_end = min(float(robot_profile.time[-1]), float(np.max(shifted_time)))
+        if overlap_end <= overlap_start:
+            return float("inf")
+
+        dt = self.estimate_common_dt(robot_profile.time, shifted_time)
+        sample_time = np.arange(overlap_start, overlap_end + 0.5 * dt, dt, dtype=float)
+        robot_speed = np.interp(sample_time, robot_profile.time, robot_profile.speed)
+        arkit_speed = np.interp(sample_time, shifted_time, arkit_profile.speed)
+
+        active_threshold = self.active_motion_ratio * max(float(np.max(robot_profile.speed)), float(np.max(arkit_profile.speed)))
+        active_mask = (robot_speed >= active_threshold) | (arkit_speed >= active_threshold)
+        if np.count_nonzero(active_mask) < 10:
+            return float("inf")
+
+        robot_active = robot_speed[active_mask]
+        arkit_active = arkit_speed[active_mask]
+        peak = float(np.max(arkit_active))
+        if peak <= 1e-9:
+            return float("inf")
+
+        scale = float(np.max(robot_active)) / peak
+        residual = robot_active - arkit_active * scale
+        return float(np.mean(residual * residual))
+
+    @staticmethod
+    def estimate_common_dt(first_time, second_time):
+        first_dt = np.diff(first_time)
+        second_dt = np.diff(second_time)
+        positive = np.concatenate([first_dt[first_dt > 1e-9], second_dt[second_dt > 1e-9]])
+        if positive.size == 0:
+            raise ValueError("Unable to estimate sampling interval from timestamps.")
+        return float(np.median(positive))
+
+
+class ScaleCalibrator:
+    def calibrate(self, robot_profile, arkit_profile, arkit_time_shifted):
+        overlap_start = max(float(robot_profile.time[0]), float(np.min(arkit_time_shifted)))
+        overlap_end = min(float(robot_profile.time[-1]), float(np.max(arkit_time_shifted)))
+        if overlap_end <= overlap_start:
+            raise ValueError("No overlapping time span remains after time synchronization.")
+
+        dt = TimeSynchronizer.estimate_common_dt(robot_profile.time, arkit_time_shifted)
+        overlap_time = np.arange(overlap_start, overlap_end + 0.5 * dt, dt, dtype=float)
+        robot_speed = np.interp(overlap_time, robot_profile.time, robot_profile.speed)
+        arkit_speed = np.interp(overlap_time, arkit_time_shifted, arkit_profile.speed)
+
+        max_v_robot = float(np.max(robot_speed))
+        max_v_arkit = float(np.max(arkit_speed))
+        if max_v_arkit <= 1e-9:
+            raise ValueError("ARKit peak speed is too small to estimate a stable scale factor.")
+
+        scale_factor = max_v_robot / max_v_arkit
+        return ScaleCalibrationResult(
+            scale_factor=float(scale_factor),
+            initial_scale_factor=float(scale_factor),
+            max_v_robot=max_v_robot,
+            max_v_arkit=max_v_arkit,
+            arkit_scaled_profile=VelocityProfile(
+                time=overlap_time,
+                speed=arkit_speed * scale_factor,
+                label="ARKit speed (time-aligned + scaled)",
+            ),
+        )
+
+
+class HandEyeCalibrator:
+    def __init__(self, max_pair_delta=0.05):
+        self.max_pair_delta = max_pair_delta
+
+    def calibrate(self, robot_series, arkit_series, arkit_time_shifted, scale_factor):
+        if cv2 is None:
+            raise ImportError("opencv-python or opencv-python-headless is required for hand-eye calibration.")
+
+        pairs = self.match_frames(robot_series, arkit_series, arkit_time_shifted, scale_factor)
+        if len(pairs) < 3:
+            raise ValueError(f"Hand-eye calibration needs at least 3 matched poses, got {len(pairs)}.")
+
+        R_gripper2base = [pair.T_base_gripper[:3, :3] for pair in pairs]
+        t_gripper2base = [pair.T_base_gripper[:3, 3].reshape(3, 1) for pair in pairs]
+        R_target2cam = [pair.T_target_cam[:3, :3] for pair in pairs]
+        t_target2cam = [pair.T_target_cam[:3, 3].reshape(3, 1) for pair in pairs]
+
+        R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
+            R_gripper2base=R_gripper2base,
+            t_gripper2base=t_gripper2base,
+            R_target2cam=R_target2cam,
+            t_target2cam=t_target2cam,
+            method=cv2.CALIB_HAND_EYE_TSAI,
+        )
+
+        R_cam2gripper = np.asarray(R_cam2gripper, dtype=float)
+        t_cam2gripper = np.asarray(t_cam2gripper, dtype=float).reshape(3)
+        T_cam2gripper = compose_transform(R_cam2gripper, t_cam2gripper)
+
+        T_base_world_candidates = [
+            pair.T_base_gripper @ T_cam2gripper @ pair.T_target_cam
+            for pair in pairs
+        ]
+        T_base_world = average_transform(T_base_world_candidates)
+
+        return HandEyeResult(
+            R_cam2gripper=R_cam2gripper,
+            t_cam2gripper=t_cam2gripper,
+            T_cam2gripper=T_cam2gripper,
+            T_base_world=T_base_world,
+            matched_pairs=pairs,
+        )
+
+    def match_frames(self, robot_series, arkit_series, arkit_time_shifted, scale_factor):
+        arkit_time_shifted = np.asarray(arkit_time_shifted, dtype=float)
+        valid_indices = np.argsort(arkit_time_shifted)
+        arkit_times_sorted = arkit_time_shifted[valid_indices]
+        overlap_start = max(float(robot_series.time[0]), float(arkit_times_sorted[0]))
+        overlap_end = min(float(robot_series.time[-1]), float(arkit_times_sorted[-1]))
+        if overlap_end <= overlap_start:
+            raise ValueError("No overlapping time span available for nearest-neighbor pose pairing.")
+
+        pairs = []
+        for robot_index, robot_time in enumerate(robot_series.time):
+            if robot_time < overlap_start or robot_time > overlap_end:
+                continue
+
+            insert_at = int(np.searchsorted(arkit_times_sorted, robot_time))
+            candidate_positions = []
+            if insert_at < len(arkit_times_sorted):
+                candidate_positions.append(insert_at)
+            if insert_at > 0:
+                candidate_positions.append(insert_at - 1)
+            if not candidate_positions:
+                continue
+
+            best_sorted_idx = min(candidate_positions, key=lambda idx: abs(arkit_times_sorted[idx] - robot_time))
+            arkit_index = int(valid_indices[best_sorted_idx])
+            delta = float(abs(arkit_time_shifted[arkit_index] - robot_time))
+            if delta > self.max_pair_delta:
+                continue
+
+            T_base_gripper = pose_to_matrix(robot_series.position[robot_index], robot_series.quaternion[robot_index])
+            T_world_cam = pose_to_matrix(
+                arkit_series.position[arkit_index],
+                arkit_series.quaternion[arkit_index],
+                translation_scale=scale_factor,
+            )
+            pairs.append(
+                MatchedFramePair(
+                    robot_index=robot_index,
+                    arkit_index=arkit_index,
+                    time_delta=delta,
+                    robot_time=float(robot_time),
+                    arkit_time_shifted=float(arkit_time_shifted[arkit_index]),
+                    T_base_gripper=T_base_gripper,
+                    T_world_cam=T_world_cam,
+                    T_target_cam=invert_transform(T_world_cam),
+                )
+            )
+
+        if len(pairs) < 3:
+            raise ValueError(
+                f"Only {len(pairs)} matched pose pairs found within {self.max_pair_delta:.3f}s. "
+                "Increase overlap or relax --max-pair-delta."
+            )
+        return pairs
+
+
+class HandEyeRefiner:
+    def __init__(self, max_translation_adjustment=0.2, max_rotation_adjustment=0.3):
+        self.max_translation_adjustment = max_translation_adjustment
+        self.max_rotation_adjustment = max_rotation_adjustment
+
+    def refine(self, hand_eye_result, arkit_series, scale_factor):
+        if least_squares is None:
+            return hand_eye_result, scale_factor
+
+        pairs = hand_eye_result.matched_pairs
+        raw_positions = [arkit_series.position[pair.arkit_index] for pair in pairs]
+        world_rotations = [quaternion_to_matrix(arkit_series.quaternion[pair.arkit_index]) for pair in pairs]
+        robot_transforms = [pair.T_base_gripper for pair in pairs]
+
+        initial = np.concatenate(
+            [
+                rotation_matrix_to_rotvec(hand_eye_result.T_base_world[:3, :3]),
+                hand_eye_result.T_base_world[:3, 3],
+            ]
+        )
+
+        lower = np.concatenate(
+            [
+                initial[0:3] - self.max_rotation_adjustment,
+                initial[3:6] - self.max_translation_adjustment,
+            ]
+        )
+        upper = np.concatenate(
+            [
+                initial[0:3] + self.max_rotation_adjustment,
+                initial[3:6] + self.max_translation_adjustment,
+            ]
+        )
+
+        def residuals(parameters):
+            T_base_world = compose_transform(
+                rotvec_to_rotation_matrix(parameters[0:3]),
+                parameters[3:6],
+            )
+
+            residual_vector = []
+            for raw_position, world_rotation, T_base_gripper in zip(raw_positions, world_rotations, robot_transforms):
+                T_world_cam = compose_transform(world_rotation, raw_position * scale_factor)
+                T_base_cam = T_base_world @ T_world_cam
+                T_base_gripper_pred = T_base_cam @ invert_transform(hand_eye_result.T_cam2gripper)
+                residual_vector.extend((T_base_gripper_pred[:3, 3] - T_base_gripper[:3, 3]) * 1000.0)
+            return np.array(residual_vector, dtype=float)
+
+        optimized = least_squares(residuals, initial, bounds=(lower, upper), max_nfev=200)
+        parameters = optimized.x
+        T_base_world = compose_transform(
+            rotvec_to_rotation_matrix(parameters[0:3]),
+            parameters[3:6],
+        )
+
+        refined_result = HandEyeResult(
+            R_cam2gripper=hand_eye_result.R_cam2gripper.copy(),
+            t_cam2gripper=hand_eye_result.t_cam2gripper.copy(),
+            T_cam2gripper=hand_eye_result.T_cam2gripper.copy(),
+            T_base_world=T_base_world,
+            matched_pairs=hand_eye_result.matched_pairs,
+        )
+        return refined_result, scale_factor
+
+
+class ScaleRefiner:
+    def __init__(self, scale_search_ratio=0.3):
+        self.scale_search_ratio = scale_search_ratio
+
+    def refine(self, initial_scale, hand_eye_calibrator, hand_eye_refiner, evaluator, robot_series, arkit_series, arkit_time_shifted):
+        if minimize_scalar is None:
+            return float(initial_scale)
+
+        lower = max(1e-6, float(initial_scale) * (1.0 - self.scale_search_ratio))
+        upper = float(initial_scale) * (1.0 + self.scale_search_ratio)
+
+        def objective(scale_value):
+            hand_eye_result = hand_eye_calibrator.calibrate(
+                robot_series,
+                arkit_series,
+                arkit_time_shifted,
+                float(scale_value),
+            )
+            refined_hand_eye_result, _ = hand_eye_refiner.refine(hand_eye_result, arkit_series, float(scale_value))
+            evaluation = evaluator.evaluate(refined_hand_eye_result)
+            return evaluation.mean_absolute_error_mm
+
+        result = minimize_scalar(
+            objective,
+            bounds=(lower, upper),
+            method="bounded",
+            options={"xatol": 1e-3, "maxiter": 40},
+        )
+        if not result.success:
+            return float(initial_scale)
+        return float(result.x)
+
+
+class CrossValidator:
+    def __init__(self, fold_count=5):
+        self.fold_count = fold_count
+
+    def evaluate_scale_generalization(self, base_pairs, initial_scale, hand_eye_calibrator, hand_eye_refiner, evaluator, robot_series, arkit_series, arkit_time_shifted):
+        if minimize_scalar is None or len(base_pairs) < self.fold_count * 10:
+            return None
+
+        fold_indices = np.array_split(np.arange(len(base_pairs)), self.fold_count)
+        fold_results = []
+
+        for fold_index, validation_indices in enumerate(fold_indices, start=1):
+            train_mask = np.ones(len(base_pairs), dtype=bool)
+            train_mask[validation_indices] = False
+            train_templates = [base_pairs[index] for index in np.flatnonzero(train_mask)]
+            validation_templates = [base_pairs[index] for index in validation_indices]
+
+            best_scale = self.optimize_scale(
+                train_templates,
+                initial_scale,
+                hand_eye_calibrator,
+                hand_eye_refiner,
+                evaluator,
+                robot_series,
+                arkit_series,
+                arkit_time_shifted,
+            )
+
+            best_hand_eye = self.fit_hand_eye(
+                train_templates,
+                best_scale,
+                hand_eye_calibrator,
+                hand_eye_refiner,
+                robot_series,
+                arkit_series,
+                arkit_time_shifted,
+            )
+            init_hand_eye = self.fit_hand_eye(
+                train_templates,
+                initial_scale,
+                hand_eye_calibrator,
+                hand_eye_refiner,
+                robot_series,
+                arkit_series,
+                arkit_time_shifted,
+            )
+
+            train_best_eval = self.evaluate_with_pairs(best_hand_eye, train_templates, best_scale, robot_series, arkit_series)
+            val_best_eval = self.evaluate_with_pairs(best_hand_eye, validation_templates, best_scale, robot_series, arkit_series)
+            train_init_eval = self.evaluate_with_pairs(init_hand_eye, train_templates, initial_scale, robot_series, arkit_series)
+            val_init_eval = self.evaluate_with_pairs(init_hand_eye, validation_templates, initial_scale, robot_series, arkit_series)
+
+            fold_results.append(
+                CrossValidationFoldResult(
+                    fold_index=fold_index,
+                    best_scale=best_scale,
+                    train_best_abs_mean_mm=train_best_eval.mean_absolute_error_mm,
+                    val_best_abs_mean_mm=val_best_eval.mean_absolute_error_mm,
+                    train_best_rel_mean_mm=train_best_eval.mean_relative_error_mm,
+                    val_best_rel_mean_mm=val_best_eval.mean_relative_error_mm,
+                    train_init_abs_mean_mm=train_init_eval.mean_absolute_error_mm,
+                    val_init_abs_mean_mm=val_init_eval.mean_absolute_error_mm,
+                    train_init_rel_mean_mm=train_init_eval.mean_relative_error_mm,
+                    val_init_rel_mean_mm=val_init_eval.mean_relative_error_mm,
+                    best_abs_gap_mm=val_best_eval.mean_absolute_error_mm - train_best_eval.mean_absolute_error_mm,
+                    init_abs_gap_mm=val_init_eval.mean_absolute_error_mm - train_init_eval.mean_absolute_error_mm,
+                )
+            )
+
+        best_scales = np.array([fold.best_scale for fold in fold_results], dtype=float)
+        train_best_abs = np.array([fold.train_best_abs_mean_mm for fold in fold_results], dtype=float)
+        val_best_abs = np.array([fold.val_best_abs_mean_mm for fold in fold_results], dtype=float)
+        train_init_abs = np.array([fold.train_init_abs_mean_mm for fold in fold_results], dtype=float)
+        val_init_abs = np.array([fold.val_init_abs_mean_mm for fold in fold_results], dtype=float)
+
+        return CrossValidationSummary(
+            fold_count=len(fold_results),
+            best_scale_mean=float(np.mean(best_scales)),
+            best_scale_std=float(np.std(best_scales)),
+            train_best_abs_mean_mm=float(np.mean(train_best_abs)),
+            val_best_abs_mean_mm=float(np.mean(val_best_abs)),
+            best_abs_gap_mean_mm=float(np.mean(val_best_abs - train_best_abs)),
+            train_init_abs_mean_mm=float(np.mean(train_init_abs)),
+            val_init_abs_mean_mm=float(np.mean(val_init_abs)),
+            init_abs_gap_mean_mm=float(np.mean(val_init_abs - train_init_abs)),
+            val_abs_improvement_mm=float(np.mean(val_init_abs - val_best_abs)),
+            folds=fold_results,
+        )
+
+    def optimize_scale(self, train_templates, initial_scale, hand_eye_calibrator, hand_eye_refiner, evaluator, robot_series, arkit_series, arkit_time_shifted):
+        def objective(scale_value):
+            hand_eye = self.fit_hand_eye(
+                train_templates,
+                float(scale_value),
+                hand_eye_calibrator,
+                hand_eye_refiner,
+                robot_series,
+                arkit_series,
+                arkit_time_shifted,
+            )
+            evaluation = self.evaluate_with_pairs(hand_eye, train_templates, float(scale_value), robot_series, arkit_series)
+            return evaluation.mean_absolute_error_mm
+
+        result = minimize_scalar(
+            objective,
+            bounds=(initial_scale * 0.7, initial_scale * 1.3),
+            method="bounded",
+            options={"xatol": 1e-3, "maxiter": 40},
+        )
+        if not result.success:
+            return float(initial_scale)
+        return float(result.x)
+
+    def fit_hand_eye(self, templates, scale_factor, hand_eye_calibrator, hand_eye_refiner, robot_series, arkit_series, arkit_time_shifted):
+        pairs = self.rebuild_pairs(templates, scale_factor, robot_series, arkit_series)
+        hand_eye = self.solve_hand_eye_from_pairs(pairs)
+        refined_hand_eye, _ = hand_eye_refiner.refine(hand_eye, arkit_series, scale_factor)
+        return refined_hand_eye
+
+    def evaluate_with_pairs(self, hand_eye_result, templates, scale_factor, robot_series, arkit_series):
+        pairs = self.rebuild_pairs(templates, scale_factor, robot_series, arkit_series)
+        evaluation_hand_eye = HandEyeResult(
+            R_cam2gripper=hand_eye_result.R_cam2gripper,
+            t_cam2gripper=hand_eye_result.t_cam2gripper,
+            T_cam2gripper=hand_eye_result.T_cam2gripper,
+            T_base_world=hand_eye_result.T_base_world,
+            matched_pairs=pairs,
+        )
+        return CalibrationEvaluator().evaluate(evaluation_hand_eye)
+
+    def rebuild_pairs(self, templates, scale_factor, robot_series, arkit_series):
+        rebuilt_pairs = []
+        for pair in templates:
+            T_base_gripper = pose_to_matrix(robot_series.position[pair.robot_index], robot_series.quaternion[pair.robot_index])
+            T_world_cam = pose_to_matrix(
+                arkit_series.position[pair.arkit_index],
+                arkit_series.quaternion[pair.arkit_index],
+                translation_scale=scale_factor,
+            )
+            rebuilt_pairs.append(
+                MatchedFramePair(
+                    robot_index=pair.robot_index,
+                    arkit_index=pair.arkit_index,
+                    time_delta=pair.time_delta,
+                    robot_time=pair.robot_time,
+                    arkit_time_shifted=pair.arkit_time_shifted,
+                    T_base_gripper=T_base_gripper,
+                    T_world_cam=T_world_cam,
+                    T_target_cam=invert_transform(T_world_cam),
+                )
+            )
+        return rebuilt_pairs
+
+    def solve_hand_eye_from_pairs(self, pairs):
+        R_gripper2base = [pair.T_base_gripper[:3, :3] for pair in pairs]
+        t_gripper2base = [pair.T_base_gripper[:3, 3].reshape(3, 1) for pair in pairs]
+        R_target2cam = [pair.T_target_cam[:3, :3] for pair in pairs]
+        t_target2cam = [pair.T_target_cam[:3, 3].reshape(3, 1) for pair in pairs]
+        R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
+            R_gripper2base=R_gripper2base,
+            t_gripper2base=t_gripper2base,
+            R_target2cam=R_target2cam,
+            t_target2cam=t_target2cam,
+            method=cv2.CALIB_HAND_EYE_TSAI,
+        )
+        R_cam2gripper = np.asarray(R_cam2gripper, dtype=float)
+        t_cam2gripper = np.asarray(t_cam2gripper, dtype=float).reshape(3)
+        T_cam2gripper = compose_transform(R_cam2gripper, t_cam2gripper)
+        T_base_world = average_transform([
+            pair.T_base_gripper @ T_cam2gripper @ pair.T_target_cam
+            for pair in pairs
+        ])
+        return HandEyeResult(
+            R_cam2gripper=R_cam2gripper,
+            t_cam2gripper=t_cam2gripper,
+            T_cam2gripper=T_cam2gripper,
+            T_base_world=T_base_world,
+            matched_pairs=pairs,
+        )
+
+
+class StageEvaluator:
+    def evaluate_stages(self, hand_eye_result, arkit_series, scale_factor):
+        identity_transform = compose_transform(np.eye(3, dtype=float), np.zeros(3, dtype=float))
+        stage_specs = [
+            ("raw_identity", 1.0, identity_transform, identity_transform),
+            ("time_sync_only", 1.0, identity_transform, average_transform([pair.T_base_gripper @ pair.T_target_cam for pair in hand_eye_result.matched_pairs])),
+            ("time_sync_plus_scale", scale_factor, identity_transform, average_transform([
+                pair.T_base_gripper @ invert_transform(pose_to_matrix(arkit_series.position[pair.arkit_index], arkit_series.quaternion[pair.arkit_index], translation_scale=scale_factor))
+                for pair in hand_eye_result.matched_pairs
+            ])),
+            ("initial_handeye", scale_factor, hand_eye_result.T_cam2gripper, average_transform([
+                pair.T_base_gripper @ hand_eye_result.T_cam2gripper @ invert_transform(pose_to_matrix(
+                    arkit_series.position[pair.arkit_index],
+                    arkit_series.quaternion[pair.arkit_index],
+                    translation_scale=scale_factor,
+                ))
+                for pair in hand_eye_result.matched_pairs
+            ])),
+            ("refined_world", scale_factor, hand_eye_result.T_cam2gripper, hand_eye_result.T_base_world),
+        ]
+
+        results = []
+        for name, stage_scale, T_cam2gripper, T_base_world in stage_specs:
+            absolute_errors = self.evaluate_absolute_errors(
+                hand_eye_result.matched_pairs,
+                arkit_series,
+                stage_scale,
+                T_cam2gripper,
+                T_base_world,
+            )
+            results.append(
+                StageEvaluationResult(
+                    name=name,
+                    absolute_errors_mm=absolute_errors,
+                    mean_absolute_error_mm=float(np.mean(absolute_errors)),
+                    rmse_absolute_error_mm=float(np.sqrt(np.mean(np.square(absolute_errors)))),
+                    max_absolute_error_mm=float(np.max(absolute_errors)),
+                )
+            )
+        return results
+
+    def evaluate_absolute_errors(self, pairs, arkit_series, scale_factor, T_cam2gripper, T_base_world):
+        absolute_errors = []
+        for pair in pairs:
+            T_world_cam = pose_to_matrix(
+                arkit_series.position[pair.arkit_index],
+                arkit_series.quaternion[pair.arkit_index],
+                translation_scale=scale_factor,
+            )
+            T_base_cam = T_base_world @ T_world_cam
+            T_base_gripper_pred = T_base_cam @ invert_transform(T_cam2gripper)
+            absolute_errors.append(
+                float(np.linalg.norm((T_base_gripper_pred[:3, 3] - pair.T_base_gripper[:3, 3]) * 1000.0))
+            )
+        return np.array(absolute_errors, dtype=float)
+
+
+class CalibrationEvaluator:
+    def evaluate(self, hand_eye_result):
+        X = hand_eye_result.T_cam2gripper
+        pairs = hand_eye_result.matched_pairs
+        relative_errors_mm = []
+        for start_index in range(0, len(pairs) - 5, 5):
+            pair_a = pairs[start_index]
+            pair_b = pairs[start_index + 5]
+            A = relative_transform(pair_a.T_base_gripper, pair_b.T_base_gripper)
+            # OpenCV's eye-in-hand convention solves A X = X B with:
+            # A = inv(^bT_g(2)) @ ^bT_g(1)
+            # B = ^cT_t(2) @ inv(^cT_t(1))
+            # Here our pair ordering is (1 = pair_a, 2 = pair_b).
+            B = pair_a.T_target_cam @ invert_transform(pair_b.T_target_cam)
+            ax = A @ X
+            xb = X @ B
+            error_m = float(np.linalg.norm(ax[:3, 3] - xb[:3, 3]))
+            relative_errors_mm.append(error_m * 1000.0)
+
+        relative_errors_mm = np.array(relative_errors_mm, dtype=float)
+        if relative_errors_mm.size == 0:
+            raise ValueError("Not enough matched pose pairs to compute 5-frame relative AX=XB errors.")
+
+        predicted_camera_positions = []
+        predicted_gripper_positions = []
+        robot_positions = []
+        pair_time_deltas_ms = []
+        absolute_errors_mm = []
+        axis_errors_mm = []
+        for pair in pairs:
+            T_base_cam = hand_eye_result.T_base_world @ pair.T_world_cam
+            T_base_gripper_pred = T_base_cam @ invert_transform(hand_eye_result.T_cam2gripper)
+            predicted_camera_positions.append(T_base_cam[:3, 3])
+            predicted_gripper_positions.append(T_base_gripper_pred[:3, 3])
+            robot_positions.append(pair.T_base_gripper[:3, 3])
+            pair_time_deltas_ms.append(pair.time_delta * 1000.0)
+            axis_error_mm = (T_base_gripper_pred[:3, 3] - pair.T_base_gripper[:3, 3]) * 1000.0
+            axis_errors_mm.append(axis_error_mm)
+            absolute_errors_mm.append(
+                float(np.linalg.norm(axis_error_mm))
+            )
+
+        absolute_errors_mm = np.array(absolute_errors_mm, dtype=float)
+        axis_errors_mm = np.array(axis_errors_mm, dtype=float)
+
+        return EvaluationResult(
+            relative_errors_mm=relative_errors_mm,
+            mean_relative_error_mm=float(np.mean(relative_errors_mm)),
+            max_relative_error_mm=float(np.max(relative_errors_mm)),
+            absolute_errors_mm=absolute_errors_mm,
+            axis_errors_mm=axis_errors_mm,
+            mean_absolute_error_mm=float(np.mean(absolute_errors_mm)),
+            rmse_absolute_error_mm=float(np.sqrt(np.mean(np.square(absolute_errors_mm)))),
+            max_absolute_error_mm=float(np.max(absolute_errors_mm)),
+            predicted_camera_positions=np.array(predicted_camera_positions, dtype=float),
+            predicted_gripper_positions=np.array(predicted_gripper_positions, dtype=float),
+            robot_positions=np.array(robot_positions, dtype=float),
+            pair_time_deltas_ms=np.array(pair_time_deltas_ms, dtype=float),
+        )
+
+
+class CalibrationPlotter:
+    def __init__(self, output_dir):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def create_all(self, result):
+        if plt is None:
+            raise ImportError("matplotlib is required for plot generation.")
+        self.plot_velocity_profiles(result)
+        self.plot_staged_absolute_error_curves(result)
+        self.plot_cross_validation_summary(result)
+        self.plot_relative_error_histogram(result)
+        self.plot_absolute_error_histogram(result)
+        self.plot_axis_error_curves(result)
+        self.plot_absolute_error_comparison(result)
+        self.plot_axis_error_comparison(result)
+        self.plot_trajectory_overlay(result)
+
+    def plot_velocity_profiles(self, result):
+        figure, axis = plt.subplots(figsize=(12, 5))
+        axis.plot(
+            result.time_sync.robot_profile.time,
+            result.time_sync.robot_profile.speed,
+            label="Robot speed",
+            linewidth=2.0,
+            color="#c66a1c",
+        )
+        axis.plot(
+            result.time_sync.arkit_profile.time,
+            result.time_sync.arkit_profile.speed,
+            label="ARKit speed (raw)",
+            linewidth=1.6,
+            linestyle="--",
+            color="#3d8bfd",
+            alpha=0.7,
+        )
+        axis.plot(
+            result.scale.arkit_scaled_profile.time,
+            result.scale.arkit_scaled_profile.speed,
+            label="ARKit speed (shifted + scaled)",
+            linewidth=2.0,
+            color="#0d9488",
+        )
+        axis.set_title("Velocity-Time Curves Before And After Alignment")
+        axis.set_xlabel("Time (s)")
+        axis.set_ylabel("Speed (m/s)")
+        axis.grid(True, alpha=0.25)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "velocity_time_alignment.png", dpi=180)
+        plt.close(figure)
+
+    def plot_staged_absolute_error_curves(self, result):
+        figure, axis = plt.subplots(figsize=(12, 6))
+        time_axis = np.array([pair.robot_time for pair in result.hand_eye.matched_pairs], dtype=float)
+        color_map = {
+            "raw_identity": "#94a3b8",
+            "time_sync_only": "#f59e0b",
+            "time_sync_plus_scale": "#8b5cf6",
+            "initial_handeye": "#2563eb",
+            "refined_world": "#059669",
+        }
+        label_map = {
+            "raw_identity": "1. Raw identity",
+            "time_sync_only": "2. Time sync only",
+            "time_sync_plus_scale": "3. Time sync + scale",
+            "initial_handeye": "4. Initial hand-eye",
+            "refined_world": "5. Optional world refinement",
+        }
+        for stage in result.stage_evaluations:
+            axis.plot(
+                time_axis,
+                stage.absolute_errors_mm,
+                label=label_map.get(stage.name, stage.name),
+                linewidth=1.9,
+                color=color_map.get(stage.name),
+            )
+        axis.set_title("Absolute Error Across Calibration Stages")
+        axis.set_xlabel("Robot time (s)")
+        axis.set_ylabel("Absolute position error (mm)")
+        axis.grid(True, alpha=0.25)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "absolute_error_stages.png", dpi=180)
+        plt.close(figure)
+
+    def plot_cross_validation_summary(self, result):
+        if result.cross_validation is None:
+            return
+        figure, axis = plt.subplots(figsize=(10, 5))
+        folds = [fold.fold_index for fold in result.cross_validation.folds]
+        train_values = [fold.train_best_abs_mean_mm for fold in result.cross_validation.folds]
+        val_values = [fold.val_best_abs_mean_mm for fold in result.cross_validation.folds]
+        axis.plot(folds, train_values, marker="o", linewidth=1.8, label="Train mean abs error", color="#2563eb")
+        axis.plot(folds, val_values, marker="o", linewidth=1.8, label="Validation mean abs error", color="#dc2626")
+        axis.set_title("Scale Cross-Validation Summary")
+        axis.set_xlabel("Fold")
+        axis.set_ylabel("Mean absolute error (mm)")
+        axis.set_xticks(folds)
+        axis.grid(True, alpha=0.25)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "scale_cross_validation.png", dpi=180)
+        plt.close(figure)
+
+    def plot_relative_error_histogram(self, result):
+        figure, axis = plt.subplots(figsize=(8, 5))
+        axis.hist(result.evaluation.relative_errors_mm, bins=min(30, len(result.evaluation.relative_errors_mm)), color="#2563eb", alpha=0.85)
+        axis.set_title("Relative Translation Error Histogram")
+        axis.set_xlabel("Relative error (mm)")
+        axis.set_ylabel("Count")
+        axis.grid(True, alpha=0.25)
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "relative_error_histogram.png", dpi=180)
+        plt.close(figure)
+
+    def plot_absolute_error_histogram(self, result):
+        figure, axis = plt.subplots(figsize=(8, 5))
+        axis.hist(result.evaluation.absolute_errors_mm, bins=min(30, len(result.evaluation.absolute_errors_mm)), color="#0891b2", alpha=0.85)
+        axis.set_title("Absolute End-Effector Error Histogram")
+        axis.set_xlabel("Absolute position error (mm)")
+        axis.set_ylabel("Count")
+        axis.grid(True, alpha=0.25)
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "absolute_error_histogram.png", dpi=180)
+        plt.close(figure)
+
+    def plot_axis_error_curves(self, result):
+        figure, axis = plt.subplots(figsize=(12, 5))
+        time_axis = np.array([pair.robot_time for pair in result.hand_eye.matched_pairs], dtype=float)
+        axis_errors = result.evaluation.axis_errors_mm
+        axis.plot(time_axis, axis_errors[:, 0], label="X error", linewidth=1.8, color="#dc2626")
+        axis.plot(time_axis, axis_errors[:, 1], label="Y error", linewidth=1.8, color="#2563eb")
+        axis.plot(time_axis, axis_errors[:, 2], label="Z error", linewidth=1.8, color="#059669")
+        axis.axhline(0.0, color="#444", linewidth=1.0, alpha=0.5)
+        axis.set_title("Per-Axis End-Effector Error Curves")
+        axis.set_xlabel("Robot time (s)")
+        axis.set_ylabel("Axis error (mm)")
+        axis.grid(True, alpha=0.25)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "axis_error_curves.png", dpi=180)
+        plt.close(figure)
+
+    def plot_absolute_error_comparison(self, result):
+        figure, axis = plt.subplots(figsize=(12, 5))
+        time_axis = np.array([pair.robot_time for pair in result.hand_eye.matched_pairs], dtype=float)
+        axis.plot(
+            time_axis,
+            result.initial_evaluation.absolute_errors_mm,
+            label="Before refinement",
+            linewidth=1.8,
+            color="#94a3b8",
+        )
+        axis.plot(
+            time_axis,
+            result.evaluation.absolute_errors_mm,
+            label="After refinement",
+            linewidth=2.0,
+            color="#0f766e",
+        )
+        axis.set_title("Absolute Error Before Vs After Refinement")
+        axis.set_xlabel("Robot time (s)")
+        axis.set_ylabel("Absolute position error (mm)")
+        axis.grid(True, alpha=0.25)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "absolute_error_comparison.png", dpi=180)
+        plt.close(figure)
+
+    def plot_axis_error_comparison(self, result):
+        figure, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+        time_axis = np.array([pair.robot_time for pair in result.hand_eye.matched_pairs], dtype=float)
+        before = result.initial_evaluation.axis_errors_mm
+        after = result.evaluation.axis_errors_mm
+        labels = ["X", "Y", "Z"]
+        colors = ["#dc2626", "#2563eb", "#059669"]
+
+        for axis_index, subplot in enumerate(axes):
+            subplot.plot(time_axis, before[:, axis_index], label=f"{labels[axis_index]} before", linewidth=1.5, color="#cbd5e1")
+            subplot.plot(time_axis, after[:, axis_index], label=f"{labels[axis_index]} after", linewidth=1.8, color=colors[axis_index])
+            subplot.axhline(0.0, color="#444", linewidth=1.0, alpha=0.4)
+            subplot.set_ylabel(f"{labels[axis_index]} (mm)")
+            subplot.grid(True, alpha=0.25)
+            subplot.legend(loc="upper right")
+
+        axes[-1].set_xlabel("Robot time (s)")
+        figure.suptitle("Per-Axis Error Before Vs After Refinement")
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "axis_error_comparison.png", dpi=180)
+        plt.close(figure)
+
+    def plot_trajectory_overlay(self, result):
+        figure = plt.figure(figsize=(8, 7))
+        axis = figure.add_subplot(111, projection="3d")
+        robot = result.evaluation.robot_positions
+        predicted = result.evaluation.predicted_gripper_positions
+        axis.plot(robot[:, 0], robot[:, 1], robot[:, 2], label="Robot gripper (measured)", linewidth=2.2, color="#d97706")
+        axis.plot(predicted[:, 0], predicted[:, 1], predicted[:, 2], label="ARKit gripper (calibrated)", linewidth=2.0, color="#0284c7")
+        axis.set_title("Final 3D End-Effector Trajectory Overlap")
+        axis.set_xlabel("X (m)")
+        axis.set_ylabel("Y (m)")
+        axis.set_zlabel("Z (m)")
+        axis.legend()
+        self._set_equal_axes(axis, np.vstack([robot, predicted]))
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "trajectory_overlap_3d.png", dpi=180)
+        plt.close(figure)
+
+    @staticmethod
+    def _set_equal_axes(axis, points):
+        minimum = points.min(axis=0)
+        maximum = points.max(axis=0)
+        center = (minimum + maximum) * 0.5
+        radius = float(np.max(maximum - minimum)) * 0.5
+        radius = max(radius, 1e-6)
+        axis.set_xlim(center[0] - radius, center[0] + radius)
+        axis.set_ylim(center[1] - radius, center[1] + radius)
+        axis.set_zlim(center[2] - radius, center[2] + radius)
+
+
+class OfflinePoseCalibrationPipeline:
+    def __init__(self, max_pair_delta=0.05, smooth_window=11):
+        self.loader = PoseDataLoader()
+        self.time_sync = TimeSynchronizer(smooth_window=smooth_window)
+        self.scale_calibrator = ScaleCalibrator()
+        self.scale_refiner = ScaleRefiner()
+        self.hand_eye_calibrator = HandEyeCalibrator(max_pair_delta=max_pair_delta)
+        self.hand_eye_refiner = HandEyeRefiner()
+        self.evaluator = CalibrationEvaluator()
+        self.stage_evaluator = StageEvaluator()
+        self.cross_validator = CrossValidator()
+
+    def run(self, arkit_csv, robot_csv):
+        arkit_series = self.loader.load_series(arkit_csv, "arkit")
+        robot_series = self.loader.load_series(robot_csv, "robot")
+        time_sync_result = self.time_sync.synchronize(robot_series, arkit_series)
+        scale_result = self.scale_calibrator.calibrate(
+            time_sync_result.robot_profile,
+            time_sync_result.arkit_profile,
+            time_sync_result.arkit_time_shifted,
+        )
+        refined_scale = self.scale_refiner.refine(
+            scale_result.scale_factor,
+            self.hand_eye_calibrator,
+            self.hand_eye_refiner,
+            self.evaluator,
+            robot_series,
+            arkit_series,
+            time_sync_result.arkit_time_shifted,
+        )
+        if abs(refined_scale - scale_result.scale_factor) > 1e-9:
+            scale_result = ScaleCalibrationResult(
+                scale_factor=refined_scale,
+                initial_scale_factor=scale_result.initial_scale_factor,
+                max_v_robot=scale_result.max_v_robot,
+                max_v_arkit=scale_result.max_v_arkit,
+                arkit_scaled_profile=VelocityProfile(
+                    time=scale_result.arkit_scaled_profile.time.copy(),
+                    speed=(scale_result.arkit_scaled_profile.speed / scale_result.scale_factor) * refined_scale,
+                    label=scale_result.arkit_scaled_profile.label,
+                ),
+            )
+        hand_eye_result = self.hand_eye_calibrator.calibrate(
+            robot_series,
+            arkit_series,
+            time_sync_result.arkit_time_shifted,
+            scale_result.scale_factor,
+        )
+        initial_evaluation = self.evaluator.evaluate(hand_eye_result)
+        refined_hand_eye_result, refined_scale = self.hand_eye_refiner.refine(
+            hand_eye_result,
+            arkit_series,
+            scale_result.scale_factor,
+        )
+        evaluation_result = self.evaluator.evaluate(refined_hand_eye_result)
+        stage_evaluations = self.stage_evaluator.evaluate_stages(
+            refined_hand_eye_result,
+            arkit_series,
+            scale_result.scale_factor,
+        )
+        cross_validation = self.cross_validator.evaluate_scale_generalization(
+            refined_hand_eye_result.matched_pairs,
+            scale_result.initial_scale_factor,
+            self.hand_eye_calibrator,
+            self.hand_eye_refiner,
+            self.evaluator,
+            robot_series,
+            arkit_series,
+            time_sync_result.arkit_time_shifted,
+        )
+        return OfflineCalibrationResult(
+            time_sync=time_sync_result,
+            scale=scale_result,
+            initial_hand_eye=hand_eye_result,
+            initial_evaluation=initial_evaluation,
+            hand_eye=refined_hand_eye_result,
+            evaluation=evaluation_result,
+            stage_evaluations=stage_evaluations,
+            cross_validation=cross_validation,
+        )
+
+
+def transform_realtime_arkit_pose(position, quaternion, scale_factor, R_cam2gripper, t_cam2gripper, T_base_world):
+    """
+    Convert a live ARKit camera pose into the robot base frame using the offline calibration result.
+
+    The input pose is ARKit's raw world->camera pose expressed as position + quaternion.
+    The output is a 4x4 camera pose in the robot base frame. If you need the live gripper pose,
+    right-multiply by the inverse of T_cam2gripper.
+    """
+    T_world_cam = pose_to_matrix(position, quaternion, translation_scale=scale_factor)
+    T_cam2gripper = compose_transform(R_cam2gripper, t_cam2gripper)
+    return T_base_world @ T_world_cam, T_base_world @ T_world_cam @ invert_transform(T_cam2gripper)
+
+
+def serialize_offline_result(result):
+    refinement_gain_mm = result.initial_evaluation.mean_absolute_error_mm - result.evaluation.mean_absolute_error_mm
+    payload = {
+        "time_shift": result.time_shift,
+        "scale_factor": result.scale_factor,
+        "initial_scale_factor": result.scale.initial_scale_factor,
+        "max_v_robot": result.scale.max_v_robot,
+        "max_v_arkit": result.scale.max_v_arkit,
+        "R_cam2gripper": result.hand_eye.R_cam2gripper.tolist(),
+        "t_cam2gripper": result.hand_eye.t_cam2gripper.tolist(),
+        "T_cam2gripper": result.hand_eye.T_cam2gripper.tolist(),
+        "T_base_world": result.hand_eye.T_base_world.tolist(),
+        "matched_pair_count": len(result.hand_eye.matched_pairs),
+        "initial_mean_relative_error_mm": result.initial_evaluation.mean_relative_error_mm,
+        "initial_max_relative_error_mm": result.initial_evaluation.max_relative_error_mm,
+        "initial_mean_absolute_error_mm": result.initial_evaluation.mean_absolute_error_mm,
+        "initial_rmse_absolute_error_mm": result.initial_evaluation.rmse_absolute_error_mm,
+        "initial_max_absolute_error_mm": result.initial_evaluation.max_absolute_error_mm,
+        "refinement_gain_mm": refinement_gain_mm,
+        "mean_relative_error_mm": result.evaluation.mean_relative_error_mm,
+        "max_relative_error_mm": result.evaluation.max_relative_error_mm,
+        "mean_absolute_error_mm": result.evaluation.mean_absolute_error_mm,
+        "rmse_absolute_error_mm": result.evaluation.rmse_absolute_error_mm,
+        "max_absolute_error_mm": result.evaluation.max_absolute_error_mm,
+        "stage_absolute_errors": [
+            {
+                "name": stage.name,
+                "mean_absolute_error_mm": stage.mean_absolute_error_mm,
+                "rmse_absolute_error_mm": stage.rmse_absolute_error_mm,
+                "max_absolute_error_mm": stage.max_absolute_error_mm,
+            }
+            for stage in result.stage_evaluations
+        ],
+        "mean_pair_time_delta_ms": float(np.mean(result.evaluation.pair_time_deltas_ms)),
+        "max_pair_time_delta_ms": float(np.max(result.evaluation.pair_time_deltas_ms)),
+    }
+    if result.cross_validation is not None:
+        payload["cross_validation"] = {
+            "fold_count": result.cross_validation.fold_count,
+            "best_scale_mean": result.cross_validation.best_scale_mean,
+            "best_scale_std": result.cross_validation.best_scale_std,
+            "train_best_abs_mean_mm": result.cross_validation.train_best_abs_mean_mm,
+            "val_best_abs_mean_mm": result.cross_validation.val_best_abs_mean_mm,
+            "best_abs_gap_mean_mm": result.cross_validation.best_abs_gap_mean_mm,
+            "train_init_abs_mean_mm": result.cross_validation.train_init_abs_mean_mm,
+            "val_init_abs_mean_mm": result.cross_validation.val_init_abs_mean_mm,
+            "init_abs_gap_mean_mm": result.cross_validation.init_abs_gap_mean_mm,
+            "val_abs_improvement_mm": result.cross_validation.val_abs_improvement_mm,
+            "folds": [
+                {
+                    "fold_index": fold.fold_index,
+                    "best_scale": fold.best_scale,
+                    "train_best_abs_mean_mm": fold.train_best_abs_mean_mm,
+                    "val_best_abs_mean_mm": fold.val_best_abs_mean_mm,
+                    "train_best_rel_mean_mm": fold.train_best_rel_mean_mm,
+                    "val_best_rel_mean_mm": fold.val_best_rel_mean_mm,
+                    "train_init_abs_mean_mm": fold.train_init_abs_mean_mm,
+                    "val_init_abs_mean_mm": fold.val_init_abs_mean_mm,
+                    "train_init_rel_mean_mm": fold.train_init_rel_mean_mm,
+                    "val_init_rel_mean_mm": fold.val_init_rel_mean_mm,
+                    "best_abs_gap_mm": fold.best_abs_gap_mm,
+                    "init_abs_gap_mm": fold.init_abs_gap_mm,
+                }
+                for fold in result.cross_validation.folds
+            ],
+        }
+    return payload
+
+
+def print_offline_result(result):
+    refinement_gain_mm = result.initial_evaluation.mean_absolute_error_mm - result.evaluation.mean_absolute_error_mm
+    refinement_label = "useful" if refinement_gain_mm > 0.2 else "negligible"
+    print("=== Offline Calibration Result ===")
+    print(f"time_shift: {result.time_shift:.6f} s")
+    print(f"initial_scale_factor: {result.scale.initial_scale_factor:.6f}")
+    print(f"scale_factor: {result.scale_factor:.6f}")
+    print(f"matched_pose_pairs: {len(result.hand_eye.matched_pairs)}")
+    print(f"initial_relative_error_mean: {result.initial_evaluation.mean_relative_error_mm:.3f} mm")
+    print(f"initial_absolute_error_mean: {result.initial_evaluation.mean_absolute_error_mm:.3f} mm")
+    print(f"relative_error_mean: {result.evaluation.mean_relative_error_mm:.3f} mm")
+    print(f"relative_error_max: {result.evaluation.max_relative_error_mm:.3f} mm")
+    print(f"absolute_error_mean: {result.evaluation.mean_absolute_error_mm:.3f} mm")
+    print(f"absolute_error_rmse: {result.evaluation.rmse_absolute_error_mm:.3f} mm")
+    print(f"absolute_error_max: {result.evaluation.max_absolute_error_mm:.3f} mm")
+    print(f"refinement_gain_mm: {refinement_gain_mm:.3f} ({refinement_label})")
+    print(f"pair_time_delta_mean: {float(np.mean(result.evaluation.pair_time_deltas_ms)):.3f} ms")
+    print(f"pair_time_delta_max: {float(np.max(result.evaluation.pair_time_deltas_ms)):.3f} ms")
+    if result.cross_validation is not None:
+        cv = result.cross_validation
+        print(
+            "cross_validation: "
+            f"best_scale {cv.best_scale_mean:.6f} +/- {cv.best_scale_std:.6f} | "
+            f"train abs {cv.train_best_abs_mean_mm:.3f} mm | "
+            f"val abs {cv.val_best_abs_mean_mm:.3f} mm | "
+            f"gap {cv.best_abs_gap_mean_mm:.3f} mm | "
+            f"val improvement {cv.val_abs_improvement_mm:.3f} mm"
+        )
+    print("stage_absolute_error_summary:")
+    for stage in result.stage_evaluations:
+        print(
+            f"  {stage.name}: mean {stage.mean_absolute_error_mm:.3f} mm | "
+            f"rmse {stage.rmse_absolute_error_mm:.3f} mm | max {stage.max_absolute_error_mm:.3f} mm"
+        )
+    print("R_cam2gripper:")
+    print(np.array2string(result.hand_eye.R_cam2gripper, precision=6, suppress_small=True))
+    print("t_cam2gripper:")
+    print(np.array2string(result.hand_eye.t_cam2gripper, precision=6, suppress_small=True))
+    print("T_base_world:")
+    print(np.array2string(result.hand_eye.T_base_world, precision=6, suppress_small=True))
 
 
 class AdaptiveCalibrator:
@@ -785,17 +2171,7 @@ class ExternalCameraView(gl.GLViewWidget):
             self.sensor_line.setData(pos=sensor_positions, color=(1.0, 0.72, 0.18, 1.0))
             self.sensor_marker.setData(pos=sensor_positions[-1:], color=(1.0, 0.72, 0.18, 1.0))
 
-        if arkit_pose is not None:
-            self.arkit_frustum.setData(
-                pos=camera_frustum_points(arkit_pose),
-                color=(0.0, 0.85, 1.0, 0.9),
-            )
-
-        if sensor_pose is not None:
-            self.sensor_frustum.setData(
-                pos=camera_frustum_points(sensor_pose),
-                color=(1.0, 0.72, 0.18, 0.9),
-            )
+        # Frustums removed to avoid blocking trajectory view
 
 
 def camera_frustum_points(sample, scale=0.18):
@@ -1228,61 +2604,40 @@ class MainWindow(QMainWindow):
             if len(arkit_positions) > 0 and len(sensor_positions) > 0:
                 sensor_positions = self.align_trajectories(arkit_positions, sensor_positions)
 
-        # Align first frame for better visualization (both calibrated and uncalibrated modes)
-        if len(arkit_positions) > 0 and len(sensor_positions) > 0:
-            offset = arkit_positions[0] - sensor_positions[0]
-            sensor_positions = sensor_positions + offset
-
-        # Debug: print lengths
-        if len(sensor_positions) == 0:
-            print(f"Warning: sensor_positions is empty! apply_calibration={self.apply_calibration}, calibrated_track exists={self.calibrated_sensor_track is not None}")
-
         self.view.update_scene(arkit_positions, sensor_positions, arkit_pose, sensor_pose)
 
     def align_trajectories(self, arkit_pos, sensor_pos, align_frames=100):
-        """Align sensor trajectory to arkit using first N frames to eliminate coordinate system differences"""
+        """
+        Align sensor trajectory to arkit by:
+        1. Forcing start points to match
+        2. Computing optimal rotation to maximize trajectory overlap
+        3. NOT forcing end points (different sampling rates/durations)
+        """
         if len(arkit_pos) < 2 or len(sensor_pos) < 2:
             return sensor_pos
 
-        # Use first N frames for alignment
-        n = min(align_frames, len(arkit_pos), len(sensor_pos))
-        arkit_subset = arkit_pos[:n]
-        sensor_subset = sensor_pos[:n]
+        # Step 1: Translate sensor so its start matches arkit's start
+        offset_start = arkit_pos[0] - sensor_pos[0]
+        sensor_translated = sensor_pos + offset_start
 
-        # Find motion start (skip static initial frames)
-        motion_threshold = 0.001  # 1mm
-        arkit_start = 0
-        for i in range(1, len(arkit_subset)):
-            if np.linalg.norm(arkit_subset[i] - arkit_subset[0]) > motion_threshold:
-                arkit_start = i
-                break
+        # Step 2: Use overlapping portion to compute optimal rotation
+        # Find how many points overlap in time (use the shorter trajectory)
+        n_overlap = min(len(arkit_pos), len(sensor_pos), align_frames)
 
-        sensor_start = 0
-        for i in range(1, len(sensor_subset)):
-            if np.linalg.norm(sensor_subset[i] - sensor_subset[0]) > motion_threshold:
-                sensor_start = i
-                break
+        if n_overlap < 10:
+            # Not enough overlap, just return translated
+            return sensor_translated
 
-        # Align motion start points
-        arkit_motion = arkit_subset[arkit_start:]
-        sensor_motion = sensor_subset[sensor_start:]
+        # Use first n_overlap points from both trajectories
+        arkit_subset = arkit_pos[:n_overlap]
+        sensor_subset = sensor_translated[:n_overlap]
 
-        if len(arkit_motion) < 10 or len(sensor_motion) < 10:
-            # Not enough motion data, use simple first frame alignment
-            offset = arkit_pos[0] - sensor_pos[0]
-            return sensor_pos + offset
-
-        # Compute centroids
-        arkit_centroid = np.mean(arkit_motion, axis=0)
-        sensor_centroid = np.mean(sensor_motion, axis=0)
-
-        # Center the point sets
-        arkit_centered = arkit_motion - arkit_centroid
-        sensor_centered = sensor_motion - sensor_centroid
+        # Center both subsets at their start point (not centroid)
+        arkit_centered = arkit_subset - arkit_subset[0]
+        sensor_centered = sensor_subset - sensor_subset[0]
 
         # Compute optimal rotation using SVD (Kabsch algorithm)
-        n_pairs = min(len(arkit_centered), len(sensor_centered))
-        H = sensor_centered[:n_pairs].T @ arkit_centered[:n_pairs]
+        H = sensor_centered.T @ arkit_centered
         U, _, Vt = np.linalg.svd(H)
         R = Vt.T @ U.T
 
@@ -1291,13 +2646,11 @@ class MainWindow(QMainWindow):
             Vt[-1, :] *= -1
             R = Vt.T @ U.T
 
-        # Compute translation
-        t = arkit_centroid - R @ sensor_centroid
+        # Step 3: Apply rotation to entire sensor trajectory around start point
+        sensor_centered_all = sensor_translated - arkit_pos[0]
+        sensor_rotated = (R @ sensor_centered_all.T).T + arkit_pos[0]
 
-        # Apply transformation to all sensor positions
-        sensor_aligned = (R @ sensor_pos.T).T + t
-
-        return sensor_aligned
+        return sensor_rotated
 
     def load_arkit_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1416,6 +2769,12 @@ class MainWindow(QMainWindow):
 
 def main():
     parser = argparse.ArgumentParser(description="Validate ARKit tracking against a wired sensor stream.")
+    parser.add_argument(
+        "--mode",
+        choices=["gui", "offline"],
+        default="gui",
+        help="Run the original GUI validator or the offline time-sync/hand-eye calibration pipeline.",
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind UDP sockets to.")
     parser.add_argument("--arkit-port", type=int, default=5555, help="ARKit UDP pose port.")
     parser.add_argument("--sensor-port", type=int, default=5556, help="Wired sensor UDP pose port.")
@@ -1433,7 +2792,42 @@ def main():
     )
     parser.add_argument("--arkit-csv", default=None, help="Offline ARKit pose CSV path.")
     parser.add_argument("--sensor-csv", default=None, help="Offline wired sensor pose CSV path.")
+    parser.add_argument(
+        "--max-pair-delta",
+        type=float,
+        default=0.05,
+        help="Maximum time delta for nearest-neighbor robot/ARKit pose pairing during offline hand-eye calibration, in seconds.",
+    )
+    parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=11,
+        help="Savitzky-Golay smoothing window for scalar speed estimation in offline mode.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="offline_calibration_output",
+        help="Root directory for offline result JSON and generated plots. Each run gets its own timestamped subfolder.",
+    )
     args = parser.parse_args()
+
+    if args.mode == "offline":
+        if not args.arkit_csv or not args.sensor_csv:
+            parser.error("--mode offline requires both --arkit-csv and --sensor-csv.")
+
+        pipeline = OfflinePoseCalibrationPipeline(
+            max_pair_delta=args.max_pair_delta,
+            smooth_window=args.smooth_window,
+        )
+        result = pipeline.run(args.arkit_csv, args.sensor_csv)
+        print_offline_result(result)
+
+        output_dir = prepare_run_output_dir(args.output_dir, args.arkit_csv, args.sensor_csv)
+        CalibrationPlotter(output_dir).create_all(result)
+        result_path = output_dir / "offline_calibration_result.json"
+        result_path.write_text(json.dumps(serialize_offline_result(result), indent=2), encoding="utf-8")
+        print(f"results_saved_to: {result_path}")
+        return
 
     app = QApplication(sys.argv)
     window = MainWindow(
