@@ -4,10 +4,27 @@ import CoreVideo
 
 enum VideoRecordingStatus {
     case idle
+    case preparing
     case recording
     case saving
     case saved(URL)
     case failed(String)
+
+    var isIdle: Bool {
+        if case .idle = self {
+            return true
+        }
+
+        return false
+    }
+
+    var isPreparing: Bool {
+        if case .preparing = self {
+            return true
+        }
+
+        return false
+    }
 
     var isRecording: Bool {
         if case .recording = self {
@@ -17,11 +34,37 @@ enum VideoRecordingStatus {
         return false
     }
 
+    var isSaving: Bool {
+        if case .saving = self {
+            return true
+        }
+
+        return false
+    }
+
+    var isStoppable: Bool {
+        switch self {
+        case .preparing, .recording:
+            return true
+        case .idle, .saving, .saved, .failed:
+            return false
+        }
+    }
+
+    var isActive: Bool {
+        switch self {
+        case .preparing, .recording, .saving:
+            return true
+        case .idle, .saved, .failed:
+            return false
+        }
+    }
+
     var isTerminal: Bool {
         switch self {
         case .idle, .saved, .failed:
             return true
-        case .recording, .saving:
+        case .preparing, .recording, .saving:
             return false
         }
     }
@@ -29,15 +72,17 @@ enum VideoRecordingStatus {
     var message: String {
         switch self {
         case .idle:
-            return "Video idle"
+            return "Idle"
+        case .preparing:
+            return "Preparing..."
         case .recording:
-            return "Recording video..."
+            return "Recording..."
         case .saving:
-            return "Saving video..."
+            return "Saving..."
         case .saved(let url):
-            return "Saved video: \(url.lastPathComponent)"
+            return "Saved: \(url.lastPathComponent)"
         case .failed(let message):
-            return "Video error: \(message)"
+            return "Record failed: \(message)"
         }
     }
 }
@@ -52,14 +97,15 @@ final class ARSessionVideoRecorder {
     private var recordingStatus: VideoRecordingStatus = .idle
 
     func startRecording() {
-        guard !recordingStatus.isRecording else { return }
+        guard recordingStatus.isTerminal else { return }
 
         resetWriterState()
-        updateStatus(.recording)
+        updateStatus(.preparing)
     }
 
     func appendFrame(pixelBuffer: CVPixelBuffer, at sourceTime: CMTime) {
-        guard recordingStatus.isRecording else { return }
+        guard recordingStatus.isPreparing || recordingStatus.isRecording else { return }
+        let isStartingFirstFrame = recordingStatus.isPreparing
 
         do {
             if assetWriter == nil {
@@ -94,7 +140,16 @@ final class ARSessionVideoRecorder {
             }
 
             guard writerInput.isReadyForMoreMediaData else { return }
-            _ = pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: sourceTime)
+            let didAppendFrame = pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: sourceTime)
+
+            if didAppendFrame {
+                if isStartingFirstFrame {
+                    updateStatus(.recording)
+                }
+            } else if isStartingFirstFrame {
+                updateStatus(.failed("Could not write first frame"))
+                resetWriterState()
+            }
         } catch {
             updateStatus(.failed(error.localizedDescription))
             resetWriterState()
@@ -102,6 +157,15 @@ final class ARSessionVideoRecorder {
     }
 
     func stopRecording(completion: @escaping (VideoRecordingStatus) -> Void) {
+        if recordingStatus.isPreparing {
+            let status = VideoRecordingStatus.failed("No valid frame was recorded")
+            assetWriter?.cancelWriting()
+            resetWriterState()
+            updateStatus(status)
+            completion(status)
+            return
+        }
+
         guard recordingStatus.isRecording else {
             completion(recordingStatus)
             return
@@ -132,6 +196,14 @@ final class ARSessionVideoRecorder {
             self.updateStatus(finalStatus)
             completion(finalStatus)
         }
+    }
+
+    func failPreparing(_ message: String) {
+        guard recordingStatus.isPreparing else { return }
+
+        assetWriter?.cancelWriting()
+        resetWriterState()
+        updateStatus(.failed(message))
     }
 
     private func configureWriter(using pixelBuffer: CVPixelBuffer) throws {

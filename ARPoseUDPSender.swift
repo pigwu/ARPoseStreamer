@@ -89,6 +89,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     private var isStreamingEnabled = false
     private var isRecordingEnabled = false
     private var hasPoseCaptureSession = false
+    private var recordingAttemptID = UUID()
 
     init?(
         hostIP: String,
@@ -110,15 +111,17 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         session.delegate = self
         videoRecorder.onStatusChange = { [weak self] status in
             self?.arQueue.async {
+                guard let self else { return }
+
                 if case .saved(let url) = status {
-                    self?.poseSessionRecorder.attachVideo(url: url)
+                    self.poseSessionRecorder.attachVideo(url: url)
                 }
 
                 if status.isTerminal {
-                    self?.isRecordingEnabled = false
-                    self?.finishPoseSessionIfNeeded()
-                    if self?.isStreamingEnabled == false {
-                        self?.pauseSessionIfNeeded()
+                    self.isRecordingEnabled = false
+                    self.finishPoseSessionIfNeeded()
+                    if !self.isStreamingEnabled {
+                        self.pauseSessionIfNeeded()
                     }
                 }
             }
@@ -142,14 +145,14 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     }
 
     func start() {
-        isStreamingEnabled = true
-
         networkQueue.async { [weak self] in
             self?.connectUDP()
         }
 
         arQueue.async { [weak self] in
-            self?.startSessionIfNeeded()
+            guard let self else { return }
+            self.isStreamingEnabled = true
+            self.startSessionIfNeeded()
         }
     }
 
@@ -160,14 +163,13 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     }
 
     func stop() {
-        isStreamingEnabled = false
-
         networkQueue.async { [weak self] in
             self?.disconnectUDP()
         }
 
         arQueue.async { [weak self] in
             guard let self else { return }
+            self.isStreamingEnabled = false
             if !self.isRecordingEnabled {
                 self.finishPoseSessionIfNeeded()
                 self.pauseSessionIfNeeded()
@@ -206,11 +208,13 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     }
 
     func startRecording() {
-        isRecordingEnabled = true
-
         arQueue.async { [weak self] in
             guard let self else { return }
-            self.startSessionIfNeeded()
+            guard !self.isRecordingEnabled else { return }
+
+            self.isRecordingEnabled = true
+            self.recordingAttemptID = UUID()
+            let attemptID = self.recordingAttemptID
 
             if self.hasPoseCaptureSession {
                 self.finishPoseSessionIfNeeded()
@@ -218,14 +222,16 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
             self.ensurePoseSession()
             self.videoRecorder.startRecording()
+            self.startSessionIfNeeded()
+            self.failRecordingIfFirstFrameDoesNotArrive(attemptID: attemptID)
         }
     }
 
     func stopRecording() {
-        isRecordingEnabled = false
-
         arQueue.async { [weak self] in
             guard let self else { return }
+            self.isRecordingEnabled = false
+            self.recordingAttemptID = UUID()
             self.videoRecorder.stopRecording { [weak self] _ in
                 guard let self else { return }
 
@@ -255,7 +261,10 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
     private func startSessionIfNeeded() {
         guard !isSessionRunning else { return }
-        guard ARWorldTrackingConfiguration.isSupported else { return }
+        guard ARWorldTrackingConfiguration.isSupported else {
+            videoRecorder.failPreparing("AR world tracking is not supported on this device")
+            return
+        }
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
@@ -265,6 +274,15 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         isSessionRunning = true
+    }
+
+    private func failRecordingIfFirstFrameDoesNotArrive(attemptID: UUID) {
+        arQueue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self else { return }
+            guard self.isRecordingEnabled, self.recordingAttemptID == attemptID else { return }
+
+            self.videoRecorder.failPreparing("Waiting for AR tracking")
+        }
     }
 
     private func pauseSessionIfNeeded() {

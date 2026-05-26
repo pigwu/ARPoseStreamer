@@ -82,6 +82,28 @@ struct WiredSensorStatsViewState {
     var connectedAccessoryName = ""
 }
 
+struct UploadStatusViewState {
+    var currentFileName = ""
+    var currentComponent = ""
+    var completedFiles = 0
+    var totalFiles = 0
+    var savedPaths: [String] = []
+
+    var isActive: Bool {
+        totalFiles > 0
+    }
+
+    var progressText: String {
+        guard isActive else { return "" }
+        let componentLabel = currentComponent.replacingOccurrences(of: "_", with: " ")
+        return "\(completedFiles)/\(totalFiles) files - \(componentLabel) - \(currentFileName)"
+    }
+
+    var latestSavedPath: String? {
+        savedPaths.last
+    }
+}
+
 @MainActor
 final class PositionViewModel: ObservableObject {
     @Published var hostIP: String {
@@ -112,11 +134,13 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var sendStatus = "Idle"
     @Published private(set) var sensorStatus = "Sensor idle"
     @Published private(set) var uploadStatus = "Upload idle"
+    @Published private(set) var uploadDetails = UploadStatusViewState()
     @Published private(set) var latestPacketSummary = "No packets yet"
     @Published private(set) var latestSensorSummary = "No sensor packets yet"
     @Published private(set) var wiredSensorStats = WiredSensorStatsViewState()
     @Published private(set) var connectedAccessories: [WiredSensorAccessoryInfo] = []
     @Published private(set) var recordingStatus = VideoRecordingStatus.idle.message
+    @Published private(set) var recordingPhase = VideoRecordingStatus.idle
     @Published private(set) var isSending = false
     @Published private(set) var isSensorStreaming = false
     @Published private(set) var isRecordingVideo = false
@@ -145,6 +169,18 @@ final class PositionViewModel: ObservableObject {
 
     var videoAccessHint: String {
         receiverPlatform.videoAccessHint
+    }
+
+    var canStartRecording: Bool {
+        recordingPhase.isTerminal
+    }
+
+    var canStopRecording: Bool {
+        recordingPhase.isStoppable
+    }
+
+    var isSavingRecording: Bool {
+        recordingPhase.isSaving
     }
 
     var uploadServerSummary: String {
@@ -237,17 +273,19 @@ final class PositionViewModel: ObservableObject {
     }
 
     func startRecording() {
+        guard canStartRecording else { return }
+
         if sender == nil {
             configureSender()
         }
 
         sender?.startRecording()
-        isRecordingVideo = true
     }
 
     func stopRecording() {
+        guard canStopRecording else { return }
+
         sender?.stopRecording()
-        isRecordingVideo = false
     }
 
     func resetOrigin() {
@@ -365,14 +403,35 @@ final class PositionViewModel: ObservableObject {
 
         uploadingRecordIDs.insert(record.id)
         uploadStatus = "Uploading \(kind == .video ? "video" : "pose") for \(record.displayName)..."
+        uploadDetails = UploadStatusViewState(
+            currentFileName: descriptors.first?.fileURL.lastPathComponent ?? "",
+            currentComponent: descriptors.first?.component ?? "",
+            completedFiles: 0,
+            totalFiles: descriptors.count,
+            savedPaths: []
+        )
 
         Task {
             do {
-                try await captureUploadService.upload(
+                let responses = try await captureUploadService.upload(
                     descriptors: descriptors,
                     captureID: record.sessionDirectoryName,
                     serverBaseURL: baseURL,
-                    kind: kind
+                    kind: kind,
+                    progress: { [weak self] snapshot in
+                        await MainActor.run {
+                            guard let self else { return }
+                            self.uploadDetails = UploadStatusViewState(
+                                currentFileName: snapshot.currentFileName,
+                                currentComponent: snapshot.currentComponent,
+                                completedFiles: snapshot.completedFiles,
+                                totalFiles: snapshot.totalFiles,
+                                savedPaths: self.uploadDetails.savedPaths + (snapshot.savedTo.map { [$0] } ?? [])
+                            )
+                            let kindLabel = kind == .video ? "video" : "pose"
+                            self.uploadStatus = "Uploading \(kindLabel) for \(record.displayName): \(snapshot.completedFiles)/\(snapshot.totalFiles)"
+                        }
+                    }
                 )
 
                 await MainActor.run {
@@ -380,11 +439,21 @@ final class PositionViewModel: ObservableObject {
                     captureRecords = captureLibraryStore
                         .markUploaded(id: record.id, kind: kind)
                         .sorted { $0.createdAt > $1.createdAt }
-                    uploadStatus = "Uploaded \(kind == .video ? "video" : "pose") for \(record.displayName)"
+                    let savedPaths = responses.compactMap(\.saved_to)
+                    uploadDetails = UploadStatusViewState(
+                        currentFileName: descriptors.last?.fileURL.lastPathComponent ?? "",
+                        currentComponent: descriptors.last?.component ?? "",
+                        completedFiles: descriptors.count,
+                        totalFiles: descriptors.count,
+                        savedPaths: savedPaths
+                    )
+                    let suffix = savedPaths.last.map { " -> \($0)" } ?? ""
+                    uploadStatus = "Uploaded \(kind == .video ? "video" : "pose") for \(record.displayName)\(suffix)"
                 }
             } catch {
                 await MainActor.run {
                     uploadingRecordIDs.remove(record.id)
+                    uploadDetails = UploadStatusViewState()
                     uploadStatus = "Upload failed: \(error.localizedDescription)"
                 }
             }
@@ -435,7 +504,8 @@ final class PositionViewModel: ObservableObject {
         newSender?.onRecordingStatusChange = { [weak self] status in
             Task { @MainActor [weak self] in
                 self?.recordingStatus = status.message
-                self?.isRecordingVideo = status.isRecording
+                self?.recordingPhase = status
+                self?.isRecordingVideo = status.isRecording || status.isPreparing
 
                 if case .saved(let url) = status {
                     self?.lastSavedVideoURL = url

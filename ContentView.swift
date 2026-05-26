@@ -8,61 +8,68 @@ struct ContentView: View {
     @State private var isSidebarPresented = false
 
     var body: some View {
-        NavigationStack {
-            ZStack(alignment: .leading) {
-                ARCameraPreviewView(session: viewModel.previewSession)
-                    .ignoresSafeArea()
+        ZStack(alignment: .leading) {
+            ARCameraPreviewView(session: viewModel.previewSession)
+                .ignoresSafeArea()
 
-                Color.black.opacity(0.22)
-                    .ignoresSafeArea()
+            LinearGradient(
+                colors: [
+                    .black.opacity(0.42),
+                    .clear,
+                    .black.opacity(0.62)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
 
-                VStack(spacing: 0) {
-                    TopBar(
-                        title: "ARPoseStreamer",
-                        onMenuTapped: {
-                            withAnimation(.easeInOut(duration: 0.22)) {
-                                isSidebarPresented.toggle()
-                            }
+            VStack(spacing: 0) {
+                TopBar(
+                    title: "ARPoseStreamer",
+                    onMenuTapped: {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            isSidebarPresented.toggle()
                         }
-                    )
+                    }
+                )
 
-                    Spacer()
+                Spacer()
 
-                    BottomDashboard(viewModel: viewModel)
-                }
-                .ignoresSafeArea(edges: .bottom)
+                BottomDashboard(viewModel: viewModel)
+            }
 
-                if isSidebarPresented {
-                    Color.black.opacity(0.35)
-                        .ignoresSafeArea()
-                        .onTapGesture {
-                            withAnimation(.easeInOut(duration: 0.22)) {
-                                isSidebarPresented = false
-                            }
-                        }
-
-                    SidebarDrawer(
-                        viewModel: viewModel,
-                        onOpenHistory: {
-                            isShowingHistory = true
-                            isSidebarPresented = false
-                        },
-                        onOpenSettings: {
-                            isShowingSettings = true
+            if isSidebarPresented {
+                Color.black.opacity(0.35)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.22)) {
                             isSidebarPresented = false
                         }
-                    )
-                    .transition(.move(edge: .leading))
-                }
+                    }
+
+                SidebarDrawer(
+                    viewModel: viewModel,
+                    onOpenHistory: {
+                        isShowingHistory = true
+                        isSidebarPresented = false
+                    },
+                    onOpenSettings: {
+                        isShowingSettings = true
+                        isSidebarPresented = false
+                    }
+                )
+                .transition(.move(edge: .leading))
             }
-            .toolbar(.hidden, for: .navigationBar)
-            .sheet(isPresented: $isShowingSettings) {
-                AppSettingsView(viewModel: viewModel)
-            }
-            .sheet(isPresented: $isShowingHistory) {
-                NavigationStack {
-                    CaptureHistoryView(viewModel: viewModel)
-                }
+        }
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
+        .sheet(isPresented: $isShowingSettings) {
+            AppSettingsView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $isShowingHistory) {
+            NavigationStack {
+                CaptureHistoryView(viewModel: viewModel)
             }
         }
         .task {
@@ -72,7 +79,12 @@ struct ContentView: View {
             switch newPhase {
             case .active:
                 viewModel.activatePreview()
-            case .inactive, .background:
+            case .inactive:
+                viewModel.deactivatePreviewIfPossible()
+            case .background:
+                if viewModel.canStopRecording {
+                    viewModel.stopRecording()
+                }
                 viewModel.deactivatePreviewIfPossible()
             @unknown default:
                 break
@@ -121,24 +133,10 @@ private struct BottomDashboard: View {
     @ObservedObject var viewModel: PositionViewModel
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
+            StatusStrip(viewModel: viewModel)
+
             HStack(spacing: 8) {
-                if viewModel.sendStatus != "Idle" {
-                    StatusChip(text: viewModel.sendStatus)
-                }
-                if viewModel.recordingStatus != "Video idle" {
-                    StatusChip(text: viewModel.recordingStatus)
-                }
-                if viewModel.sensorStatus != "Sensor idle" {
-                    StatusChip(text: viewModel.sensorStatus)
-                }
-            }
-
-            if viewModel.uploadStatus != "Upload idle" {
-                StatusChip(text: viewModel.uploadStatus)
-            }
-
-            HStack(spacing: 12) {
                 AxisCard(axis: "X", value: viewModel.formattedValue(for: viewModel.position.x))
                 AxisCard(axis: "Y", value: viewModel.formattedValue(for: viewModel.position.y))
                 AxisCard(axis: "Z", value: viewModel.formattedValue(for: viewModel.position.z))
@@ -146,47 +144,107 @@ private struct BottomDashboard: View {
 
             if viewModel.showPositionChart {
                 Trajectory3DView(samples: viewModel.positionHistory)
-                    .frame(height: 220)
+                    .frame(height: 120)
             }
 
             HStack {
                 Text(viewModel.latestPacketSummary)
-                    .font(.footnote.monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.78))
-                    .lineLimit(2)
-
-                Spacer()
-            }
-
-            HStack {
-                Text(viewModel.latestSensorSummary)
-                    .font(.footnote.monospacedDigit())
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.white.opacity(0.72))
-                    .lineLimit(2)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
 
                 Spacer()
             }
 
-            HStack {
-                Text("Latest capture: \(viewModel.lastCaptureSessionName)")
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.72))
-                Spacer()
-            }
-
-            if viewModel.lastSensorLogName != "No sensor log yet" {
-                HStack {
-                    Text("Sensor log: \(viewModel.lastSensorLogName)")
-                        .font(.footnote)
-                        .foregroundStyle(.white.opacity(0.72))
-                    Spacer()
-                }
-            }
+            RecordButton(viewModel: viewModel)
         }
-        .padding(16)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
-        .padding(.horizontal, 16)
-        .padding(.bottom, 14)
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
+    }
+}
+
+private struct StatusStrip: View {
+    @ObservedObject var viewModel: PositionViewModel
+
+    var body: some View {
+        HStack(spacing: 6) {
+            StatusChip(text: viewModel.recordingStatus, isActive: viewModel.recordingPhase.isActive)
+
+            if viewModel.isSending {
+                StatusChip(text: "Streaming", isActive: true)
+            }
+
+            if viewModel.isSensorStreaming {
+                StatusChip(text: "Sensor", isActive: true)
+            }
+
+            if viewModel.uploadDetails.isActive {
+                StatusChip(text: "Upload \(viewModel.uploadDetails.completedFiles)/\(viewModel.uploadDetails.totalFiles)", isActive: true)
+            } else if viewModel.uploadStatus != "Upload idle" {
+                StatusChip(text: viewModel.uploadStatus.hasPrefix("Upload failed") ? "Upload failed" : "Upload done", isActive: false)
+            }
+
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+private struct RecordButton: View {
+    @ObservedObject var viewModel: PositionViewModel
+
+    private var title: String {
+        if viewModel.recordingPhase.isSaving {
+            return "Saving"
+        }
+
+        if viewModel.canStopRecording {
+            return "Stop & Save"
+        }
+
+        return "Start Recording"
+    }
+
+    private var systemImage: String {
+        if viewModel.canStopRecording {
+            return "stop.fill"
+        }
+
+        return "record.circle"
+    }
+
+    private var isDisabled: Bool {
+        viewModel.isSavingRecording || (!viewModel.canStartRecording && !viewModel.canStopRecording)
+    }
+
+    var body: some View {
+        Button {
+            if viewModel.canStopRecording {
+                viewModel.stopRecording()
+            } else {
+                viewModel.startRecording()
+            }
+        } label: {
+            Label(title, systemImage: systemImage)
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 54)
+                .background(buttonBackground, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.65 : 1)
+    }
+
+    private var buttonBackground: Color {
+        if viewModel.canStopRecording {
+            return .red
+        }
+
+        return .blue
     }
 }
 
@@ -206,15 +264,6 @@ private struct SidebarDrawer: View {
                     viewModel.stopSending()
                 } else {
                     viewModel.startSending()
-                }
-            }
-            .buttonStyle(.borderedProminent)
-
-            Button(viewModel.isRecordingVideo ? "Stop & Save Video" : "Start Video Recording") {
-                if viewModel.isRecordingVideo {
-                    viewModel.stopRecording()
-                } else {
-                    viewModel.startRecording()
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -271,6 +320,7 @@ private struct SidebarDrawer: View {
 
 private struct StatusChip: View {
     let text: String
+    var isActive = false
 
     var body: some View {
         Text(text)
@@ -278,7 +328,9 @@ private struct StatusChip: View {
             .foregroundStyle(.white.opacity(0.9))
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
-            .background(Color.white.opacity(0.12), in: Capsule())
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
+            .background((isActive ? Color.green.opacity(0.28) : Color.white.opacity(0.12)), in: Capsule())
     }
 }
 
@@ -299,8 +351,8 @@ private struct AxisCard: View {
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 14)
-        .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -380,8 +432,8 @@ private struct Trajectory3DView: View {
                 }
             }
         }
-        .padding(16)
-        .background(Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(12)
+        .background(Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 

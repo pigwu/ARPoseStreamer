@@ -17,16 +17,17 @@ import numpy as np
 
 try:
     import pyqtgraph.opengl as gl
-    from PyQt6.QtCore import QThread, QTimer, pyqtSignal, Qt
+    from PyQt6.QtCore import QThread, QUrl, pyqtSignal, Qt
+    from PyQt6.QtGui import QDesktopServices, QPixmap
     from PyQt6.QtWidgets import (
         QApplication,
-        QCheckBox,
         QFileDialog,
         QGroupBox,
         QHBoxLayout,
         QLabel,
         QMainWindow,
         QPushButton,
+        QScrollArea,
         QVBoxLayout,
         QWidget,
     )
@@ -53,17 +54,19 @@ except ImportError:
 
     gl = _DummyGLModule()
     QThread = _MissingGuiBase
-    QTimer = _MissingGuiBase
     Qt = _DummyQtNamespace()
     QApplication = _MissingGuiBase
-    QCheckBox = _MissingGuiBase
+    QDesktopServices = _MissingGuiBase
     QFileDialog = _MissingGuiBase
     QGroupBox = _MissingGuiBase
     QHBoxLayout = _MissingGuiBase
     QLabel = _MissingGuiBase
     QMainWindow = _MissingGuiBase
+    QPixmap = _MissingGuiBase
     QPushButton = _MissingGuiBase
+    QScrollArea = _MissingGuiBase
     QVBoxLayout = _MissingGuiBase
+    QUrl = _MissingGuiBase
     QWidget = _MissingGuiBase
 
 try:
@@ -391,6 +394,40 @@ def prepare_run_output_dir(base_output_dir, arkit_csv, sensor_csv):
     run_dir = base_dir / f"{timestamp}_{arkit_stem}__{sensor_stem}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+ERROR_PLOT_FILES = [
+    ("3D Trajectory Overlap", "trajectory_overlap_3d.png"),
+    ("XYZ Error Curve", "axis_error_curves.png"),
+    ("Position Error Distribution", "absolute_error_histogram.png"),
+    ("Motion Error Distribution", "relative_error_histogram.png"),
+]
+
+LEGACY_DIAGNOSTIC_PLOT_FILES = [
+    ("Position Error Before/After", "absolute_error_comparison.png"),
+    ("XYZ Error Before/After", "axis_error_comparison.png"),
+    ("Calibration Process", "absolute_error_stages.png"),
+]
+
+ALL_KNOWN_PLOT_FILES = ERROR_PLOT_FILES + LEGACY_DIAGNOSTIC_PLOT_FILES
+
+
+def find_latest_error_plot_dir(base_output_dir="offline_calibration_output"):
+    base_dir = Path(base_output_dir)
+    if not base_dir.exists():
+        return None
+
+    candidates = []
+    for path in base_dir.iterdir():
+        if not path.is_dir():
+            continue
+        if any((path / filename).exists() for _, filename in ALL_KNOWN_PLOT_FILES):
+            candidates.append(path)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 class SimilarityTransform:
@@ -784,19 +821,15 @@ class ScaleCalibrator:
 
         max_v_robot = float(np.max(robot_speed))
         max_v_arkit = float(np.max(arkit_speed))
-        if max_v_arkit <= 1e-9:
-            raise ValueError("ARKit peak speed is too small to estimate a stable scale factor.")
-
-        scale_factor = max_v_robot / max_v_arkit
         return ScaleCalibrationResult(
-            scale_factor=float(scale_factor),
-            initial_scale_factor=float(scale_factor),
+            scale_factor=1.0,
+            initial_scale_factor=1.0,
             max_v_robot=max_v_robot,
             max_v_arkit=max_v_arkit,
             arkit_scaled_profile=VelocityProfile(
                 time=overlap_time,
-                speed=arkit_speed * scale_factor,
-                label="ARKit speed (time-aligned + scaled)",
+                speed=arkit_speed,
+                label="ARKit speed (time-aligned, scale fixed at 1)",
             ),
         )
 
@@ -1185,7 +1218,7 @@ class StageEvaluator:
         stage_specs = [
             ("raw_identity", 1.0, identity_transform, identity_transform),
             ("time_sync_only", 1.0, identity_transform, average_transform([pair.T_base_gripper @ pair.T_target_cam for pair in hand_eye_result.matched_pairs])),
-            ("time_sync_plus_scale", scale_factor, identity_transform, average_transform([
+            ("time_sync_fixed_scale", scale_factor, identity_transform, average_transform([
                 pair.T_base_gripper @ invert_transform(pose_to_matrix(arkit_series.position[pair.arkit_index], arkit_series.quaternion[pair.arkit_index], translation_scale=scale_factor))
                 for pair in hand_eye_result.matched_pairs
             ])),
@@ -1336,7 +1369,7 @@ class CalibrationPlotter:
         axis.plot(
             result.scale.arkit_scaled_profile.time,
             result.scale.arkit_scaled_profile.speed,
-            label="ARKit speed (shifted + scaled)",
+            label="ARKit speed (time-aligned, scale=1)",
             linewidth=2.0,
             color="#0d9488",
         )
@@ -1355,14 +1388,14 @@ class CalibrationPlotter:
         color_map = {
             "raw_identity": "#94a3b8",
             "time_sync_only": "#f59e0b",
-            "time_sync_plus_scale": "#8b5cf6",
+            "time_sync_fixed_scale": "#8b5cf6",
             "initial_handeye": "#2563eb",
             "refined_world": "#059669",
         }
         label_map = {
             "raw_identity": "1. Raw identity",
             "time_sync_only": "2. Time sync only",
-            "time_sync_plus_scale": "3. Time sync + scale",
+            "time_sync_fixed_scale": "3. Time sync + fixed scale",
             "initial_handeye": "4. Initial hand-eye",
             "refined_world": "5. Optional world refinement",
         }
@@ -1523,13 +1556,11 @@ class OfflinePoseCalibrationPipeline:
         self.loader = PoseDataLoader()
         self.time_sync = TimeSynchronizer(smooth_window=smooth_window)
         self.scale_calibrator = ScaleCalibrator()
-        self.scale_refiner = ScaleRefiner()
         self.hand_eye_calibrator = HandEyeCalibrator(max_pair_delta=max_pair_delta)
         self.hand_eye_refiner = HandEyeRefiner()
         self.evaluator = CalibrationEvaluator()
         self.stage_evaluator = StageEvaluator()
-        self.cross_validator = CrossValidator(fold_count=cv_folds)
-        self.cross_validate_scale = cross_validate_scale
+        self.cross_validate_scale = False
         self.skip_world_refinement = skip_world_refinement
 
     def run(self, arkit_csv, robot_csv):
@@ -1541,61 +1572,28 @@ class OfflinePoseCalibrationPipeline:
             time_sync_result.arkit_profile,
             time_sync_result.arkit_time_shifted,
         )
-        refined_scale = self.scale_refiner.refine(
-            scale_result.scale_factor,
-            self.hand_eye_calibrator,
-            self.hand_eye_refiner,
-            self.evaluator,
-            robot_series,
-            arkit_series,
-            time_sync_result.arkit_time_shifted,
-        )
-        if abs(refined_scale - scale_result.scale_factor) > 1e-9:
-            scale_result = ScaleCalibrationResult(
-                scale_factor=refined_scale,
-                initial_scale_factor=scale_result.initial_scale_factor,
-                max_v_robot=scale_result.max_v_robot,
-                max_v_arkit=scale_result.max_v_arkit,
-                arkit_scaled_profile=VelocityProfile(
-                    time=scale_result.arkit_scaled_profile.time.copy(),
-                    speed=(scale_result.arkit_scaled_profile.speed / scale_result.scale_factor) * refined_scale,
-                    label=scale_result.arkit_scaled_profile.label,
-                ),
-            )
         hand_eye_result = self.hand_eye_calibrator.calibrate(
             robot_series,
             arkit_series,
             time_sync_result.arkit_time_shifted,
-            scale_result.scale_factor,
+            1.0,
         )
         initial_evaluation = self.evaluator.evaluate(hand_eye_result)
         if self.skip_world_refinement:
             refined_hand_eye_result = hand_eye_result
-            refined_scale = scale_result.scale_factor
         else:
-            refined_hand_eye_result, refined_scale = self.hand_eye_refiner.refine(
+            refined_hand_eye_result, _ = self.hand_eye_refiner.refine(
                 hand_eye_result,
                 arkit_series,
-                scale_result.scale_factor,
+                1.0,
             )
         evaluation_result = self.evaluator.evaluate(refined_hand_eye_result)
         stage_evaluations = self.stage_evaluator.evaluate_stages(
             refined_hand_eye_result,
             arkit_series,
-            scale_result.scale_factor,
+            1.0,
         )
         cross_validation = None
-        if self.cross_validate_scale:
-            cross_validation = self.cross_validator.evaluate_scale_generalization(
-                refined_hand_eye_result.matched_pairs,
-                scale_result.initial_scale_factor,
-                self.hand_eye_calibrator,
-                self.hand_eye_refiner,
-                self.evaluator,
-                robot_series,
-                arkit_series,
-                time_sync_result.arkit_time_shifted,
-            )
         return OfflineCalibrationResult(
             time_sync=time_sync_result,
             scale=scale_result,
@@ -1695,8 +1693,7 @@ def print_offline_result(result):
     refinement_label = "useful" if refinement_gain_mm > 0.2 else "negligible"
     print("=== Offline Calibration Result ===")
     print(f"time_shift: {result.time_shift:.6f} s")
-    print(f"initial_scale_factor: {result.scale.initial_scale_factor:.6f}")
-    print(f"scale_factor: {result.scale_factor:.6f}")
+    print(f"scale_factor: {result.scale_factor:.6f} (fixed)")
     print(f"matched_pose_pairs: {len(result.hand_eye.matched_pairs)}")
     print(f"initial_relative_error_mean: {result.initial_evaluation.mean_relative_error_mm:.3f} mm")
     print(f"initial_absolute_error_mean: {result.initial_evaluation.mean_absolute_error_mm:.3f} mm")
@@ -1730,6 +1727,75 @@ def print_offline_result(result):
     print(np.array2string(result.hand_eye.t_cam2gripper, precision=6, suppress_small=True))
     print("T_base_world:")
     print(np.array2string(result.hand_eye.T_base_world, precision=6, suppress_small=True))
+
+
+def run_offline_calibration_to_output(
+    arkit_csv,
+    sensor_csv,
+    output_root="offline_calibration_output",
+    max_pair_delta=0.05,
+    smooth_window=11,
+    cross_validate_scale=False,
+    cv_folds=5,
+    skip_world_refinement=False,
+):
+    pipeline = OfflinePoseCalibrationPipeline(
+        max_pair_delta=max_pair_delta,
+        smooth_window=smooth_window,
+        cross_validate_scale=cross_validate_scale,
+        cv_folds=cv_folds,
+        skip_world_refinement=skip_world_refinement,
+    )
+    result = pipeline.run(arkit_csv, sensor_csv)
+    output_dir = prepare_run_output_dir(output_root, arkit_csv, sensor_csv)
+    CalibrationPlotter(output_dir).create_all(result)
+    result_path = output_dir / "offline_calibration_result.json"
+    result_path.write_text(json.dumps(serialize_offline_result(result), indent=2), encoding="utf-8")
+    return result, output_dir, result_path
+
+
+class OfflineCalibrationWorker(QThread):
+    status_changed = pyqtSignal(str)
+    finished_successfully = pyqtSignal(object, str, str)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        arkit_csv,
+        sensor_csv,
+        output_root,
+        max_pair_delta,
+        smooth_window,
+        cross_validate_scale,
+        cv_folds,
+        skip_world_refinement,
+    ):
+        super().__init__()
+        self.arkit_csv = arkit_csv
+        self.sensor_csv = sensor_csv
+        self.output_root = output_root
+        self.max_pair_delta = max_pair_delta
+        self.smooth_window = smooth_window
+        self.cross_validate_scale = cross_validate_scale
+        self.cv_folds = cv_folds
+        self.skip_world_refinement = skip_world_refinement
+
+    def run(self):
+        try:
+            self.status_changed.emit("Running offline calibration...")
+            result, output_dir, result_path = run_offline_calibration_to_output(
+                self.arkit_csv,
+                self.sensor_csv,
+                output_root=self.output_root,
+                max_pair_delta=self.max_pair_delta,
+                smooth_window=self.smooth_window,
+                cross_validate_scale=self.cross_validate_scale,
+                cv_folds=self.cv_folds,
+                skip_world_refinement=self.skip_world_refinement,
+            )
+            self.finished_successfully.emit(result, str(output_dir), str(result_path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class AdaptiveCalibrator:
@@ -2134,7 +2200,8 @@ class ExternalCameraView(gl.GLViewWidget):
     def __init__(self):
         super().__init__()
         self.setBackgroundColor("#101418")
-        self.setCameraPosition(distance=3.5, elevation=24, azimuth=42)
+        self.setCameraPosition(distance=2.5, elevation=28, azimuth=42)
+        self.last_camera_fit = 0.0
 
         grid = gl.GLGridItem()
         grid.setSize(4.0, 4.0, 1.0)
@@ -2148,17 +2215,21 @@ class ExternalCameraView(gl.GLViewWidget):
         self.sensor_line = gl.GLLinePlotItem(width=3.0, antialias=True)
         self.arkit_marker = gl.GLScatterPlotItem(size=9, pxMode=True)
         self.sensor_marker = gl.GLScatterPlotItem(size=9, pxMode=True)
-        self.arkit_frustum = gl.GLLinePlotItem(width=2.0, antialias=True)
-        self.sensor_frustum = gl.GLLinePlotItem(width=2.0, antialias=True)
+        self.start_marker = gl.GLScatterPlotItem(size=11, pxMode=True)
+        self.end_marker = gl.GLScatterPlotItem(size=11, pxMode=True)
+        self.error_lines = [gl.GLLinePlotItem(width=1.2, antialias=True) for _ in range(24)]
 
         for item in [
             self.arkit_line,
             self.sensor_line,
             self.arkit_marker,
             self.sensor_marker,
-            self.arkit_frustum,
-            self.sensor_frustum,
+            self.start_marker,
+            self.end_marker,
         ]:
+            self.addItem(item)
+
+        for item in self.error_lines:
             self.addItem(item)
 
     def add_axes(self):
@@ -2170,16 +2241,89 @@ class ExternalCameraView(gl.GLViewWidget):
         for points, color in axes:
             self.addItem(gl.GLLinePlotItem(pos=points, color=color, width=2.0, antialias=True))
 
-    def update_scene(self, arkit_positions, sensor_positions, arkit_pose, sensor_pose):
-        if len(arkit_positions) > 1:
-            self.arkit_line.setData(pos=arkit_positions, color=(0.0, 0.85, 1.0, 1.0))
-            self.arkit_marker.setData(pos=arkit_positions[-1:], color=(0.0, 0.85, 1.0, 1.0))
+    def update_scene(self, arkit_positions, sensor_positions, arkit_pose, sensor_pose, error_segments=None):
+        arkit_positions = self.normalized_points(arkit_positions)
+        sensor_positions = self.normalized_points(sensor_positions)
 
-        if len(sensor_positions) > 1:
-            self.sensor_line.setData(pos=sensor_positions, color=(1.0, 0.72, 0.18, 1.0))
-            self.sensor_marker.setData(pos=sensor_positions[-1:], color=(1.0, 0.72, 0.18, 1.0))
+        self.update_track(
+            self.arkit_line,
+            self.arkit_marker,
+            arkit_positions,
+            line_color=(0.0, 0.85, 1.0, 1.0),
+            marker_color=(0.45, 0.95, 1.0, 1.0),
+        )
+        self.update_track(
+            self.sensor_line,
+            self.sensor_marker,
+            sensor_positions,
+            line_color=(1.0, 0.68, 0.12, 0.95),
+            marker_color=(1.0, 0.76, 0.22, 1.0),
+        )
+        self.update_start_end_markers(arkit_positions, sensor_positions)
+        self.update_error_segments(error_segments or [])
+        self.fit_camera_to_points([arkit_positions, sensor_positions])
 
-        # Frustums removed to avoid blocking trajectory view
+    def normalized_points(self, points):
+        if points is None or len(points) == 0:
+            return np.empty((0, 3), dtype=float)
+        points = np.asarray(points, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 3:
+            return np.empty((0, 3), dtype=float)
+        return points
+
+    def update_track(self, line_item, marker_item, points, line_color, marker_color):
+        if len(points) > 1:
+            line_item.setData(pos=points, color=line_color)
+        else:
+            line_item.setData(pos=np.empty((0, 3), dtype=float), color=line_color)
+
+        if len(points) > 0:
+            marker_item.setData(pos=points[-1:], color=marker_color)
+        else:
+            marker_item.setData(pos=np.empty((0, 3), dtype=float), color=marker_color)
+
+    def update_start_end_markers(self, arkit_positions, sensor_positions):
+        start_points = []
+        end_points = []
+        if len(arkit_positions) > 0:
+            start_points.append(arkit_positions[0])
+            end_points.append(arkit_positions[-1])
+        if len(sensor_positions) > 0:
+            start_points.append(sensor_positions[0])
+            end_points.append(sensor_positions[-1])
+
+        self.start_marker.setData(
+            pos=np.array(start_points, dtype=float) if start_points else np.empty((0, 3), dtype=float),
+            color=(0.2, 1.0, 0.35, 1.0),
+        )
+        self.end_marker.setData(
+            pos=np.array(end_points, dtype=float) if end_points else np.empty((0, 3), dtype=float),
+            color=(1.0, 0.25, 0.95, 1.0),
+        )
+
+    def update_error_segments(self, error_segments):
+        for index, item in enumerate(self.error_lines):
+            if index < len(error_segments):
+                segment = np.asarray(error_segments[index], dtype=float)
+                item.setData(pos=segment, color=(1.0, 0.15, 0.25, 0.45))
+            else:
+                item.setData(pos=np.empty((0, 3), dtype=float), color=(1.0, 0.15, 0.25, 0.0))
+
+    def fit_camera_to_points(self, point_sets):
+        now = time.monotonic()
+        if now - self.last_camera_fit < 0.75:
+            return
+
+        visible = [points for points in point_sets if len(points) > 0]
+        if not visible:
+            return
+
+        all_points = np.vstack(visible)
+        extent = np.ptp(all_points, axis=0)
+        distance = float(max(np.max(extent) * 2.8, 0.35))
+        distance = min(distance, 12.0)
+        self.setCameraPosition(distance=distance, elevation=28, azimuth=42)
+        self.last_camera_fit = now
 
 
 def camera_frustum_points(sample, scale=0.18):
@@ -2211,14 +2355,14 @@ class StatsPanel(QWidget):
         super().__init__()
         layout = QVBoxLayout()
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        self.arkit_label = QLabel("ARKit: waiting")
-        self.sensor_label = QLabel("Sensor: waiting")
-        self.error_label = QLabel("Error: waiting for paired samples")
-        self.timing_label = QLabel("Timing: waiting for calibration")
-        self.calibration_label = QLabel("Calibration: waiting for motion")
-        self.legend_label = QLabel("ARKit = cyan | Sensor = amber")
+        self.arkit_label = QLabel("iPhone CSV: not loaded")
+        self.sensor_label = QLabel("Robot CSV: not loaded")
+        self.error_label = QLabel("Status: choose both files to run offline calibration")
+        self.timing_label = QLabel("Timing: waiting")
+        self.calibration_label = QLabel("Result: waiting")
+        self.legend_label = QLabel("Output: no result yet")
 
         for label in [
             self.arkit_label,
@@ -2229,9 +2373,41 @@ class StatsPanel(QWidget):
             self.legend_label,
         ]:
             label.setWordWrap(True)
+            label.setMinimumHeight(0)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             layout.addWidget(label)
 
         self.setLayout(layout)
+
+    def update_input(self, stream, filename, sample_count=None):
+        suffix = "" if sample_count is None else f" ({sample_count} samples)"
+        if stream == "arkit":
+            self.arkit_label.setText(f"iPhone CSV: {filename}{suffix}")
+        else:
+            self.sensor_label.setText(f"Robot CSV: {filename}{suffix}")
+
+    def update_status(self, message):
+        self.error_label.setText(f"Status: {message}")
+
+    def update_offline_result(self, result, output_dir):
+        self.error_label.setText("Status: calibration complete")
+        self.timing_label.setText(
+            f"Timing: shift {result.time_shift:+.3f} s | pairs {len(result.hand_eye.matched_pairs)}"
+        )
+        self.calibration_label.setText(
+            f"Result: mean {result.evaluation.mean_absolute_error_mm:.3f} mm | "
+            f"rmse {result.evaluation.rmse_absolute_error_mm:.3f} mm | "
+            f"max {result.evaluation.max_absolute_error_mm:.3f} mm"
+        )
+        self.legend_label.setText(f"Output folder: {Path(output_dir).name}")
+
+    def reset_offline(self):
+        self.arkit_label.setText("iPhone CSV: not loaded")
+        self.sensor_label.setText("Robot CSV: not loaded")
+        self.error_label.setText("Status: choose both files to run offline calibration")
+        self.timing_label.setText("Timing: waiting")
+        self.calibration_label.setText("Result: waiting")
+        self.legend_label.setText("Output: no result yet")
 
     def update_stream(self, stream, stats):
         text = (
@@ -2279,62 +2455,307 @@ class StatsPanel(QWidget):
         )
 
 
+class ErrorPlotsPanel(QWidget):
+    plot_selected = pyqtSignal(str)
+
+    def __init__(self, output_root="offline_calibration_output"):
+        super().__init__()
+        self.output_root = Path(output_root)
+        self.plot_dir = None
+        self.image_labels = []
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        header = QLabel("Result Plots")
+        header.setObjectName("panelHeader")
+
+        self.path_label = QLabel("No result plots loaded")
+        self.path_label.setObjectName("mutedLabel")
+        self.path_label.setWordWrap(True)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        self.refresh_button = QPushButton("Refresh")
+        self.choose_button = QPushButton("Choose")
+        self.open_button = QPushButton("Open Folder")
+        controls.addWidget(self.refresh_button)
+        controls.addWidget(self.choose_button)
+        controls.addWidget(self.open_button)
+
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout()
+        self.scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_layout.setSpacing(12)
+        self.scroll_content.setLayout(self.scroll_layout)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(self.scroll_content)
+
+        layout.addWidget(header)
+        layout.addWidget(self.path_label)
+        layout.addLayout(controls)
+        layout.addWidget(self.scroll_area, 1)
+        self.setLayout(layout)
+
+        self.refresh_button.clicked.connect(self.load_latest)
+        self.choose_button.clicked.connect(self.choose_directory)
+        self.open_button.clicked.connect(self.open_directory)
+
+        self.load_latest()
+
+    def load_latest(self):
+        latest_dir = find_latest_error_plot_dir(self.output_root)
+        self.load_directory(latest_dir)
+
+    def choose_directory(self):
+        start_dir = self.plot_dir or self.output_root
+        path = QFileDialog.getExistingDirectory(self, "Choose Error Plot Folder", str(start_dir))
+        if path:
+            self.load_directory(Path(path))
+
+    def open_directory(self):
+        if self.plot_dir is None:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.plot_dir.resolve())))
+
+    def load_directory(self, plot_dir):
+        self.clear_images()
+        self.plot_dir = Path(plot_dir) if plot_dir else None
+
+        if self.plot_dir is None:
+            self.path_label.setText("No result plots found under offline_calibration_output")
+            self.add_placeholder("Run offline calibration first, or choose a folder that contains generated PNG plots.")
+            return
+
+        self.path_label.setText(str(self.plot_dir))
+        loaded_count = 0
+        first_image_path = None
+        for title, filename in ERROR_PLOT_FILES:
+            image_path = self.plot_dir / filename
+            if image_path.exists():
+                if first_image_path is None:
+                    first_image_path = image_path
+                self.add_image(title, image_path)
+                loaded_count += 1
+
+        if loaded_count == 0:
+            self.add_placeholder("This folder does not contain recognized error plot PNG files.")
+        elif first_image_path is not None:
+            self.plot_selected.emit(str(first_image_path))
+
+    def clear_images(self):
+        while self.scroll_layout.count():
+            item = self.scroll_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.image_labels = []
+
+    def add_placeholder(self, message):
+        label = QLabel(message)
+        label.setObjectName("mutedLabel")
+        label.setWordWrap(True)
+        self.scroll_layout.addWidget(label)
+        self.scroll_layout.addStretch()
+
+    def add_image(self, title, image_path):
+        container = QGroupBox(title)
+        container_layout = QVBoxLayout()
+        container_layout.setContentsMargins(8, 10, 8, 8)
+        container_layout.setSpacing(6)
+
+        image_label = QLabel()
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image_label.setMinimumHeight(180)
+        image_label.setObjectName("plotImage")
+
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            image_label.setText(f"Could not load {image_path.name}")
+        else:
+            scaled = pixmap.scaled(
+                360,
+                240,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            image_label.setPixmap(scaled)
+
+        file_label = QLabel(image_path.name)
+        file_label.setObjectName("mutedLabel")
+        file_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        container_layout.addWidget(image_label)
+        container_layout.addWidget(file_label)
+        container.setLayout(container_layout)
+        self.scroll_layout.addWidget(container)
+        self.image_labels.append(image_label)
+
+        for clickable in [container, image_label, file_label]:
+            clickable.setCursor(Qt.CursorShape.PointingHandCursor)
+            clickable.mousePressEvent = lambda event, path=str(image_path): self.plot_selected.emit(path)
+
+
+class TrajectoryOverlapImageView(QWidget):
+    def __init__(self, output_root="offline_calibration_output"):
+        super().__init__()
+        self.output_root = Path(output_root)
+        self.plot_dir = None
+        self.image_path = None
+        self.original_pixmap = QPixmap()
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+        self.title_label = QLabel("3D Trajectory Overlap")
+        self.title_label.setObjectName("panelHeader")
+        self.refresh_button = QPushButton("Refresh")
+        self.choose_button = QPushButton("Choose")
+        self.open_button = QPushButton("Open Folder")
+        header_row.addWidget(self.title_label, 1)
+        header_row.addWidget(self.refresh_button)
+        header_row.addWidget(self.choose_button)
+        header_row.addWidget(self.open_button)
+
+        self.path_label = QLabel("No trajectory overlap plot loaded")
+        self.path_label.setObjectName("mutedLabel")
+        self.path_label.setWordWrap(True)
+
+        self.image_label = QLabel()
+        self.image_label.setObjectName("overlapImage")
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(640, 480)
+
+        layout.addLayout(header_row)
+        layout.addWidget(self.path_label)
+        layout.addWidget(self.image_label, 1)
+        self.setLayout(layout)
+
+        self.refresh_button.clicked.connect(self.load_latest)
+        self.choose_button.clicked.connect(self.choose_directory)
+        self.open_button.clicked.connect(self.open_directory)
+
+        self.load_latest()
+
+    def load_latest(self):
+        self.load_directory(find_latest_error_plot_dir(self.output_root))
+
+    def choose_directory(self):
+        start_dir = self.plot_dir or self.output_root
+        path = QFileDialog.getExistingDirectory(self, "Choose Trajectory Plot Folder", str(start_dir))
+        if path:
+            self.load_directory(Path(path))
+
+    def open_directory(self):
+        if self.plot_dir is None:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.plot_dir.resolve())))
+
+    def load_directory(self, plot_dir):
+        self.plot_dir = Path(plot_dir) if plot_dir else None
+        image_path = self.plot_dir / "trajectory_overlap_3d.png" if self.plot_dir else None
+
+        if image_path is None or not image_path.exists():
+            self.original_pixmap = QPixmap()
+            self.path_label.setText("No trajectory_overlap_3d.png found under offline_calibration_output")
+            self.image_label.setText("Run offline calibration first, or choose a folder containing trajectory_overlap_3d.png.")
+            self.image_label.setPixmap(QPixmap())
+            return
+
+        self.load_image_path(str(image_path))
+
+    def load_image_path(self, image_path):
+        self.image_path = Path(image_path)
+        self.plot_dir = self.image_path.parent
+
+        self.original_pixmap = QPixmap(str(self.image_path))
+        if self.original_pixmap.isNull():
+            self.path_label.setText(str(self.image_path))
+            self.image_label.setPixmap(QPixmap())
+            self.image_label.setText(f"Could not load {self.image_path.name}")
+            return
+
+        self.title_label.setText(self.display_title_for(self.image_path.name))
+        self.path_label.setText(str(self.image_path))
+        self.update_scaled_pixmap()
+
+    def display_title_for(self, filename):
+        for title, plot_filename in ALL_KNOWN_PLOT_FILES:
+            if filename == plot_filename:
+                return title
+        return Path(filename).stem.replace("_", " ").title()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_scaled_pixmap()
+
+    def update_scaled_pixmap(self):
+        if self.original_pixmap.isNull():
+            return
+
+        target_size = self.image_label.size()
+        scaled = self.original_pixmap.scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image_label.setPixmap(scaled)
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, host, arkit_port, sensor_port, pairing_window, max_time_offset, arkit_csv=None, sensor_csv=None):
+    def __init__(
+        self,
+        host,
+        arkit_port,
+        sensor_port,
+        pairing_window,
+        max_time_offset,
+        arkit_csv=None,
+        sensor_csv=None,
+        output_dir="offline_calibration_output",
+        max_pair_delta=0.05,
+        smooth_window=11,
+        cross_validate_scale=False,
+        cv_folds=5,
+        skip_world_refinement=False,
+    ):
         super().__init__()
         self.host = host
         self.arkit_port = arkit_port
         self.sensor_port = sensor_port
         self.pairing_window = pairing_window
         self.max_time_offset = max_time_offset
-        self.receivers = []
+        self.output_dir = output_dir
+        self.max_pair_delta = max_pair_delta
+        self.smooth_window = smooth_window
+        self.cross_validate_scale = cross_validate_scale
+        self.cv_folds = cv_folds
+        self.skip_world_refinement = skip_world_refinement
+        self.offline_worker = None
         self.tracks = {"arkit": PoseTrack(), "sensor": PoseTrack()}
-        self.calibrator = AdaptiveCalibrator(max_time_offset=max_time_offset, pairing_window=pairing_window)
-        self.calibrated_sensor_track = CalibratedSensorTrack(self.tracks["sensor"], self.calibrator.result)
-        self.apply_calibration = False
-        self.show_all = False
-        self.last_calibration_update = 0.0
-        self.calibration_file = Path("calibration.json")
         self.arkit_csv = arkit_csv
         self.sensor_csv = sensor_csv
 
         self.init_ui()
         self.apply_stylesheet()
-        self.load_offline_inputs_if_needed()
+        self.load_initial_offline_inputs_if_needed()
 
-        self.render_timer = QTimer()
-        self.render_timer.timeout.connect(self.update_render)
-        self.render_timer.start(33)
-
-    def load_offline_inputs_if_needed(self):
-        if not self.arkit_csv or not self.sensor_csv:
-            return
-        for sample in load_pose_csv(self.arkit_csv, "arkit"):
-            self.tracks["arkit"].append(sample)
-        for sample in load_pose_csv(self.sensor_csv, "sensor"):
-            self.tracks["sensor"].append(sample)
-
-        result = self.calibrator.update(self.tracks["arkit"].samples, self.tracks["sensor"].samples)
-        self.calibrated_sensor_track.calibration_result = result
-        self.stats_panel.update_stream("arkit", {
-            "fps": 0.0,
-            "packets": len(self.tracks["arkit"].samples),
-            "drops": 0,
-            "latency_ms": 0.0,
-            "protocol_version": self.tracks["arkit"].samples[-1].protocol_version if self.tracks["arkit"].samples else 1,
-        })
-        self.stats_panel.update_stream("sensor", {
-            "fps": 0.0,
-            "packets": len(self.tracks["sensor"].samples),
-            "drops": 0,
-            "latency_ms": 0.0,
-            "protocol_version": self.tracks["sensor"].samples[-1].protocol_version if self.tracks["sensor"].samples else 1,
-        })
-        self.stats_panel.update_calibration(result, self.apply_calibration)
+    def load_initial_offline_inputs_if_needed(self):
+        if self.arkit_csv:
+            self.load_csv_path("arkit", self.arkit_csv)
+        if self.sensor_csv:
+            self.load_csv_path("sensor", self.sensor_csv)
+        self.run_offline_calibration_if_ready()
 
     def init_ui(self):
         self.setWindowTitle("ARPose Tracking Validator")
-        self.resize(1280, 820)
+        self.resize(1680, 900)
 
         root = QWidget()
         root_layout = QHBoxLayout()
@@ -2342,12 +2763,12 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(0)
 
         side = QWidget()
-        side.setFixedWidth(320)
+        side.setFixedWidth(360)
         side_layout = QVBoxLayout()
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(14)
 
-        service_box = QGroupBox("Streams")
+        service_box = QGroupBox("Offline Calibration")
         service_layout = QVBoxLayout()
 
         self.load_arkit_csv_button = QPushButton("Load iPhone CSV")
@@ -2355,25 +2776,13 @@ class MainWindow(QMainWindow):
         self.arkit_csv_label = QLabel("iPhone: Not loaded")
         self.sensor_csv_label = QLabel("Robot Arm: Not loaded")
         self.clear_data_button = QPushButton("Clear All Data")
-
-        self.start_button = QPushButton("Start Live Validation")
-        self.stop_button = QPushButton("Stop")
-        self.reset_button = QPushButton("Reset Origins")
-        self.save_calibration_button = QPushButton("Save Calibration")
-        self.load_calibration_button = QPushButton("Load Calibration")
-        self.show_all_checkbox = QCheckBox("Show all history")
-        self.apply_calibration_checkbox = QCheckBox("Apply adaptive calibration")
+        self.run_calibration_button = QPushButton("Run Offline Calibration")
+        self.run_calibration_button.setEnabled(False)
 
         self.load_arkit_csv_button.clicked.connect(self.load_arkit_csv)
         self.load_sensor_csv_button.clicked.connect(self.load_sensor_csv)
         self.clear_data_button.clicked.connect(self.clear_all_data)
-        self.start_button.clicked.connect(self.start_receivers)
-        self.stop_button.clicked.connect(self.stop_receivers)
-        self.reset_button.clicked.connect(self.reset_origins)
-        self.save_calibration_button.clicked.connect(self.save_calibration)
-        self.load_calibration_button.clicked.connect(self.load_calibration)
-        self.show_all_checkbox.stateChanged.connect(self.change_history_mode)
-        self.apply_calibration_checkbox.stateChanged.connect(self.change_calibration_mode)
+        self.run_calibration_button.clicked.connect(self.run_offline_calibration_if_ready)
 
         self.arkit_csv_label.setWordWrap(True)
         self.sensor_csv_label.setWordWrap(True)
@@ -2385,34 +2794,35 @@ class MainWindow(QMainWindow):
             self.arkit_csv_label,
             self.load_sensor_csv_button,
             self.sensor_csv_label,
+            self.run_calibration_button,
             self.clear_data_button,
-            self.start_button,
-            self.stop_button,
-            self.reset_button,
-            self.save_calibration_button,
-            self.load_calibration_button,
-            self.show_all_checkbox,
-            self.apply_calibration_checkbox,
         ]:
             service_layout.addWidget(widget)
 
-        self.endpoint_label = QLabel(
-            f"Bind host: {self.host}\nARKit UDP: {self.arkit_port}\nSensor UDP: {self.sensor_port}"
-        )
+        self.endpoint_label = QLabel("Select both CSV files. Calibration and plots will be generated automatically.")
         self.endpoint_label.setWordWrap(True)
         service_layout.addWidget(self.endpoint_label)
         service_box.setLayout(service_layout)
 
         self.stats_panel = StatsPanel()
+        stats_scroll = QScrollArea()
+        stats_scroll.setWidgetResizable(True)
+        stats_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        stats_scroll.setMinimumHeight(210)
+        stats_scroll.setWidget(self.stats_panel)
 
         side_layout.addWidget(service_box)
-        side_layout.addWidget(self.stats_panel)
-        side_layout.addStretch()
+        side_layout.addWidget(stats_scroll, 1)
         side.setLayout(side_layout)
 
-        self.view = ExternalCameraView()
+        self.view = TrajectoryOverlapImageView()
+        self.error_plots_panel = ErrorPlotsPanel()
+        self.error_plots_panel.setFixedWidth(420)
+        self.error_plots_panel.plot_selected.connect(self.view.load_image_path)
+
         root_layout.addWidget(side)
         root_layout.addWidget(self.view, 1)
+        root_layout.addWidget(self.error_plots_panel)
         root.setLayout(root_layout)
         self.setCentralWidget(root)
 
@@ -2445,220 +2855,36 @@ class MainWindow(QMainWindow):
             QPushButton:hover {
                 background-color: #31444f;
             }
-            QCheckBox {
-                padding: 4px;
-            }
             QLabel {
                 color: #edf2f4;
+                line-height: 145%;
+                padding: 1px 0;
+            }
+            QLabel#panelHeader {
+                font-size: 16px;
+                font-weight: bold;
+            }
+            QLabel#mutedLabel {
+                color: #9ba8b0;
+                font-size: 11px;
+            }
+            QLabel#plotImage {
+                background-color: #0f1418;
+                border: 1px solid #2b3942;
+                border-radius: 6px;
+            }
+            QLabel#overlapImage {
+                background-color: #f8fafc;
+                border: 1px solid #33444f;
+                border-radius: 8px;
+                color: #182027;
+            }
+            QScrollArea {
+                border: none;
+                background-color: transparent;
             }
             """
         )
-
-    def start_receivers(self):
-        if self.receivers:
-            return
-        for stream, port in [("arkit", self.arkit_port), ("sensor", self.sensor_port)]:
-            receiver = PoseReceiverThread(stream, port, self.host)
-            receiver.sample_received.connect(self.on_sample)
-            receiver.status_updated.connect(self.stats_panel.update_stream)
-            receiver.error_occurred.connect(self.on_error)
-            receiver.start()
-            self.receivers.append(receiver)
-
-    def stop_receivers(self):
-        for receiver in self.receivers:
-            receiver.stop()
-            receiver.wait()
-        self.receivers = []
-
-    def reset_origins(self):
-        for track in self.tracks.values():
-            track.reset_origin()
-        self.calibrated_sensor_track.reset_origin()
-
-    def change_history_mode(self, state):
-        self.show_all = state == Qt.CheckState.Checked.value
-
-    def change_calibration_mode(self, state):
-        self.apply_calibration = state == Qt.CheckState.Checked.value
-        self.calibrated_sensor_track.reset_origin()
-        self.stats_panel.update_calibration(self.calibrator.result, self.apply_calibration)
-
-    def save_calibration(self):
-        if not self.calibrator.result.enabled:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Calibration", str(self.calibration_file), "JSON Files (*.json)")
-        if not path:
-            return
-        payload = self.calibrator.result.to_dict()
-        payload["saved_at"] = time.time()
-        payload["format"] = "arpose_calibration_v1"
-        Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        self.calibration_file = Path(path)
-
-    def load_calibration(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load Calibration", str(self.calibration_file), "JSON Files (*.json)")
-        if not path:
-            return
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        result = CalibrationResult.from_dict(data)
-        result.enabled = True
-        result.quality = data.get("quality", "loaded")
-        self.calibrator.result = result
-        self.calibrated_sensor_track.calibration_result = result
-        self.calibrated_sensor_track.reset_origin()
-        self.calibration_file = Path(path)
-        self.stats_panel.update_calibration(result, self.apply_calibration)
-
-    def on_sample(self, sample):
-        self.tracks[sample.stream].append(sample)
-        self.update_calibration_if_needed()
-        self.update_error_metrics(sample)
-
-    def on_error(self, stream, message):
-        print(f"[{stream}] {message}")
-
-    def update_error_metrics(self, sample):
-        paired = self.current_error_pair(sample)
-        if paired is None:
-            self.stats_panel.update_error(None, None, None)
-            return
-
-        arkit, sensor, delta = paired
-        arkit_origin = self.tracks["arkit"].origin
-        if arkit_origin is None:
-            arkit_origin = np.zeros(3, dtype=float)
-        arkit_pos = arkit.position - arkit_origin
-
-        if self.apply_calibration and self.calibrator.result.enabled:
-            sensor_position = self.calibrator.result.transform.apply_position(sensor.position)
-            sensor_pos = sensor_position - arkit_origin
-            sensor_quaternion = self.calibrator.result.transform.apply_quaternion(sensor.quaternion)
-        else:
-            sensor_origin = self.tracks["sensor"].origin
-            if sensor_origin is None:
-                sensor_origin = np.zeros(3, dtype=float)
-            sensor_pos = sensor.position - sensor_origin
-            sensor_quaternion = sensor.quaternion
-
-        position_error = float(np.linalg.norm(arkit_pos - sensor_pos))
-        angle_error = quaternion_angle_error_degrees(arkit.quaternion, sensor_quaternion)
-        self.stats_panel.update_error(position_error, angle_error, delta)
-
-    def current_error_pair(self, sample):
-        if self.apply_calibration and self.calibrator.result.enabled:
-            target_stream = "sensor" if sample.stream == "arkit" else "arkit"
-            if sample.stream == "arkit":
-                target_time = self.calibrator.result.arkit_to_sensor_time(sample.sender_time)
-                other, delta = nearest_by_sender_time(
-                    self.tracks[target_stream].samples,
-                    target_time,
-                    self.pairing_window,
-                )
-                if other is None:
-                    return None
-                return sample, other, delta
-
-            sample_time = self.calibrator.sample_time(sample)
-            target_time = self.calibrator.result.sensor_to_arkit_time(sample_time)
-            other, delta = nearest_by_sender_time(
-                self.tracks[target_stream].samples,
-                target_time,
-                self.pairing_window,
-            )
-            if other is None:
-                return None
-            return other, sample, delta
-
-        other_stream = "sensor" if sample.stream == "arkit" else "arkit"
-        other, delta = nearest_by_sender_time(
-            self.tracks[other_stream].samples,
-            sample.sender_time,
-            self.pairing_window,
-        )
-        if other is None:
-            return None
-
-        arkit = sample if sample.stream == "arkit" else other
-        sensor = other if sample.stream == "arkit" else sample
-        return arkit, sensor, delta
-
-    def update_calibration_if_needed(self):
-        now = time.monotonic()
-        if now - self.last_calibration_update < 0.5:
-            return
-        self.last_calibration_update = now
-        result = self.calibrator.update(self.tracks["arkit"].samples, self.tracks["sensor"].samples)
-        self.calibrated_sensor_track.calibration_result = result
-        self.stats_panel.update_calibration(result, self.apply_calibration)
-
-    def update_render(self):
-        window = None if self.show_all else 5.0
-        arkit_positions = self.tracks["arkit"].positions(window)
-        arkit_pose = self.tracks["arkit"].latest_relative()
-
-        # Always show both tracks, even when calibration is applied
-        if self.apply_calibration and self.calibrated_sensor_track is not None:
-            sensor_track = self.calibrated_sensor_track
-            arkit_origin = self.tracks["arkit"].origin
-            sensor_positions = sensor_track.positions(window, reference_origin=arkit_origin)
-            sensor_pose = sensor_track.latest_relative(reference_origin=arkit_origin)
-        else:
-            sensor_track = self.tracks["sensor"]
-            sensor_positions = sensor_track.positions(window)
-            sensor_pose = sensor_track.latest_relative()
-
-            # Only apply manual alignment when calibration is NOT applied
-            if len(arkit_positions) > 0 and len(sensor_positions) > 0:
-                sensor_positions = self.align_trajectories(arkit_positions, sensor_positions)
-
-        self.view.update_scene(arkit_positions, sensor_positions, arkit_pose, sensor_pose)
-
-    def align_trajectories(self, arkit_pos, sensor_pos, align_frames=100):
-        """
-        Align sensor trajectory to arkit by:
-        1. Forcing start points to match
-        2. Computing optimal rotation to maximize trajectory overlap
-        3. NOT forcing end points (different sampling rates/durations)
-        """
-        if len(arkit_pos) < 2 or len(sensor_pos) < 2:
-            return sensor_pos
-
-        # Step 1: Translate sensor so its start matches arkit's start
-        offset_start = arkit_pos[0] - sensor_pos[0]
-        sensor_translated = sensor_pos + offset_start
-
-        # Step 2: Use overlapping portion to compute optimal rotation
-        # Find how many points overlap in time (use the shorter trajectory)
-        n_overlap = min(len(arkit_pos), len(sensor_pos), align_frames)
-
-        if n_overlap < 10:
-            # Not enough overlap, just return translated
-            return sensor_translated
-
-        # Use first n_overlap points from both trajectories
-        arkit_subset = arkit_pos[:n_overlap]
-        sensor_subset = sensor_translated[:n_overlap]
-
-        # Center both subsets at their start point (not centroid)
-        arkit_centered = arkit_subset - arkit_subset[0]
-        sensor_centered = sensor_subset - sensor_subset[0]
-
-        # Compute optimal rotation using SVD (Kabsch algorithm)
-        H = sensor_centered.T @ arkit_centered
-        U, _, Vt = np.linalg.svd(H)
-        R = Vt.T @ U.T
-
-        # Ensure proper rotation (det(R) = 1)
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = Vt.T @ U.T
-
-        # Step 3: Apply rotation to entire sensor trajectory around start point
-        sensor_centered_all = sensor_translated - arkit_pos[0]
-        sensor_rotated = (R @ sensor_centered_all.T).T + arkit_pos[0]
-
-        return sensor_rotated
 
     def load_arkit_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2669,32 +2895,8 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-
-        self.stop_receivers()
-        self.tracks["arkit"] = PoseTrack()
-
-        try:
-            samples = load_pose_csv(path, "arkit")
-            for sample in samples:
-                self.tracks["arkit"].append(sample)
-
-            self.arkit_csv = path
-            filename = Path(path).name
-            self.arkit_csv_label.setText(f"iPhone: {filename} ({len(samples)} samples)")
-            self.stats_panel.update_stream("arkit", {
-                "fps": 0.0,
-                "packets": len(samples),
-                "drops": 0,
-                "latency_ms": 0.0,
-                "protocol_version": samples[-1].protocol_version if samples else 1,
-            })
-
-            if self.sensor_csv:
-                self.update_calibration_from_loaded_data()
-
-        except Exception as e:
-            self.arkit_csv_label.setText(f"iPhone: Error loading file")
-            print(f"Error loading ARKit CSV: {e}")
+        self.load_csv_path("arkit", path)
+        self.run_offline_calibration_if_ready()
 
     def load_sensor_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2705,73 +2907,103 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self.load_csv_path("sensor", path)
+        self.run_offline_calibration_if_ready()
 
-        self.stop_receivers()
-        self.tracks["sensor"] = PoseTrack()
-
+    def load_csv_path(self, stream, path):
         try:
-            samples = load_pose_csv(path, "sensor")
+            samples = load_pose_csv(path, stream)
+            self.tracks[stream] = PoseTrack()
             for sample in samples:
-                self.tracks["sensor"].append(sample)
+                self.tracks[stream].append(sample)
 
-            self.sensor_csv = path
             filename = Path(path).name
-            self.sensor_csv_label.setText(f"Robot Arm: {filename} ({len(samples)} samples)")
-            self.stats_panel.update_stream("sensor", {
-                "fps": 0.0,
-                "packets": len(samples),
-                "drops": 0,
-                "latency_ms": 0.0,
-                "protocol_version": samples[-1].protocol_version if samples else 1,
-            })
+            if stream == "arkit":
+                self.arkit_csv = path
+                self.arkit_csv_label.setText(f"iPhone: {filename} ({len(samples)} samples)")
+            else:
+                self.sensor_csv = path
+                self.sensor_csv_label.setText(f"Robot Arm: {filename} ({len(samples)} samples)")
 
-            if self.arkit_csv:
-                self.update_calibration_from_loaded_data()
+            self.stats_panel.update_input(stream, filename, len(samples))
+            self.update_run_button_state()
+            return True
+        except Exception as exc:
+            if stream == "arkit":
+                self.arkit_csv = None
+                self.arkit_csv_label.setText("iPhone: Error loading file")
+            else:
+                self.sensor_csv = None
+                self.sensor_csv_label.setText("Robot Arm: Error loading file")
+            self.stats_panel.update_status(f"could not load {stream} CSV: {exc}")
+            self.update_run_button_state()
+            return False
 
-            # Update calibrated_sensor_track to reference the new sensor track
-            self.calibrated_sensor_track.source_track = self.tracks["sensor"]
+    def update_run_button_state(self):
+        ready = bool(self.arkit_csv and self.sensor_csv and self.offline_worker is None)
+        self.run_calibration_button.setEnabled(ready)
 
-        except Exception as e:
-            self.sensor_csv_label.setText(f"Robot Arm: Error loading file")
-            print(f"Error loading sensor CSV: {e}")
-
-    def update_calibration_from_loaded_data(self):
-        if not self.tracks["arkit"].samples or not self.tracks["sensor"].samples:
+    def run_offline_calibration_if_ready(self):
+        if not self.arkit_csv or not self.sensor_csv or self.offline_worker is not None:
+            self.update_run_button_state()
             return
 
-        result = self.calibrator.update(self.tracks["arkit"].samples, self.tracks["sensor"].samples)
-        self.calibrated_sensor_track.calibration_result = result
-        self.stats_panel.update_calibration(result, self.apply_calibration)
+        self.run_calibration_button.setEnabled(False)
+        self.load_arkit_csv_button.setEnabled(False)
+        self.load_sensor_csv_button.setEnabled(False)
+        self.clear_data_button.setEnabled(False)
+        self.stats_panel.update_status("running offline calibration...")
+
+        self.offline_worker = OfflineCalibrationWorker(
+            self.arkit_csv,
+            self.sensor_csv,
+            self.output_dir,
+            self.max_pair_delta,
+            self.smooth_window,
+            self.cross_validate_scale,
+            self.cv_folds,
+            self.skip_world_refinement,
+        )
+        self.offline_worker.status_changed.connect(self.stats_panel.update_status)
+        self.offline_worker.finished_successfully.connect(self.on_offline_calibration_finished)
+        self.offline_worker.failed.connect(self.on_offline_calibration_failed)
+        self.offline_worker.finished.connect(self.on_offline_worker_done)
+        self.offline_worker.start()
+
+    def on_offline_calibration_finished(self, result, output_dir, result_path):
+        output_path = Path(output_dir)
+        self.stats_panel.update_offline_result(result, output_dir)
+        self.view.load_directory(output_path)
+        self.error_plots_panel.load_directory(output_path)
+        self.endpoint_label.setText(f"Latest result:\n{Path(result_path).name}\nFolder: {Path(result_path).parent.name}")
+
+    def on_offline_calibration_failed(self, message):
+        self.stats_panel.update_status(f"calibration failed: {message}")
+        self.endpoint_label.setText("Calibration failed. Check the selected CSV files and try again.")
+
+    def on_offline_worker_done(self):
+        self.offline_worker = None
+        self.load_arkit_csv_button.setEnabled(True)
+        self.load_sensor_csv_button.setEnabled(True)
+        self.clear_data_button.setEnabled(True)
+        self.update_run_button_state()
 
     def clear_all_data(self):
-        self.stop_receivers()
+        if self.offline_worker is not None:
+            return
         self.tracks["arkit"] = PoseTrack()
         self.tracks["sensor"] = PoseTrack()
-        self.calibrator = AdaptiveCalibrator(max_time_offset=self.max_time_offset, pairing_window=self.pairing_window)
-        self.calibrated_sensor_track = CalibratedSensorTrack(self.tracks["sensor"], self.calibrator.result)
         self.arkit_csv = None
         self.sensor_csv = None
         self.arkit_csv_label.setText("iPhone: Not loaded")
         self.sensor_csv_label.setText("Robot Arm: Not loaded")
-        self.stats_panel.update_stream("arkit", {
-            "fps": 0.0,
-            "packets": 0,
-            "drops": 0,
-            "latency_ms": 0.0,
-            "protocol_version": 1,
-        })
-        self.stats_panel.update_stream("sensor", {
-            "fps": 0.0,
-            "packets": 0,
-            "drops": 0,
-            "latency_ms": 0.0,
-            "protocol_version": 1,
-        })
-        self.stats_panel.update_error(None, None, None)
-        self.stats_panel.update_calibration(self.calibrator.result, self.apply_calibration)
+        self.stats_panel.reset_offline()
+        self.endpoint_label.setText("Select both CSV files. Calibration and plots will be generated automatically.")
+        self.update_run_button_state()
 
     def closeEvent(self, event):
-        self.stop_receivers()
+        if self.offline_worker is not None:
+            self.offline_worker.wait(5000)
         event.accept()
 
 
@@ -2820,7 +3052,7 @@ def main():
     parser.add_argument(
         "--cross-validate-scale",
         action="store_true",
-        help="Run block-wise cross-validation to quantify scale overfitting risk.",
+        help="Deprecated; scale is fixed at 1.0 and this option is ignored.",
     )
     parser.add_argument(
         "--cv-folds",

@@ -26,6 +26,7 @@ final class PoseDataSessionRecorder {
     private var sessionStartFrameTime: TimeInterval?
     private var videoStartFrameTime: TimeInterval?
     private var creationTime: Date?
+    private var sampleCount = 0
 
     func startSessionIfNeeded() {
         guard sessionDirectoryURL == nil else { return }
@@ -37,18 +38,18 @@ final class PoseDataSessionRecorder {
         let poseCSVURL = sessionURL.appendingPathComponent("pose.csv")
 
         do {
+            self.sessionDirectoryURL = sessionURL
+            self.poseCSVURL = poseCSVURL
             try FileManager.default.createDirectory(at: sessionURL, withIntermediateDirectories: true)
             try Data(Self.csvHeader.utf8).write(to: poseCSVURL, options: .atomic)
 
             let fileHandle = try FileHandle(forWritingTo: poseCSVURL)
             try fileHandle.seekToEnd()
 
-            self.sessionDirectoryURL = sessionURL
-            self.poseCSVURL = poseCSVURL
             self.fileHandle = fileHandle
             self.creationTime = Date()
         } catch {
-            reset()
+            reset(deleteSessionDirectory: true)
         }
     }
 
@@ -79,7 +80,12 @@ final class PoseDataSessionRecorder {
         )
 
         if let data = line.data(using: .utf8) {
-            try? fileHandle.write(contentsOf: data)
+            do {
+                try fileHandle.write(contentsOf: data)
+                sampleCount += 1
+            } catch {
+                return
+            }
         }
     }
 
@@ -97,21 +103,27 @@ final class PoseDataSessionRecorder {
         guard
             let sessionDirectoryURL,
             let poseCSVURL,
-            let sessionStartFrameTime,
             let creationTime
         else {
-            reset()
+            reset(deleteSessionDirectory: true)
+            return
+        }
+
+        guard sampleCount > 0 || videoURL != nil else {
+            reset(deleteSessionDirectory: true)
             return
         }
 
         try? fileHandle?.close()
 
+        let manifestSessionStartFrameTime = sessionStartFrameTime ?? videoStartFrameTime ?? 0
+
         let manifest = PoseCaptureManifest(
             createdAtUnixTime: creationTime.timeIntervalSince1970,
             poseCSVFileName: poseCSVURL.lastPathComponent,
             videoFileName: videoURL?.lastPathComponent,
-            sessionStartFrameTime: sessionStartFrameTime,
-            videoStartOffsetSeconds: videoStartFrameTime.map { $0 - sessionStartFrameTime }
+            sessionStartFrameTime: manifestSessionStartFrameTime,
+            videoStartOffsetSeconds: videoStartFrameTime.map { $0 - manifestSessionStartFrameTime }
         )
 
         let manifestURL = sessionDirectoryURL.appendingPathComponent("capture_manifest.json")
@@ -131,7 +143,9 @@ final class PoseDataSessionRecorder {
         reset()
     }
 
-    private func reset() {
+    private func reset(deleteSessionDirectory: Bool = false) {
+        let directoryURL = sessionDirectoryURL
+
         try? fileHandle?.close()
         sessionDirectoryURL = nil
         poseCSVURL = nil
@@ -140,6 +154,11 @@ final class PoseDataSessionRecorder {
         sessionStartFrameTime = nil
         videoStartFrameTime = nil
         creationTime = nil
+        sampleCount = 0
+
+        if deleteSessionDirectory, let directoryURL {
+            try? FileManager.default.removeItem(at: directoryURL)
+        }
     }
 
     private static let csvHeader = "sequence,sender_time,frame_time,relative_time,x,y,z,qx,qy,qz,qw\n"
