@@ -4,6 +4,7 @@ enum CaptureUploadError: LocalizedError {
     case invalidBaseURL
     case httpStatus(Int)
     case invalidResponse
+    case invalidResponseBody
 
     var errorDescription: String? {
         switch self {
@@ -13,6 +14,8 @@ enum CaptureUploadError: LocalizedError {
             return "Upload failed with HTTP status \(code)"
         case .invalidResponse:
             return "Upload server returned an invalid response"
+        case .invalidResponseBody:
+            return "Upload server returned an unreadable response body"
         }
     }
 }
@@ -22,6 +25,22 @@ struct UploadDescriptor {
     let component: String
 }
 
+struct UploadResponse: Decodable {
+    let ok: Bool
+    let capture_id: String?
+    let component: String?
+    let upload_kind: String?
+    let saved_to: String?
+}
+
+struct UploadProgressSnapshot {
+    let completedFiles: Int
+    let totalFiles: Int
+    let currentFileName: String
+    let currentComponent: String
+    let savedTo: String?
+}
+
 final class CaptureUploadService {
     private let session: URLSession = .shared
 
@@ -29,16 +48,35 @@ final class CaptureUploadService {
         descriptors: [UploadDescriptor],
         captureID: String,
         serverBaseURL: URL,
-        kind: CaptureUploadKind
-    ) async throws {
-        for descriptor in descriptors {
-            try await uploadSingle(
+        kind: CaptureUploadKind,
+        progress: (@Sendable (UploadProgressSnapshot) async -> Void)? = nil
+    ) async throws -> [UploadResponse] {
+        var responses: [UploadResponse] = []
+
+        for (index, descriptor) in descriptors.enumerated() {
+            let response = try await uploadSingle(
                 descriptor: descriptor,
                 captureID: captureID,
                 serverBaseURL: serverBaseURL,
                 kind: kind
             )
+
+            responses.append(response)
+
+            if let progress {
+                await progress(
+                    UploadProgressSnapshot(
+                        completedFiles: index + 1,
+                        totalFiles: descriptors.count,
+                        currentFileName: descriptor.fileURL.lastPathComponent,
+                        currentComponent: descriptor.component,
+                        savedTo: response.saved_to
+                    )
+                )
+            }
         }
+
+        return responses
     }
 
     private func uploadSingle(
@@ -46,7 +84,7 @@ final class CaptureUploadService {
         captureID: String,
         serverBaseURL: URL,
         kind: CaptureUploadKind
-    ) async throws {
+    ) async throws -> UploadResponse {
         let uploadURL = serverBaseURL.appending(path: "upload")
 
         var request = URLRequest(url: uploadURL)
@@ -57,7 +95,7 @@ final class CaptureUploadService {
         request.setValue(kind == .video ? "video" : "pose", forHTTPHeaderField: "X-Upload-Kind")
         request.setValue(descriptor.fileURL.lastPathComponent, forHTTPHeaderField: "X-Original-Filename")
 
-        let (_, response) = try await session.upload(for: request, fromFile: descriptor.fileURL)
+        let (data, response) = try await session.upload(for: request, fromFile: descriptor.fileURL)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw CaptureUploadError.invalidResponse
@@ -66,5 +104,12 @@ final class CaptureUploadService {
         guard (200...299).contains(httpResponse.statusCode) else {
             throw CaptureUploadError.httpStatus(httpResponse.statusCode)
         }
+
+        let decoder = JSONDecoder()
+        guard let uploadResponse = try? decoder.decode(UploadResponse.self, from: data) else {
+            throw CaptureUploadError.invalidResponseBody
+        }
+
+        return uploadResponse
     }
 }

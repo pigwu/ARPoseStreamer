@@ -17,11 +17,36 @@ from PyQt6.QtCore import QThread, QTimer, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QClipboard
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QRadioButton, QButtonGroup, QLineEdit, QGroupBox, QCheckBox
+    QPushButton, QLabel, QRadioButton, QButtonGroup, QLineEdit, QGroupBox, QCheckBox, QProgressBar
 )
 
 # UDP packet format (from udp_pose_receiver.py)
 FLOAT32_PACKET = struct.Struct("<Id7f")
+UPLOAD_CHUNK_SIZE = 64 * 1024
+
+
+def get_app_base_dir():
+    """Resolve the directory that should own runtime data."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def get_default_upload_dir():
+    """Return the default upload folder used by the desktop tools."""
+    return (get_app_base_dir() / "uploads").resolve()
+
+
+def format_bytes(num_bytes):
+    """Format a byte count for compact UI display."""
+    value = float(num_bytes)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
 
 
 def get_local_ip():
@@ -55,8 +80,14 @@ def decode_packet(packet: bytes, encoding: str):
 
 class UploadHandler(BaseHTTPRequestHandler):
     """HTTP upload handler for receiving files from iPhone"""
-    upload_root = Path("uploads")
+    upload_root = get_default_upload_dir()
     file_received_callback = None
+    progress_callback = None
+
+    @classmethod
+    def report_progress(cls, event):
+        if cls.progress_callback:
+            cls.progress_callback(event)
 
     def do_POST(self):
         if self.path != "/upload":
@@ -85,11 +116,83 @@ class UploadHandler(BaseHTTPRequestHandler):
         target_dir.mkdir(parents=True, exist_ok=True)
 
         file_path = target_dir / f"{component}__{safe_filename}"
-        file_path.write_bytes(self.rfile.read(body_length))
+        upload_kind_label = str(upload_kind)
+        self.report_progress({
+            "stage": "starting",
+            "capture_id": safe_capture_id,
+            "filename": safe_filename,
+            "component": component,
+            "upload_kind": upload_kind_label,
+            "bytes_received": 0,
+            "total_bytes": body_length,
+            "percent": 0,
+            "target_dir": str(target_dir.resolve()),
+            "saved_to": str(file_path.resolve()),
+        })
+
+        bytes_received = 0
+        last_percent = -1
+        with file_path.open("wb") as handle:
+            while bytes_received < body_length:
+                remaining = body_length - bytes_received
+                chunk = self.rfile.read(min(UPLOAD_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                handle.write(chunk)
+                bytes_received += len(chunk)
+                percent = int((bytes_received / body_length) * 100) if body_length else 100
+                if percent != last_percent:
+                    self.report_progress({
+                        "stage": "receiving",
+                        "capture_id": safe_capture_id,
+                        "filename": safe_filename,
+                        "component": component,
+                        "upload_kind": upload_kind_label,
+                        "bytes_received": bytes_received,
+                        "total_bytes": body_length,
+                        "percent": percent,
+                        "target_dir": str(target_dir.resolve()),
+                        "saved_to": str(file_path.resolve()),
+                    })
+                    last_percent = percent
+
+        if bytes_received != body_length:
+            try:
+                file_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.report_progress({
+                "stage": "error",
+                "capture_id": safe_capture_id,
+                "filename": safe_filename,
+                "component": component,
+                "upload_kind": upload_kind_label,
+                "bytes_received": bytes_received,
+                "total_bytes": body_length,
+                "percent": int((bytes_received / body_length) * 100) if body_length else 0,
+                "target_dir": str(target_dir.resolve()),
+                "saved_to": str(file_path.resolve()),
+                "message": f"Upload truncated: expected {body_length} bytes, received {bytes_received}",
+            })
+            self.send_error(400, "Incomplete upload body")
+            return
 
         # Notify callback
         if self.file_received_callback:
-            self.file_received_callback(safe_capture_id, safe_filename)
+            self.file_received_callback(safe_capture_id, safe_filename, str(file_path.resolve()))
+
+        self.report_progress({
+            "stage": "completed",
+            "capture_id": safe_capture_id,
+            "filename": safe_filename,
+            "component": component,
+            "upload_kind": upload_kind_label,
+            "bytes_received": body_length,
+            "total_bytes": body_length,
+            "percent": 100,
+            "target_dir": str(target_dir.resolve()),
+            "saved_to": str(file_path.resolve()),
+        })
 
         response = {
             "ok": True,
@@ -115,13 +218,14 @@ class UploadHandler(BaseHTTPRequestHandler):
 class UploadServerThread(QThread):
     """Background thread for HTTP upload server"""
     server_started = pyqtSignal(str)  # Emits server URL
-    file_received = pyqtSignal(str, str)  # Emits (capture_id, filename)
+    file_received = pyqtSignal(str, str, str)  # Emits (capture_id, filename, saved_to)
+    upload_progress = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, port=8000, upload_dir="uploads"):
+    def __init__(self, port=8000, upload_dir=None):
         super().__init__()
         self.port = port
-        self.upload_dir = Path(upload_dir)
+        self.upload_dir = Path(upload_dir) if upload_dir is not None else get_default_upload_dir()
         self.server = None
         self.running = False
 
@@ -129,6 +233,7 @@ class UploadServerThread(QThread):
         try:
             UploadHandler.upload_root = self.upload_dir
             UploadHandler.file_received_callback = self.on_file_received
+            UploadHandler.progress_callback = self.on_upload_progress
             self.upload_dir.mkdir(parents=True, exist_ok=True)
 
             self.server = HTTPServer(('0.0.0.0', self.port), UploadHandler)
@@ -143,8 +248,11 @@ class UploadServerThread(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
 
-    def on_file_received(self, capture_id, filename):
-        self.file_received.emit(capture_id, filename)
+    def on_file_received(self, capture_id, filename, saved_to):
+        self.file_received.emit(capture_id, filename, saved_to)
+
+    def on_upload_progress(self, event):
+        self.upload_progress.emit(event)
 
     def stop(self):
         self.running = False
@@ -465,6 +573,185 @@ class StatsPanel(QWidget):
         QTimer.singleShot(500, lambda: self.upload_label.setStyleSheet("color: #a0a0a0;"))
 
 
+class UploadAwareStatsPanel(QWidget):
+    """Real-time statistics with upload progress and save-path visibility."""
+
+    def __init__(self):
+        super().__init__()
+        self.upload_count = 0
+        self.init_ui()
+
+    def init_ui(self):
+        root_layout = QVBoxLayout()
+        root_layout.setContentsMargins(10, 6, 10, 8)
+        root_layout.setSpacing(6)
+
+        stats_row = QHBoxLayout()
+        stats_row.setContentsMargins(0, 0, 0, 0)
+
+        self.status_label = QLabel("Disconnected")
+        self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
+        stats_row.addWidget(self.status_label)
+        stats_row.addStretch()
+
+        self.fps_label = QLabel("FPS: --")
+        self.packets_label = QLabel("Packets: 0")
+        self.drop_label = QLabel("Drop: 0")
+        self.latency_label = QLabel("Latency: --")
+        self.uptime_label = QLabel("Uptime: 00:00:00")
+        for label in [self.fps_label, self.packets_label, self.drop_label, self.latency_label, self.uptime_label]:
+            label.setStyleSheet("color: #eaeaea;")
+            stats_row.addWidget(label)
+            stats_row.addSpacing(15)
+
+        self.pos_label = QLabel("X: -- Y: -- Z: --")
+        self.pos_label.setStyleSheet("color: #00d9ff;")
+        stats_row.addWidget(self.pos_label)
+        stats_row.addSpacing(20)
+
+        self.upload_label = QLabel("Uploads: 0")
+        self.upload_label.setStyleSheet("color: #a0a0a0;")
+        stats_row.addWidget(self.upload_label)
+        root_layout.addLayout(stats_row)
+
+        upload_row = QHBoxLayout()
+        upload_row.setContentsMargins(0, 0, 0, 0)
+        upload_row.setSpacing(10)
+
+        self.upload_state_label = QLabel("Upload server idle")
+        self.upload_state_label.setStyleSheet("color: #a0a0a0;")
+        upload_row.addWidget(self.upload_state_label)
+
+        self.upload_progress_label = QLabel("--")
+        self.upload_progress_label.setStyleSheet("color: #8bd3ff;")
+        upload_row.addWidget(self.upload_progress_label)
+
+        self.upload_target_label = QLabel("")
+        self.upload_target_label.setStyleSheet("color: #8f9bb3;")
+        upload_row.addWidget(self.upload_target_label, 1)
+        root_layout.addLayout(upload_row)
+
+        self.upload_progress_bar = QProgressBar()
+        self.upload_progress_bar.setRange(0, 100)
+        self.upload_progress_bar.setValue(0)
+        self.upload_progress_bar.setTextVisible(True)
+        self.upload_progress_bar.setFormat("Waiting")
+        self.upload_progress_bar.setFixedHeight(16)
+        root_layout.addWidget(self.upload_progress_bar)
+
+        self.upload_saved_label = QLabel(f"Upload folder: {get_default_upload_dir()}")
+        self.upload_saved_label.setStyleSheet("color: #8f9bb3;")
+        self.upload_saved_label.setWordWrap(True)
+        root_layout.addWidget(self.upload_saved_label)
+
+        self.setLayout(root_layout)
+        self.setStyleSheet("background-color: #16213e;")
+        self.setFixedHeight(94)
+
+    def update_stats(self, stats):
+        self.status_label.setText("Connected")
+        self.status_label.setStyleSheet("color: #00d9ff; font-weight: bold;")
+        self.fps_label.setText(f"FPS: {stats['fps']:.1f}")
+        self.packets_label.setText(f"Packets: {stats['packet_count']}")
+        self.drop_label.setText(f"Drop: {stats['drop_count']}")
+        self.latency_label.setText(f"Latency: {stats['latency_ms']:.1f}ms")
+
+        uptime = int(stats['uptime'])
+        hours = uptime // 3600
+        minutes = (uptime % 3600) // 60
+        seconds = uptime % 60
+        self.uptime_label.setText(f"Uptime: {hours:02d}:{minutes:02d}:{seconds:02d}")
+
+        x, y, z = stats['position']
+        self.pos_label.setText(f"X: {x:+.3f}m  Y: {y:+.3f}m  Z: {z:+.3f}m")
+
+    def set_disconnected(self):
+        self.status_label.setText("Disconnected")
+        self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
+
+    def increment_upload_count(self, filename, saved_to=None):
+        self.upload_count += 1
+        self.upload_label.setText(f"Uploads: {self.upload_count}")
+        self.upload_label.setStyleSheet("color: #00d9ff;")
+        self.upload_state_label.setText(f"Received: {filename}")
+        self.upload_state_label.setStyleSheet("color: #00d9ff; font-weight: bold;")
+        self.upload_progress_bar.setValue(100)
+        self.upload_progress_bar.setFormat("100%")
+        self.upload_progress_label.setText("Complete")
+        if saved_to:
+            self.upload_saved_label.setText(f"Saved to: {saved_to}")
+        QTimer.singleShot(500, lambda: self.upload_label.setStyleSheet("color: #a0a0a0;"))
+
+    def set_upload_folder(self, upload_dir):
+        self.upload_saved_label.setText(f"Upload folder: {Path(upload_dir).resolve()}")
+
+    def set_upload_idle(self, upload_dir=None):
+        self.upload_state_label.setText("Upload server idle")
+        self.upload_state_label.setStyleSheet("color: #a0a0a0;")
+        self.upload_progress_label.setText("--")
+        self.upload_target_label.setText("")
+        self.upload_progress_bar.setValue(0)
+        self.upload_progress_bar.setFormat("Waiting")
+        if upload_dir is not None:
+            self.set_upload_folder(upload_dir)
+
+    def set_upload_server_running(self, upload_dir):
+        self.upload_state_label.setText("Upload server listening")
+        self.upload_state_label.setStyleSheet("color: #00d9ff; font-weight: bold;")
+        self.upload_progress_label.setText("Ready")
+        self.upload_target_label.setText("")
+        self.upload_progress_bar.setValue(0)
+        self.upload_progress_bar.setFormat("Waiting")
+        self.set_upload_folder(upload_dir)
+
+    def update_upload_progress(self, event):
+        stage = event.get("stage", "receiving")
+        filename = event.get("filename", "unknown")
+        upload_kind = event.get("upload_kind", "file")
+        bytes_received = int(event.get("bytes_received", 0) or 0)
+        total_bytes = int(event.get("total_bytes", 0) or 0)
+        percent = int(event.get("percent", 0) or 0)
+        target_dir = event.get("target_dir", "")
+        saved_to = event.get("saved_to", "")
+        message = event.get("message", "")
+
+        self.upload_progress_bar.setValue(max(0, min(100, percent)))
+        self.upload_progress_bar.setFormat(f"{percent}%")
+        self.upload_target_label.setText(Path(target_dir).name if target_dir else "")
+
+        if stage == "starting":
+            self.upload_state_label.setText(f"Receiving {upload_kind}: {filename}")
+            self.upload_state_label.setStyleSheet("color: #ffd166; font-weight: bold;")
+            self.upload_progress_label.setText(f"0% of {format_bytes(total_bytes)}")
+            if target_dir:
+                self.upload_saved_label.setText(f"Target folder: {target_dir}")
+            return
+
+        if stage == "receiving":
+            size_text = format_bytes(total_bytes) if total_bytes else "unknown"
+            self.upload_state_label.setText(f"Receiving {upload_kind}: {filename}")
+            self.upload_state_label.setStyleSheet("color: #ffd166; font-weight: bold;")
+            self.upload_progress_label.setText(f"{percent}%  {format_bytes(bytes_received)} / {size_text}")
+            if target_dir:
+                self.upload_saved_label.setText(f"Target folder: {target_dir}")
+            return
+
+        if stage == "completed":
+            self.upload_state_label.setText(f"Upload complete: {filename}")
+            self.upload_state_label.setStyleSheet("color: #00d9ff; font-weight: bold;")
+            self.upload_progress_label.setText(f"Saved {format_bytes(total_bytes)}")
+            if saved_to:
+                self.upload_saved_label.setText(f"Saved to: {saved_to}")
+            return
+
+        if stage == "error":
+            self.upload_state_label.setText(f"Upload failed: {filename}")
+            self.upload_state_label.setStyleSheet("color: #ff6b6b; font-weight: bold;")
+            self.upload_progress_label.setText(message or "Error")
+            if target_dir:
+                self.upload_saved_label.setText(f"Target folder: {target_dir}")
+
+
 class ControlPanel(QWidget):
     """Control panel widget"""
     start_clicked = pyqtSignal()
@@ -604,6 +891,7 @@ class MainWindow(QMainWindow):
         self.host = host
         self.port = port
         self.upload_port = upload_port
+        self.upload_dir = get_default_upload_dir()
         self.receiver_thread = None
         self.upload_server_thread = None
         self.trajectory_manager = TrajectoryManager()
@@ -652,7 +940,8 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(top_layout, 1)
 
         # Stats panel
-        self.stats_panel = StatsPanel()
+        self.stats_panel = UploadAwareStatsPanel()
+        self.stats_panel.set_upload_idle(self.upload_dir)
         main_layout.addWidget(self.stats_panel)
 
         central_widget.setLayout(main_layout)
@@ -738,6 +1027,17 @@ class MainWindow(QMainWindow):
                 border: 2px solid #00d9ff;
                 background-color: #00d9ff;
             }
+            QProgressBar {
+                border: 1px solid #0f3460;
+                border-radius: 6px;
+                background-color: #1a1a2e;
+                color: #eaeaea;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #00d9ff;
+                border-radius: 5px;
+            }
             QLabel {
                 color: #eaeaea;
             }
@@ -776,9 +1076,11 @@ class MainWindow(QMainWindow):
         if self.upload_server_thread is not None:
             return
 
-        self.upload_server_thread = UploadServerThread(self.upload_port, "uploads")
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.upload_server_thread = UploadServerThread(self.upload_port, self.upload_dir)
         self.upload_server_thread.server_started.connect(self.on_upload_server_started)
         self.upload_server_thread.file_received.connect(self.on_file_received)
+        self.upload_server_thread.upload_progress.connect(self.on_upload_progress)
         self.upload_server_thread.error_occurred.connect(self.on_upload_server_error)
         self.upload_server_thread.start()
 
@@ -789,18 +1091,24 @@ class MainWindow(QMainWindow):
             self.upload_server_thread = None
 
         self.control_panel.set_upload_running(False)
+        self.stats_panel.set_upload_idle(self.upload_dir)
 
     def on_upload_server_started(self, url):
         print(f"[INFO] Upload server started: {url}")
         self.control_panel.set_upload_running(True)
+        self.stats_panel.set_upload_server_running(self.upload_dir)
 
-    def on_file_received(self, capture_id, filename):
-        print(f"[INFO] File received: {capture_id}/{filename}")
-        self.stats_panel.increment_upload_count(filename)
+    def on_file_received(self, capture_id, filename, saved_to):
+        print(f"[INFO] File received: {capture_id}/{filename} -> {saved_to}")
+        self.stats_panel.increment_upload_count(filename, saved_to)
+
+    def on_upload_progress(self, event):
+        self.stats_panel.update_upload_progress(event)
 
     def on_upload_server_error(self, error_msg):
         print(f"[ERROR] Upload server error: {error_msg}")
         self.control_panel.set_upload_running(False)
+        self.stats_panel.set_upload_idle(self.upload_dir)
 
     def on_packet_received(self, data):
         position = data['position']
@@ -827,7 +1135,7 @@ class MainWindow(QMainWindow):
         self.trajectory_manager.show_all = show_all
 
     def open_data_folder(self):
-        folder = Path.home() / 'Documents' / 'ARPoseStreamer'
+        folder = self.upload_dir
         folder.mkdir(parents=True, exist_ok=True)
 
         if platform.system() == 'Darwin':  # macOS

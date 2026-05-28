@@ -23,6 +23,13 @@ __pycache__/
 
 # Logs
 logs/
+*.log
+
+# Runtime data and generated analysis outputs
+uploads/
+offline_calibration_output/
+temp_offline_output/
+release_payload.json
 
 # VS Code
 .vscode/

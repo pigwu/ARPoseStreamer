@@ -76,6 +76,7 @@ Mac / Windows receiver
 - [Quick Start](#quick-start)
 - [Sample Receiver Output](#sample-receiver-output)
 - [Documentation](#documentation)
+- [Related Projects](#related-projects)
 - [Repository Structure](#repository-structure)
 - [Packet Format](#packet-format)
 - [iPhone Installation Model](#iphone-installation-model)
@@ -269,6 +270,20 @@ Optional packet logging:
 python3 udp_pose_receiver.py --encoding binary --csv-log logs/pose.csv
 ```
 
+### UDP Packet Loss Monitor
+
+For focused network diagnostics, use the standalone project:
+
+- [iPhone UDP Packet Loss Monitor](https://github.com/pigwu/iPhoneUDPPacketLossMonitor)
+
+This repository also keeps a local helper script for convenience:
+
+```powershell
+.\run_packet_loss_monitor_windows.ps1
+```
+
+The monitor listens on `0.0.0.0:5555` by default and uses the packet `sequence` field to show loss rate, missing packets, FPS, latency, jitter, duplicates, and out-of-order packets.
+
 For real uploads on macOS:
 
 ```bash
@@ -369,6 +384,15 @@ Detailed docs:
 - [Architecture overview](docs/ARCHITECTURE.md)
 - [Packet protocol](docs/PROTOCOL.md)
 
+## Related Projects
+
+The tooling around ARPoseStreamer is split into small repositories so each part can be used on its own:
+
+- [iPhone UDP Packet Loss Monitor](https://github.com/pigwu/iPhoneUDPPacketLossMonitor): a focused desktop dashboard for measuring real-time UDP loss, FPS, jitter, latency, duplicates, and out-of-order packets from the iPhone stream.
+- [iPhone Trajectory Validator](https://github.com/pigwu/iPhoneTrajectoryValidator): an offline validation GUI for checking iPhone ARKit trajectory quality against reference robot logs with fixed `scale = 1.0`.
+
+Use this repository for the iPhone app, pose recording, UDP streaming, upload server, and integrated 3D visualizer. Use the standalone tools when you only need network diagnostics or offline trajectory validation.
+
 ## Repository Structure
 
 - `ARPoseUDPSender.swift`: ARKit + UDP sender core
@@ -388,12 +412,14 @@ Detailed docs:
 - `project.yml`: XcodeGen project spec
 - `udp_pose_receiver.py`: Python UDP receiver (CLI) for macOS and Windows
 - `udp_pose_visualizer.py`: Python 3D visualizer (GUI) with real-time trajectory display
+- `udp_packet_loss_monitor.py`: standalone UDP packet-loss dashboard for real-time network diagnostics
 - `pose_tracking_validator.py`: Python dual-stream validator for ARKit and wired sensor pose streams
 - `requirements_visualizer.txt`: Python dependencies for the 3D visualizer
 - `run_receiver_mac.sh`: macOS helper launcher for CLI receiver
 - `run_receiver_windows.ps1`: Windows helper launcher for CLI receiver
 - `run_visualizer_mac.sh`: macOS helper launcher for 3D visualizer
 - `run_visualizer_windows.ps1`: Windows helper launcher for 3D visualizer
+- `run_packet_loss_monitor_windows.ps1`: Windows helper launcher for the packet-loss monitor
 - `INSTALL_IPHONE_APP.md`: iPhone installation guide
 - `ARSessionVideoRecorder.swift`: local MP4 recording helper
 

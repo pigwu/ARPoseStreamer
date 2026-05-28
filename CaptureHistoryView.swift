@@ -16,6 +16,7 @@ struct CaptureHistoryView: View {
                     CaptureRecordCard(
                         record: record,
                         isUploading: viewModel.isUploading(record),
+                        uploadDetails: viewModel.uploadDetails,
                         onRename: { newName in
                             viewModel.renameCapture(record, to: newName)
                         },
@@ -51,6 +52,7 @@ struct CaptureHistoryView: View {
 private struct CaptureRecordCard: View {
     let record: CaptureRecord
     let isUploading: Bool
+    let uploadDetails: UploadStatusViewState
     let onRename: (String) -> Void
     let onUploadVideo: () -> Void
     let onUploadPose: () -> Void
@@ -60,12 +62,14 @@ private struct CaptureRecordCard: View {
     init(
         record: CaptureRecord,
         isUploading: Bool,
+        uploadDetails: UploadStatusViewState,
         onRename: @escaping (String) -> Void,
         onUploadVideo: @escaping () -> Void,
         onUploadPose: @escaping () -> Void
     ) {
         self.record = record
         self.isUploading = isUploading
+        self.uploadDetails = uploadDetails
         self.onRename = onRename
         self.onUploadVideo = onUploadVideo
         self.onUploadPose = onUploadPose
@@ -114,9 +118,18 @@ private struct CaptureRecordCard: View {
             }
 
             if isUploading {
-                Text("Uploading...")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(uploadDetails.progressText.isEmpty ? "Uploading..." : uploadDetails.progressText)
+                        .font(.footnote.monospacedDigit())
+                        .foregroundStyle(.secondary)
+
+                    if let latestSavedPath = uploadDetails.latestSavedPath {
+                        Text("Host path: \(latestSavedPath)")
+                            .font(.footnote.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
             }
         }
         .padding(16)
