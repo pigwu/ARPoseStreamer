@@ -101,7 +101,18 @@ final class CaptureLibraryStore {
 
     func urlForVideo(record: CaptureRecord) -> URL? {
         guard let videoFileName = record.videoFileName else { return nil }
-        return Self.captureDirectory(for: record).appendingPathComponent(videoFileName)
+
+        let captureVideoURL = Self.captureDirectory(for: record).appendingPathComponent(videoFileName)
+        if Self.isUsableFile(captureVideoURL) {
+            return captureVideoURL
+        }
+
+        let legacyVideoURL = Self.documentsRootURL().appendingPathComponent(videoFileName)
+        if Self.isUsableFile(legacyVideoURL) {
+            return legacyVideoURL
+        }
+
+        return captureVideoURL
     }
 
     private func save(records: [CaptureRecord]) {
@@ -123,7 +134,26 @@ final class CaptureLibraryStore {
     }
 
     private static func capturesRootURL() -> URL {
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return documentsURL.appendingPathComponent("Captures", isDirectory: true)
+        documentsRootURL().appendingPathComponent("Captures", isDirectory: true)
+    }
+
+    private static func documentsRootURL() -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    private static func isUsableFile(_ url: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return false
+        }
+
+        guard
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+            values.isRegularFile == true,
+            let fileSize = values.fileSize
+        else {
+            return false
+        }
+
+        return fileSize > 0
     }
 }

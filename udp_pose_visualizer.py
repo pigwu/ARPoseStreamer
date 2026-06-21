@@ -109,6 +109,9 @@ class UploadHandler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error(400, "Invalid Content-Length")
             return
+        if body_length <= 0:
+            self.send_error(400, "Empty upload body")
+            return
 
         safe_capture_id = capture_id.replace("/", "_").replace("\\", "_")
         safe_filename = Path(original_filename).name
@@ -116,6 +119,7 @@ class UploadHandler(BaseHTTPRequestHandler):
         target_dir.mkdir(parents=True, exist_ok=True)
 
         file_path = target_dir / f"{component}__{safe_filename}"
+        temp_path = file_path.with_name(f"{file_path.name}.part")
         upload_kind_label = str(upload_kind)
         self.report_progress({
             "stage": "starting",
@@ -132,7 +136,7 @@ class UploadHandler(BaseHTTPRequestHandler):
 
         bytes_received = 0
         last_percent = -1
-        with file_path.open("wb") as handle:
+        with temp_path.open("wb") as handle:
             while bytes_received < body_length:
                 remaining = body_length - bytes_received
                 chunk = self.rfile.read(min(UPLOAD_CHUNK_SIZE, remaining))
@@ -158,7 +162,7 @@ class UploadHandler(BaseHTTPRequestHandler):
 
         if bytes_received != body_length:
             try:
-                file_path.unlink(missing_ok=True)
+                temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
             self.report_progress({
@@ -176,6 +180,8 @@ class UploadHandler(BaseHTTPRequestHandler):
             })
             self.send_error(400, "Incomplete upload body")
             return
+
+        temp_path.replace(file_path)
 
         # Notify callback
         if self.file_received_callback:

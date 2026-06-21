@@ -37,6 +37,9 @@ class UploadHandler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error(400, "Invalid Content-Length")
             return
+        if body_length <= 0:
+            self.send_error(400, "Empty upload body")
+            return
 
         safe_capture_id = capture_id.replace("/", "_").replace("\\", "_")
         safe_filename = Path(original_filename).name
@@ -44,6 +47,7 @@ class UploadHandler(BaseHTTPRequestHandler):
         target_dir.mkdir(parents=True, exist_ok=True)
 
         file_path = target_dir / f"{component}__{safe_filename}"
+        temp_path = file_path.with_name(f"{file_path.name}.part")
 
         # Progress display
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -58,7 +62,7 @@ class UploadHandler(BaseHTTPRequestHandler):
         received = 0
         last_percent = -1
 
-        with file_path.open("wb") as handle:
+        with temp_path.open("wb") as handle:
             while received < body_length:
                 remaining = body_length - received
                 to_read = min(UPLOAD_CHUNK_SIZE, remaining)
@@ -74,10 +78,12 @@ class UploadHandler(BaseHTTPRequestHandler):
                     last_percent = percent
 
         if received != body_length:
-            file_path.unlink(missing_ok=True)
+            temp_path.unlink(missing_ok=True)
             print(" failed")
             self.send_error(400, "Incomplete upload body")
             return
+
+        temp_path.replace(file_path)
 
         UploadHandler.upload_count += 1
 

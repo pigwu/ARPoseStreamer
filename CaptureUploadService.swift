@@ -2,6 +2,9 @@ import Foundation
 
 enum CaptureUploadError: LocalizedError {
     case invalidBaseURL
+    case uploadFileMissing(String)
+    case uploadFileInvalid(String)
+    case uploadFileEmpty(String)
     case httpStatus(Int)
     case invalidResponse
     case invalidResponseBody
@@ -10,6 +13,12 @@ enum CaptureUploadError: LocalizedError {
         switch self {
         case .invalidBaseURL:
             return "Invalid upload server URL"
+        case .uploadFileMissing(let fileName):
+            return "Upload file is missing: \(fileName)"
+        case .uploadFileInvalid(let fileName):
+            return "Upload path is not a regular file: \(fileName)"
+        case .uploadFileEmpty(let fileName):
+            return "Upload file is empty: \(fileName)"
         case .httpStatus(let code):
             return "Upload failed with HTTP status \(code)"
         case .invalidResponse:
@@ -85,6 +94,8 @@ final class CaptureUploadService {
         serverBaseURL: URL,
         kind: CaptureUploadKind
     ) async throws -> UploadResponse {
+        try validateUploadFile(descriptor)
+
         let uploadURL = serverBaseURL.appending(path: "upload")
 
         var request = URLRequest(url: uploadURL)
@@ -111,5 +122,23 @@ final class CaptureUploadService {
         }
 
         return uploadResponse
+    }
+
+    private func validateUploadFile(_ descriptor: UploadDescriptor) throws {
+        let fileURL = descriptor.fileURL
+        let fileName = fileURL.lastPathComponent
+
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw CaptureUploadError.uploadFileMissing(fileName)
+        }
+
+        let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else {
+            throw CaptureUploadError.uploadFileInvalid(fileName)
+        }
+
+        guard let fileSize = values.fileSize, fileSize > 0 else {
+            throw CaptureUploadError.uploadFileEmpty(fileName)
+        }
     }
 }

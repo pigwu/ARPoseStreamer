@@ -116,12 +116,13 @@ final class PoseDataSessionRecorder {
 
         try? fileHandle?.close()
 
+        let archivedVideoURL = archiveVideoIfNeeded(videoURL, into: sessionDirectoryURL)
         let manifestSessionStartFrameTime = sessionStartFrameTime ?? videoStartFrameTime ?? 0
 
         let manifest = PoseCaptureManifest(
             createdAtUnixTime: creationTime.timeIntervalSince1970,
             poseCSVFileName: poseCSVURL.lastPathComponent,
-            videoFileName: videoURL?.lastPathComponent,
+            videoFileName: archivedVideoURL?.lastPathComponent,
             sessionStartFrameTime: manifestSessionStartFrameTime,
             videoStartOffsetSeconds: videoStartFrameTime.map { $0 - manifestSessionStartFrameTime }
         )
@@ -136,11 +137,37 @@ final class PoseDataSessionRecorder {
                 sessionDirectoryURL: sessionDirectoryURL,
                 poseCSVURL: poseCSVURL,
                 manifestURL: manifestURL,
-                videoURL: videoURL
+                videoURL: archivedVideoURL
             )
         )
 
         reset()
+    }
+
+    private func archiveVideoIfNeeded(_ sourceURL: URL?, into sessionDirectoryURL: URL) -> URL? {
+        guard let sourceURL else { return nil }
+
+        let fileManager = FileManager.default
+        let destinationURL = sessionDirectoryURL.appendingPathComponent(sourceURL.lastPathComponent)
+
+        guard fileManager.fileExists(atPath: sourceURL.path) else {
+            return nil
+        }
+
+        if sourceURL.standardizedFileURL == destinationURL.standardizedFileURL {
+            return sourceURL
+        }
+
+        do {
+            if fileManager.fileExists(atPath: destinationURL.path) {
+                try fileManager.removeItem(at: destinationURL)
+            }
+
+            try fileManager.moveItem(at: sourceURL, to: destinationURL)
+            return destinationURL
+        } catch {
+            return nil
+        }
     }
 
     private func reset(deleteSessionDirectory: Bool = false) {
