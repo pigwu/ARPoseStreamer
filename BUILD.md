@@ -20,6 +20,7 @@ The build scripts force `QT_API=pyqt6` and exclude other Qt bindings so PyInstal
 3. The executables will be created at:
    - `dist\ARPose Visualizer.exe`
    - `dist\ARPose Tracking Validator.exe`
+   - `dist\ARPose Packet Loss Monitor.exe`
 4. You can distribute these .exe files
 
 ## Building on macOS
@@ -32,6 +33,7 @@ The build scripts force `QT_API=pyqt6` and exclude other Qt bindings so PyInstal
 3. The applications will be created at:
    - `dist/ARPose Visualizer.app`
    - `dist/ARPose Tracking Validator.app`
+   - `dist/ARPose Packet Loss Monitor.app`
 4. You can distribute these .app bundles
 
 ## Distribution

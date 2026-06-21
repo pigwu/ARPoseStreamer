@@ -53,9 +53,11 @@ function Build-DesktopTool {
 # Build the executables
 Build-DesktopTool -Name "ARPose Visualizer" -EntryPoint "udp_pose_visualizer.py"
 Build-DesktopTool -Name "ARPose Tracking Validator" -EntryPoint "pose_tracking_validator.py"
+Build-DesktopTool -Name "ARPose Packet Loss Monitor" -EntryPoint "udp_packet_loss_monitor.py"
 
 Write-Host "`nBuild complete!"
 Write-Host "Executable locations:"
 Write-Host "  dist\ARPose Visualizer.exe"
 Write-Host "  dist\ARPose Tracking Validator.exe"
+Write-Host "  dist\ARPose Packet Loss Monitor.exe"
 Write-Host "`nYou can now run the application by double-clicking the .exe file"
