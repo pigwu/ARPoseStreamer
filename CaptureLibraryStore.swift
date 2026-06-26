@@ -5,6 +5,47 @@ enum CaptureUploadKind {
     case pose
 }
 
+enum CaptureVideoFileState {
+    case notRecorded
+    case missing(URL)
+    case empty(URL)
+    case available(URL, Int)
+
+    var canUpload: Bool {
+        if case .available = self {
+            return true
+        }
+        return false
+    }
+
+    var uploadURL: URL? {
+        if case .available(let url, _) = self {
+            return url
+        }
+        return nil
+    }
+
+    var fileSize: Int? {
+        if case .available(_, let size) = self {
+            return size
+        }
+        return nil
+    }
+
+    var statusText: String {
+        switch self {
+        case .notRecorded:
+            return "Video: no video recorded in this capture"
+        case .missing(_):
+            return "Video: file missing"
+        case .empty(_):
+            return "Video: file is empty"
+        case .available(_, let fileSize):
+            return "Video: not uploaded yet (\(ByteCountFormatter.fileString(fromByteCount: Int64(fileSize))))"
+        }
+    }
+}
+
 struct CaptureRecord: Identifiable, Codable, Hashable {
     let id: UUID
     let createdAt: Date
@@ -100,19 +141,31 @@ final class CaptureLibraryStore {
     }
 
     func urlForVideo(record: CaptureRecord) -> URL? {
-        guard let videoFileName = record.videoFileName else { return nil }
+        videoFileState(for: record).uploadURL
+    }
+
+    func videoFileState(for record: CaptureRecord) -> CaptureVideoFileState {
+        guard let videoFileName = record.videoFileName else { return .notRecorded }
 
         let captureVideoURL = Self.captureDirectory(for: record).appendingPathComponent(videoFileName)
-        if Self.isUsableFile(captureVideoURL) {
-            return captureVideoURL
+        if let state = Self.stateForExistingVideo(captureVideoURL), state.canUpload {
+            return state
         }
 
         let legacyVideoURL = Self.documentsRootURL().appendingPathComponent(videoFileName)
-        if Self.isUsableFile(legacyVideoURL) {
-            return legacyVideoURL
+        if let state = Self.stateForExistingVideo(legacyVideoURL), state.canUpload {
+            return state
         }
 
-        return captureVideoURL
+        if let captureState = Self.stateForExistingVideo(captureVideoURL) {
+            return captureState
+        }
+
+        if let legacyState = Self.stateForExistingVideo(legacyVideoURL) {
+            return legacyState
+        }
+
+        return .missing(captureVideoURL)
     }
 
     private func save(records: [CaptureRecord]) {
@@ -141,19 +194,31 @@ final class CaptureLibraryStore {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
 
-    private static func isUsableFile(_ url: URL) -> Bool {
+    private static func stateForExistingVideo(_ url: URL) -> CaptureVideoFileState? {
         guard FileManager.default.fileExists(atPath: url.path) else {
-            return false
+            return nil
         }
 
         guard
             let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-            values.isRegularFile == true,
-            let fileSize = values.fileSize
+            values.isRegularFile == true
         else {
-            return false
+            return .missing(url)
         }
 
-        return fileSize > 0
+        guard let fileSize = values.fileSize, fileSize > 0 else {
+            return .empty(url)
+        }
+
+        return .available(url, fileSize)
+    }
+}
+
+private extension ByteCountFormatter {
+    static func fileString(fromByteCount byteCount: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: byteCount)
     }
 }

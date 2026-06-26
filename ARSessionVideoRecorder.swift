@@ -186,8 +186,14 @@ final class ARSessionVideoRecorder {
             guard let self else { return }
 
             let finalStatus: VideoRecordingStatus
-            if assetWriter.status == .completed, let outputURL = self.outputURL {
+            if
+                assetWriter.status == .completed,
+                let outputURL = self.outputURL,
+                Self.usableRegularFileSize(outputURL) != nil
+            {
                 finalStatus = .saved(outputURL)
+            } else if assetWriter.status == .completed {
+                finalStatus = .failed("Recorded video file is empty or missing")
             } else {
                 finalStatus = .failed(assetWriter.error?.localizedDescription ?? "Failed to finish recording")
             }
@@ -196,6 +202,14 @@ final class ARSessionVideoRecorder {
             self.updateStatus(finalStatus)
             completion(finalStatus)
         }
+    }
+
+    func cancelRecording(reason: String) {
+        guard recordingStatus.isActive else { return }
+
+        assetWriter?.cancelWriting()
+        resetWriterState()
+        updateStatus(.failed(reason))
     }
 
     func failPreparing(_ message: String) {
@@ -276,5 +290,18 @@ final class ARSessionVideoRecorder {
         let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
 
         return documentsURL.appendingPathComponent(fileName)
+    }
+
+    private static func usableRegularFileSize(_ url: URL) -> Int? {
+        guard
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+            values.isRegularFile == true,
+            let fileSize = values.fileSize,
+            fileSize > 0
+        else {
+            return nil
+        }
+
+        return fileSize
     }
 }

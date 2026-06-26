@@ -30,6 +30,8 @@ uploads/
 offline_calibration_output/
 temp_offline_output/
 release_payload.json
+*.zarr/
+*.zarr.zip
 
 # VS Code
 .vscode/

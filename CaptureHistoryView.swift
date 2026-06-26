@@ -146,16 +146,7 @@ private struct CaptureRecordCard: View {
             if let date = record.videoUploadedAt {
                 return "Video uploaded before: \(date.formatted(date: .abbreviated, time: .shortened))"
             }
-            switch videoFileState {
-            case .notRecorded:
-                return "Video: no video recorded in this capture"
-            case .missing:
-                return "Video: file missing"
-            case .empty:
-                return "Video: file is empty"
-            case .available(let fileSize):
-                return "Video: not uploaded yet (\(Self.formatBytes(fileSize)))"
-            }
+            return videoFileState.statusText
         case .pose:
             if let date = record.poseUploadedAt {
                 return "Pose uploaded before: \(date.formatted(date: .abbreviated, time: .shortened))"
@@ -164,48 +155,7 @@ private struct CaptureRecordCard: View {
         }
     }
 
-    private var videoFileState: VideoFileState {
-        guard let videoURL = CaptureLibraryStore().urlForVideo(record: record) else {
-            return .notRecorded
-        }
-
-        guard FileManager.default.fileExists(atPath: videoURL.path) else {
-            return .missing
-        }
-
-        guard
-            let values = try? videoURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-            values.isRegularFile == true
-        else {
-            return .missing
-        }
-
-        guard let fileSize = values.fileSize, fileSize > 0 else {
-            return .empty
-        }
-
-        return .available(fileSize)
-    }
-
-    private static func formatBytes(_ byteCount: Int) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useKB, .useMB, .useGB]
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: Int64(byteCount))
-    }
-}
-
-private enum VideoFileState {
-    case notRecorded
-    case missing
-    case empty
-    case available(Int)
-
-    var canUpload: Bool {
-        if case .available = self {
-            return true
-        }
-
-        return false
+    private var videoFileState: CaptureVideoFileState {
+        CaptureLibraryStore().videoFileState(for: record)
     }
 }

@@ -5,7 +5,7 @@ enum CaptureUploadError: LocalizedError {
     case uploadFileMissing(String)
     case uploadFileInvalid(String)
     case uploadFileEmpty(String)
-    case httpStatus(Int)
+    case httpStatus(Int, String?)
     case invalidResponse
     case invalidResponseBody
 
@@ -19,7 +19,10 @@ enum CaptureUploadError: LocalizedError {
             return "Upload path is not a regular file: \(fileName)"
         case .uploadFileEmpty(let fileName):
             return "Upload file is empty: \(fileName)"
-        case .httpStatus(let code):
+        case .httpStatus(let code, let message):
+            if let message, !message.isEmpty {
+                return "Upload failed with HTTP status \(code): \(message)"
+            }
             return "Upload failed with HTTP status \(code)"
         case .invalidResponse:
             return "Upload server returned an invalid response"
@@ -51,7 +54,15 @@ struct UploadProgressSnapshot {
 }
 
 final class CaptureUploadService {
-    private let session: URLSession = .shared
+    private let session: URLSession
+
+    init() {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 600
+        configuration.timeoutIntervalForResource = 3600
+        self.session = URLSession(configuration: configuration)
+    }
 
     func upload(
         descriptors: [UploadDescriptor],
@@ -94,17 +105,19 @@ final class CaptureUploadService {
         serverBaseURL: URL,
         kind: CaptureUploadKind
     ) async throws -> UploadResponse {
-        try validateUploadFile(descriptor)
+        let fileSize = try validateUploadFile(descriptor)
 
         let uploadURL = serverBaseURL.appending(path: "upload")
 
         var request = URLRequest(url: uploadURL)
         request.httpMethod = "POST"
+        request.timeoutInterval = kind == .video ? 600 : 120
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue(captureID, forHTTPHeaderField: "X-Capture-ID")
         request.setValue(descriptor.component, forHTTPHeaderField: "X-Capture-Component")
         request.setValue(kind == .video ? "video" : "pose", forHTTPHeaderField: "X-Upload-Kind")
         request.setValue(descriptor.fileURL.lastPathComponent, forHTTPHeaderField: "X-Original-Filename")
+        request.setValue(String(fileSize), forHTTPHeaderField: "X-Upload-File-Size")
 
         let (data, response) = try await session.upload(for: request, fromFile: descriptor.fileURL)
 
@@ -113,7 +126,8 @@ final class CaptureUploadService {
         }
 
         guard (200...299).contains(httpResponse.statusCode) else {
-            throw CaptureUploadError.httpStatus(httpResponse.statusCode)
+            let serverMessage = String(data: data, encoding: .utf8)
+            throw CaptureUploadError.httpStatus(httpResponse.statusCode, serverMessage)
         }
 
         let decoder = JSONDecoder()
@@ -124,7 +138,7 @@ final class CaptureUploadService {
         return uploadResponse
     }
 
-    private func validateUploadFile(_ descriptor: UploadDescriptor) throws {
+    private func validateUploadFile(_ descriptor: UploadDescriptor) throws -> Int {
         let fileURL = descriptor.fileURL
         let fileName = fileURL.lastPathComponent
 
@@ -140,5 +154,7 @@ final class CaptureUploadService {
         guard let fileSize = values.fileSize, fileSize > 0 else {
             throw CaptureUploadError.uploadFileEmpty(fileName)
         }
+
+        return fileSize
     }
 }

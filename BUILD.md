@@ -21,6 +21,8 @@ The build scripts force `QT_API=pyqt6` and exclude other Qt bindings so PyInstal
    - `dist\ARPose Visualizer.exe`
    - `dist\ARPose Tracking Validator.exe`
    - `dist\ARPose Packet Loss Monitor.exe`
+   - `dist\ARPose Zarr Exporter.exe`
+   - `dist\AnySkin UDP Monitor.exe`
 4. You can distribute these .exe files
 
 ## Building on macOS
@@ -34,6 +36,8 @@ The build scripts force `QT_API=pyqt6` and exclude other Qt bindings so PyInstal
    - `dist/ARPose Visualizer.app`
    - `dist/ARPose Tracking Validator.app`
    - `dist/ARPose Packet Loss Monitor.app`
+   - `dist/ARPose Zarr Exporter.app`
+   - `dist/AnySkin UDP Monitor.app`
 4. You can distribute these .app bundles
 
 ## Distribution

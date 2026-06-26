@@ -6,6 +6,7 @@ struct PoseCaptureArtifact {
     let poseCSVURL: URL
     let manifestURL: URL
     let videoURL: URL?
+    let warning: String?
 }
 
 private struct PoseCaptureManifest: Codable {
@@ -26,6 +27,7 @@ final class PoseDataSessionRecorder {
     private var sessionStartFrameTime: TimeInterval?
     private var videoStartFrameTime: TimeInterval?
     private var creationTime: Date?
+    private var lastVideoArchiveWarning: String?
     private var sampleCount = 0
 
     func startSessionIfNeeded() {
@@ -116,6 +118,7 @@ final class PoseDataSessionRecorder {
 
         try? fileHandle?.close()
 
+        lastVideoArchiveWarning = nil
         let archivedVideoURL = archiveVideoIfNeeded(videoURL, into: sessionDirectoryURL)
         let manifestSessionStartFrameTime = sessionStartFrameTime ?? videoStartFrameTime ?? 0
 
@@ -137,7 +140,8 @@ final class PoseDataSessionRecorder {
                 sessionDirectoryURL: sessionDirectoryURL,
                 poseCSVURL: poseCSVURL,
                 manifestURL: manifestURL,
-                videoURL: archivedVideoURL
+                videoURL: archivedVideoURL,
+                warning: lastVideoArchiveWarning
             )
         )
 
@@ -150,7 +154,8 @@ final class PoseDataSessionRecorder {
         let fileManager = FileManager.default
         let destinationURL = sessionDirectoryURL.appendingPathComponent(sourceURL.lastPathComponent)
 
-        guard fileManager.fileExists(atPath: sourceURL.path) else {
+        guard let sourceSize = Self.usableRegularFileSize(sourceURL) else {
+            lastVideoArchiveWarning = "Video file is missing or empty: \(sourceURL.lastPathComponent)"
             return nil
         }
 
@@ -163,9 +168,17 @@ final class PoseDataSessionRecorder {
                 try fileManager.removeItem(at: destinationURL)
             }
 
-            try fileManager.moveItem(at: sourceURL, to: destinationURL)
+            try fileManager.copyItem(at: sourceURL, to: destinationURL)
+            guard Self.usableRegularFileSize(destinationURL) == sourceSize else {
+                try? fileManager.removeItem(at: destinationURL)
+                lastVideoArchiveWarning = "Copied video size check failed: \(sourceURL.lastPathComponent)"
+                return nil
+            }
+
+            try? fileManager.removeItem(at: sourceURL)
             return destinationURL
         } catch {
+            lastVideoArchiveWarning = "Could not archive video \(sourceURL.lastPathComponent): \(error.localizedDescription)"
             return nil
         }
     }
@@ -181,6 +194,7 @@ final class PoseDataSessionRecorder {
         sessionStartFrameTime = nil
         videoStartFrameTime = nil
         creationTime = nil
+        lastVideoArchiveWarning = nil
         sampleCount = 0
 
         if deleteSessionDirectory, let directoryURL {
@@ -189,6 +203,19 @@ final class PoseDataSessionRecorder {
     }
 
     private static let csvHeader = "sequence,sender_time,frame_time,relative_time,x,y,z,qx,qy,qz,qw\n"
+
+    private static func usableRegularFileSize(_ url: URL) -> Int? {
+        guard
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+            values.isRegularFile == true,
+            let fileSize = values.fileSize,
+            fileSize > 0
+        else {
+            return nil
+        }
+
+        return fileSize
+    }
 
     private static let timestampFormatter: DateFormatter = {
         let formatter = DateFormatter()
