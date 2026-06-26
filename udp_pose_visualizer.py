@@ -80,6 +80,7 @@ def decode_packet(packet: bytes, encoding: str):
 
 class UploadHandler(BaseHTTPRequestHandler):
     """HTTP upload handler for receiving files from iPhone"""
+    protocol_version = "HTTP/1.1"
     upload_root = get_default_upload_dir()
     file_received_callback = None
     progress_callback = None
@@ -88,6 +89,11 @@ class UploadHandler(BaseHTTPRequestHandler):
     def report_progress(cls, event):
         if cls.progress_callback:
             cls.progress_callback(event)
+
+    def handle_expect_100(self):
+        self.send_response_only(100)
+        self.end_headers()
+        return True
 
     def do_POST(self):
         if self.path != "/upload":
@@ -99,18 +105,25 @@ class UploadHandler(BaseHTTPRequestHandler):
         original_filename = self.headers.get("X-Original-Filename")
         upload_kind = self.headers.get("X-Upload-Kind")
         content_length = self.headers.get("Content-Length")
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        is_chunked = "chunked" in transfer_encoding
 
-        if not capture_id or not component or not original_filename or not upload_kind or not content_length:
-            self.send_error(400, "Missing required headers")
+        if not capture_id or not component or not original_filename or not upload_kind:
+            self.reject_upload(400, "Missing required upload headers", original_filename, upload_kind)
             return
 
-        try:
-            body_length = int(content_length)
-        except ValueError:
-            self.send_error(400, "Invalid Content-Length")
-            return
-        if body_length <= 0:
-            self.send_error(400, "Empty upload body")
+        body_length = None
+        if content_length:
+            try:
+                body_length = int(content_length)
+            except ValueError:
+                self.reject_upload(400, "Invalid Content-Length", original_filename, upload_kind)
+                return
+            if body_length <= 0:
+                self.reject_upload(400, "Empty upload body", original_filename, upload_kind)
+                return
+        elif not is_chunked:
+            self.reject_upload(411, "Missing Content-Length or chunked Transfer-Encoding", original_filename, upload_kind)
             return
 
         safe_capture_id = capture_id.replace("/", "_").replace("\\", "_")
@@ -128,39 +141,36 @@ class UploadHandler(BaseHTTPRequestHandler):
             "component": component,
             "upload_kind": upload_kind_label,
             "bytes_received": 0,
-            "total_bytes": body_length,
+            "total_bytes": body_length or 0,
             "percent": 0,
             "target_dir": str(target_dir.resolve()),
             "saved_to": str(file_path.resolve()),
         })
 
-        bytes_received = 0
-        last_percent = -1
-        with temp_path.open("wb") as handle:
-            while bytes_received < body_length:
-                remaining = body_length - bytes_received
-                chunk = self.rfile.read(min(UPLOAD_CHUNK_SIZE, remaining))
-                if not chunk:
-                    break
-                handle.write(chunk)
-                bytes_received += len(chunk)
-                percent = int((bytes_received / body_length) * 100) if body_length else 100
-                if percent != last_percent:
-                    self.report_progress({
-                        "stage": "receiving",
-                        "capture_id": safe_capture_id,
-                        "filename": safe_filename,
-                        "component": component,
-                        "upload_kind": upload_kind_label,
-                        "bytes_received": bytes_received,
-                        "total_bytes": body_length,
-                        "percent": percent,
-                        "target_dir": str(target_dir.resolve()),
-                        "saved_to": str(file_path.resolve()),
-                    })
-                    last_percent = percent
-
-        if bytes_received != body_length:
+        try:
+            with temp_path.open("wb") as handle:
+                if is_chunked and body_length is None:
+                    bytes_received = self.read_chunked_body(
+                        handle=handle,
+                        safe_capture_id=safe_capture_id,
+                        safe_filename=safe_filename,
+                        component=component,
+                        upload_kind_label=upload_kind_label,
+                        target_dir=target_dir,
+                        file_path=file_path,
+                    )
+                else:
+                    bytes_received = self.read_fixed_body(
+                        handle=handle,
+                        body_length=body_length,
+                        safe_capture_id=safe_capture_id,
+                        safe_filename=safe_filename,
+                        component=component,
+                        upload_kind_label=upload_kind_label,
+                        target_dir=target_dir,
+                        file_path=file_path,
+                    )
+        except Exception as exc:
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
@@ -171,12 +181,34 @@ class UploadHandler(BaseHTTPRequestHandler):
                 "filename": safe_filename,
                 "component": component,
                 "upload_kind": upload_kind_label,
+                "bytes_received": 0,
+                "total_bytes": body_length or 0,
+                "percent": 0,
+                "target_dir": str(target_dir.resolve()),
+                "saved_to": str(file_path.resolve()),
+                "message": str(exc),
+            })
+            self.send_error(400, "Incomplete upload body")
+            return
+
+        if bytes_received <= 0 or (body_length is not None and bytes_received != body_length):
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            expected_text = str(body_length) if body_length is not None else "chunked body"
+            self.report_progress({
+                "stage": "error",
+                "capture_id": safe_capture_id,
+                "filename": safe_filename,
+                "component": component,
+                "upload_kind": upload_kind_label,
                 "bytes_received": bytes_received,
-                "total_bytes": body_length,
+                "total_bytes": body_length or 0,
                 "percent": int((bytes_received / body_length) * 100) if body_length else 0,
                 "target_dir": str(target_dir.resolve()),
                 "saved_to": str(file_path.resolve()),
-                "message": f"Upload truncated: expected {body_length} bytes, received {bytes_received}",
+                "message": f"Upload truncated: expected {expected_text}, received {bytes_received}",
             })
             self.send_error(400, "Incomplete upload body")
             return
@@ -193,8 +225,8 @@ class UploadHandler(BaseHTTPRequestHandler):
             "filename": safe_filename,
             "component": component,
             "upload_kind": upload_kind_label,
-            "bytes_received": body_length,
-            "total_bytes": body_length,
+            "bytes_received": bytes_received,
+            "total_bytes": bytes_received,
             "percent": 100,
             "target_dir": str(target_dir.resolve()),
             "saved_to": str(file_path.resolve()),
@@ -213,12 +245,121 @@ class UploadHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(encoded)
+        self.close_connection = True
 
     def log_message(self, format, *args):
         # Suppress log messages
         pass
+
+    def reject_upload(self, status_code, message, filename=None, upload_kind=None):
+        self.report_progress({
+            "stage": "error",
+            "filename": Path(filename).name if filename else "unknown",
+            "upload_kind": upload_kind or "file",
+            "bytes_received": 0,
+            "total_bytes": 0,
+            "percent": 0,
+            "message": message,
+        })
+        self.send_error(status_code, message)
+
+    def read_fixed_body(
+        self,
+        handle,
+        body_length,
+        safe_capture_id,
+        safe_filename,
+        component,
+        upload_kind_label,
+        target_dir,
+        file_path,
+    ):
+        bytes_received = 0
+        last_percent = -1
+        while bytes_received < body_length:
+            remaining = body_length - bytes_received
+            chunk = self.rfile.read(min(UPLOAD_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            handle.write(chunk)
+            bytes_received += len(chunk)
+            percent = int((bytes_received / body_length) * 100) if body_length else 100
+            if percent != last_percent:
+                self.report_progress({
+                    "stage": "receiving",
+                    "capture_id": safe_capture_id,
+                    "filename": safe_filename,
+                    "component": component,
+                    "upload_kind": upload_kind_label,
+                    "bytes_received": bytes_received,
+                    "total_bytes": body_length,
+                    "percent": percent,
+                    "target_dir": str(target_dir.resolve()),
+                    "saved_to": str(file_path.resolve()),
+                })
+                last_percent = percent
+        return bytes_received
+
+    def read_chunked_body(
+        self,
+        handle,
+        safe_capture_id,
+        safe_filename,
+        component,
+        upload_kind_label,
+        target_dir,
+        file_path,
+    ):
+        bytes_received = 0
+        last_reported = 0
+        while True:
+            size_line = self.rfile.readline(128)
+            if not size_line:
+                raise ValueError("Chunked upload ended before final chunk")
+            size_text = size_line.split(b";", 1)[0].strip()
+            try:
+                chunk_size = int(size_text, 16)
+            except ValueError as exc:
+                raise ValueError(f"Invalid chunk size: {size_text!r}") from exc
+
+            if chunk_size == 0:
+                while True:
+                    trailer_line = self.rfile.readline(8192)
+                    if trailer_line in (b"\r\n", b"\n", b""):
+                        break
+                break
+
+            remaining = chunk_size
+            while remaining > 0:
+                chunk = self.rfile.read(min(UPLOAD_CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise ValueError("Chunked upload ended mid-chunk")
+                handle.write(chunk)
+                bytes_received += len(chunk)
+                remaining -= len(chunk)
+
+            line_end = self.rfile.read(2)
+            if line_end != b"\r\n":
+                raise ValueError("Invalid chunk terminator")
+
+            if bytes_received - last_reported >= 256 * 1024:
+                self.report_progress({
+                    "stage": "receiving",
+                    "capture_id": safe_capture_id,
+                    "filename": safe_filename,
+                    "component": component,
+                    "upload_kind": upload_kind_label,
+                    "bytes_received": bytes_received,
+                    "total_bytes": 0,
+                    "percent": 0,
+                    "target_dir": str(target_dir.resolve()),
+                    "saved_to": str(file_path.resolve()),
+                })
+                last_reported = bytes_received
+        return bytes_received
 
 
 class UploadServerThread(QThread):

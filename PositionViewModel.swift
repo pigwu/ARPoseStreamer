@@ -134,6 +134,7 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var sendStatus = "Idle"
     @Published private(set) var sensorStatus = "Sensor idle"
     @Published private(set) var uploadStatus = "Upload idle"
+    @Published private(set) var trackingStatus = "AR tracking idle"
     @Published private(set) var uploadDetails = UploadStatusViewState()
     @Published private(set) var latestPacketSummary = "No packets yet"
     @Published private(set) var latestSensorSummary = "No sensor packets yet"
@@ -338,7 +339,11 @@ final class PositionViewModel: ObservableObject {
     }
 
     func requestVideoUpload(for record: CaptureRecord) {
-        guard captureLibraryStore.urlForVideo(record: record) != nil else { return }
+        let videoState = captureLibraryStore.videoFileState(for: record)
+        guard videoState.canUpload else {
+            uploadStatus = videoState.statusText
+            return
+        }
 
         if let previousUploadDate = record.videoUploadedAt {
             pendingReuploadPrompt = ReuploadPrompt(
@@ -384,8 +389,9 @@ final class PositionViewModel: ObservableObject {
         let descriptors: [UploadDescriptor]
         switch kind {
         case .video:
-            guard let videoURL = captureLibraryStore.urlForVideo(record: record) else {
-                uploadStatus = "This capture has no video file"
+            let videoState = captureLibraryStore.videoFileState(for: record)
+            guard let videoURL = videoState.uploadURL else {
+                uploadStatus = videoState.statusText
                 return
             }
             descriptors = [UploadDescriptor(fileURL: videoURL, component: "video")]
@@ -501,11 +507,17 @@ final class PositionViewModel: ObservableObject {
             }
         }
 
+        newSender?.onTrackingStatusChange = { [weak self] status in
+            Task { @MainActor [weak self] in
+                self?.trackingStatus = status
+            }
+        }
+
         newSender?.onRecordingStatusChange = { [weak self] status in
             Task { @MainActor [weak self] in
                 self?.recordingStatus = status.message
                 self?.recordingPhase = status
-                self?.isRecordingVideo = status.isRecording || status.isPreparing
+                self?.isRecordingVideo = status.isActive
 
                 if case .saved(let url) = status {
                     self?.lastSavedVideoURL = url
@@ -528,6 +540,9 @@ final class PositionViewModel: ObservableObject {
                 if let videoURL = artifact.videoURL {
                     self.lastSavedVideoURL = videoURL
                     self.lastSavedVideoName = videoURL.lastPathComponent
+                }
+                if let warning = artifact.warning {
+                    self.recordingStatus = warning
                 }
             }
         }

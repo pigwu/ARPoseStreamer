@@ -67,6 +67,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     var onError: ((Error) -> Void)?
     var onRecordingStatusChange: ((VideoRecordingStatus) -> Void)?
     var onCaptureSessionSaved: ((PoseCaptureArtifact) -> Void)?
+    var onTrackingStatusChange: ((String) -> Void)?
 
     private let coordinateSystem: CoordinateSystem
     private let payloadEncoding: PayloadEncoding
@@ -270,10 +271,13 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         configuration.worldAlignment = .gravity
         configuration.planeDetection = []
         configuration.isAutoFocusEnabled = true
-        configuration.videoFormat = preferredVideoFormat()
+        if let videoFormat = preferredVideoFormat() {
+            configuration.videoFormat = videoFormat
+        }
 
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         isSessionRunning = true
+        reportTrackingStatus("AR session starting")
     }
 
     private func failRecordingIfFirstFrameDoesNotArrive(attemptID: UUID) {
@@ -291,8 +295,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         isSessionRunning = false
     }
 
-    private func preferredVideoFormat() -> ARConfiguration.VideoFormat {
+    private func preferredVideoFormat() -> ARConfiguration.VideoFormat? {
         let formats = ARWorldTrackingConfiguration.supportedVideoFormats
+        guard !formats.isEmpty else { return nil }
 
         let exact60 = formats
             .filter { $0.framesPerSecond == 60 }
@@ -315,7 +320,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
                 return lhsPixels < rhsPixels
             }
 
-        return fallback.first ?? formats[0]
+        return fallback.first ?? formats.first
     }
 
     private func connectUDP(port: NWEndpoint.Port? = nil) {
@@ -357,15 +362,53 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         connection = nil
     }
 
+    func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
+        reportTrackingStatus(Self.trackingDescription(for: camera.trackingState))
+    }
+
+    func session(_ session: ARSession, didFailWithError error: Error) {
+        arQueue.async { [weak self] in
+            guard let self else { return }
+            self.isSessionRunning = false
+            self.videoRecorder.cancelRecording(reason: "AR session failed: \(error.localizedDescription)")
+            self.reportTrackingStatus("AR failed: \(error.localizedDescription)")
+        }
+    }
+
+    func sessionWasInterrupted(_ session: ARSession) {
+        arQueue.async { [weak self] in
+            guard let self else { return }
+            self.isSessionRunning = false
+            self.videoRecorder.cancelRecording(reason: "AR session interrupted")
+            self.reportTrackingStatus("AR interrupted")
+        }
+    }
+
+    func sessionInterruptionEnded(_ session: ARSession) {
+        arQueue.async { [weak self] in
+            guard let self else { return }
+            self.isSessionRunning = false
+            if self.isStreamingEnabled || self.isRecordingEnabled {
+                self.startSessionIfNeeded()
+            } else {
+                self.reportTrackingStatus("AR interruption ended")
+            }
+        }
+    }
+
     private func processFrame(transform: simd_float4x4, pixelBuffer: CVPixelBuffer, frameTimestamp: TimeInterval) {
         if shouldResetOriginOnNextFrame || originTransform == nil {
             originTransform = transform
             shouldResetOriginOnNextFrame = false
         }
 
-        let relativeTransform = originTransform.map {
-            simd_mul(simd_inverse($0), transform)
-        } ?? transform
+        // Keep ARKit's gravity-aligned world axes; only shift the origin position.
+        var relativeTransform = transform
+        if let originTransform {
+            relativeTransform.columns.3.x -= originTransform.columns.3.x
+            relativeTransform.columns.3.y -= originTransform.columns.3.y
+            relativeTransform.columns.3.z -= originTransform.columns.3.z
+        }
 
         let sample = makePoseSample(from: relativeTransform)
         let presentationTime = CMTime(seconds: frameTimestamp, preferredTimescale: 600)
@@ -448,11 +491,10 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         switch coordinateSystem {
         case .arkitYUp:
             convertedPosition = positionYUp
-            convertedOrientation = simd_quatf(vector: simd_normalize(orientationYUp.vector))
+            convertedOrientation = Self.normalizedQuaternion(orientationYUp)
         case .zUpRightHanded:
             convertedPosition = SIMD3(positionYUp.x, -positionYUp.z, positionYUp.y)
-            let aligned = zUpAlignment * orientationYUp
-            convertedOrientation = simd_quatf(vector: simd_normalize(aligned.vector))
+            convertedOrientation = Self.convertRotationToZUp(rotationMatrix, alignment: zUpAlignment)
         }
 
         sequenceNumber &+= 1
@@ -472,5 +514,49 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         case .csvUTF8:
             return Data(sample.csvString.utf8)
         }
+    }
+
+    private func reportTrackingStatus(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onTrackingStatusChange?(message)
+        }
+    }
+
+    private static func trackingDescription(for state: ARCamera.TrackingState) -> String {
+        switch state {
+        case .normal:
+            return "Tracking normal"
+        case .notAvailable:
+            return "Tracking unavailable"
+        case .limited(let reason):
+            switch reason {
+            case .initializing:
+                return "Tracking limited: initializing"
+            case .excessiveMotion:
+                return "Tracking limited: excessive motion"
+            case .insufficientFeatures:
+                return "Tracking limited: insufficient features"
+            case .relocalizing:
+                return "Tracking limited: relocalizing"
+            @unknown default:
+                return "Tracking limited"
+            }
+        }
+    }
+
+    private static func normalizedQuaternion(_ quaternion: simd_quatf) -> simd_quatf {
+        let vector = quaternion.vector
+        let norm = simd_length(vector)
+        guard norm.isFinite, norm > 1e-6 else {
+            return simd_quatf(angle: 0, axis: SIMD3<Float>(1, 0, 0))
+        }
+
+        return simd_quatf(vector: vector / norm)
+    }
+
+    private static func convertRotationToZUp(_ rotationYUp: simd_float3x3, alignment: simd_quatf) -> simd_quatf {
+        let alignmentMatrix = simd_float3x3(alignment)
+        let converted = simd_mul(alignmentMatrix, simd_mul(rotationYUp, simd_transpose(alignmentMatrix)))
+        return normalizedQuaternion(simd_quatf(converted))
     }
 }

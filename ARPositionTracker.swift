@@ -65,9 +65,17 @@ final class ARPositionTracker: NSObject, ARSessionDelegate {
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let cameraTransform = frame.camera.transform
-        let relativeTransform = originTransform.map {
-            simd_mul(simd_inverse($0), cameraTransform)
-        } ?? cameraTransform
+        if originTransform == nil {
+            originTransform = cameraTransform
+        }
+
+        // Keep ARKit's gravity-aligned world axes; only shift the origin position.
+        var relativeTransform = cameraTransform
+        if let originTransform {
+            relativeTransform.columns.3.x -= originTransform.columns.3.x
+            relativeTransform.columns.3.y -= originTransform.columns.3.y
+            relativeTransform.columns.3.z -= originTransform.columns.3.z
+        }
 
         let sample = makePoseSample(from: relativeTransform, timestamp: frame.timestamp)
 
@@ -140,7 +148,19 @@ final class ARPositionTracker: NSObject, ARSessionDelegate {
     }
 
     private func convertQuaternionToZUp(_ quaternion: simd_quatf) -> simd_quatf {
-        let converted = zUpAlignment * quaternion
-        return simd_quatf(vector: simd_normalize(converted.vector))
+        let alignmentMatrix = simd_float3x3(zUpAlignment)
+        let rotationYUp = simd_float3x3(quaternion)
+        let converted = simd_mul(alignmentMatrix, simd_mul(rotationYUp, simd_transpose(alignmentMatrix)))
+        return normalizedQuaternion(simd_quatf(converted))
+    }
+
+    private func normalizedQuaternion(_ quaternion: simd_quatf) -> simd_quatf {
+        let vector = quaternion.vector
+        let norm = simd_length(vector)
+        guard norm.isFinite, norm > 1e-6 else {
+            return simd_quatf(angle: 0, axis: SIMD3<Float>(1, 0, 0))
+        }
+
+        return simd_quatf(vector: vector / norm)
     }
 }

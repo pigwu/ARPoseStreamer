@@ -173,6 +173,8 @@ private struct StatusStrip: View {
         HStack(spacing: 6) {
             StatusChip(text: viewModel.recordingStatus, isActive: viewModel.recordingPhase.isActive)
 
+            StatusChip(text: viewModel.trackingStatus, isActive: viewModel.trackingStatus == "Tracking normal")
+
             if viewModel.isSending {
                 StatusChip(text: "Streaming", isActive: true)
             }
