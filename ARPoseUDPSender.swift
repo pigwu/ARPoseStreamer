@@ -429,13 +429,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             shouldResetOriginOnNextFrame = false
         }
 
-        // Keep ARKit's gravity-aligned world axes; only shift the origin position.
-        var relativeTransform = transform
-        if let originTransform {
-            relativeTransform.columns.3.x -= originTransform.columns.3.x
-            relativeTransform.columns.3.y -= originTransform.columns.3.y
-            relativeTransform.columns.3.z -= originTransform.columns.3.z
-        }
+        let relativeTransform = originTransform.map {
+            simd_mul(simd_inverse($0), transform)
+        } ?? transform
 
         let sample = makePoseSample(from: relativeTransform)
         let presentationTime = CMTime(seconds: frameTimestamp, preferredTimescale: 600)
