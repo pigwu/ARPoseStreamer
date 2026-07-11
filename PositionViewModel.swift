@@ -55,6 +55,34 @@ enum ReceiverPlatform: String, CaseIterable, Identifiable {
     }
 }
 
+struct VideoStreamStatsViewState: Equatable {
+    var state = "Video off"
+    var encodedFPS = 0.0
+    var sentFPS = 0.0
+    var bitrateMbps = 0.0
+    var encodedFrames: UInt64 = 0
+    var sentFrames: UInt64 = 0
+    var droppedFrames: UInt64 = 0
+    var keyFrames: UInt64 = 0
+    var sentBytes: UInt64 = 0
+
+    static let idle = VideoStreamStatsViewState()
+
+    init() {}
+
+    init(from stats: LowLatencyVideoStats) {
+        state = stats.state
+        encodedFPS = stats.encodedFPS
+        sentFPS = stats.sentFPS
+        bitrateMbps = stats.bitrateMbps
+        encodedFrames = stats.encodedFrames
+        sentFrames = stats.sentFrames
+        droppedFrames = stats.droppedFrames
+        keyFrames = stats.keyFrames
+        sentBytes = stats.sentBytes
+    }
+}
+
 struct PositionHistorySample: Identifiable {
     let id = UUID()
     let timestamp: TimeInterval
@@ -107,10 +135,16 @@ struct UploadStatusViewState {
 @MainActor
 final class PositionViewModel: ObservableObject {
     @Published var hostIP: String {
-        didSet { UserDefaults.standard.set(hostIP, forKey: Self.hostIPKey) }
+        didSet {
+            UserDefaults.standard.set(hostIP, forKey: Self.hostIPKey)
+            applySenderConfigurationIfNeeded()
+        }
     }
     @Published var hostPort: String {
-        didSet { UserDefaults.standard.set(hostPort, forKey: Self.hostPortKey) }
+        didSet {
+            UserDefaults.standard.set(hostPort, forKey: Self.hostPortKey)
+            applySenderConfigurationIfNeeded()
+        }
     }
     @Published var uploadPort: String {
         didSet { UserDefaults.standard.set(uploadPort, forKey: Self.uploadPortKey) }
@@ -123,6 +157,36 @@ final class PositionViewModel: ObservableObject {
     }
     @Published var receiverPlatform: ReceiverPlatform {
         didSet { UserDefaults.standard.set(receiverPlatform.rawValue, forKey: Self.receiverPlatformKey) }
+    }
+    @Published var isVideoStreamingEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(isVideoStreamingEnabled, forKey: Self.isVideoStreamingEnabledKey)
+            applySenderConfigurationIfNeeded()
+        }
+    }
+    @Published var videoPort: String {
+        didSet {
+            UserDefaults.standard.set(videoPort, forKey: Self.videoPortKey)
+            applySenderConfigurationIfNeeded()
+        }
+    }
+    @Published var videoFrameRate: String {
+        didSet {
+            UserDefaults.standard.set(videoFrameRate, forKey: Self.videoFrameRateKey)
+            applySenderConfigurationIfNeeded()
+        }
+    }
+    @Published var videoBitrateMbps: String {
+        didSet {
+            UserDefaults.standard.set(videoBitrateMbps, forKey: Self.videoBitrateKey)
+            applySenderConfigurationIfNeeded()
+        }
+    }
+    @Published var videoResolution: VideoStreamResolution {
+        didSet {
+            UserDefaults.standard.set(videoResolution.rawValue, forKey: Self.videoResolutionKey)
+            applySenderConfigurationIfNeeded()
+        }
     }
     @Published var showPositionChart: Bool {
         didSet { UserDefaults.standard.set(showPositionChart, forKey: Self.showPositionChartKey) }
@@ -139,6 +203,8 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var latestPacketSummary = "No packets yet"
     @Published private(set) var latestSensorSummary = "No sensor packets yet"
     @Published private(set) var wiredSensorStats = WiredSensorStatsViewState()
+    @Published private(set) var videoStatus = "Video off"
+    @Published private(set) var videoStats = VideoStreamStatsViewState.idle
     @Published private(set) var connectedAccessories: [WiredSensorAccessoryInfo] = []
     @Published private(set) var recordingStatus = VideoRecordingStatus.idle.message
     @Published private(set) var recordingPhase = VideoRecordingStatus.idle
@@ -168,8 +234,41 @@ final class PositionViewModel: ObservableObject {
         "\(receiverPlatform.displayName) receiver at \(hostIP):\(hostPort)"
     }
 
+    var videoTargetSummary: String {
+        "Low-latency video at \(hostIP):\(videoPort)"
+    }
+
     var videoAccessHint: String {
         receiverPlatform.videoAccessHint
+    }
+
+    var videoReceiverCommand: String {
+        switch receiverPlatform {
+        case .macOS:
+            return "python3 udp_video_debug_ui.py --bind 0.0.0.0 --video-port \(normalizedPort(videoPort) ?? 5560) --pose-port \(normalizedPort(hostPort) ?? 5555)"
+        case .windows:
+            return "py udp_video_debug_ui.py --bind 0.0.0.0 --video-port \(normalizedPort(videoPort) ?? 5560) --pose-port \(normalizedPort(hostPort) ?? 5555)"
+        }
+    }
+
+    var hasVideoStreamingEnabled: Bool {
+        isVideoStreamingEnabled
+    }
+
+    var videoEncodedFPSText: String {
+        String(format: "%.1f", videoStats.encodedFPS)
+    }
+
+    var videoSentFPSText: String {
+        String(format: "%.1f", videoStats.sentFPS)
+    }
+
+    var videoBitrateText: String {
+        String(format: "%.1f", videoStats.bitrateMbps)
+    }
+
+    var videoDroppedFramesText: String {
+        "\(videoStats.droppedFrames)"
     }
 
     var canStartRecording: Bool {
@@ -200,8 +299,16 @@ final class PositionViewModel: ObservableObject {
         sensorPort = defaults.string(forKey: Self.sensorPortKey) ?? "5556"
         sensorAccessoryProtocol = defaults.string(forKey: Self.sensorAccessoryProtocolKey) ?? "com.example.sensor.pose"
         receiverPlatform = ReceiverPlatform(rawValue: defaults.string(forKey: Self.receiverPlatformKey) ?? ReceiverPlatform.macOS.rawValue) ?? .macOS
+        isVideoStreamingEnabled = defaults.object(forKey: Self.isVideoStreamingEnabledKey) as? Bool ?? false
+        videoPort = defaults.string(forKey: Self.videoPortKey) ?? "5560"
+        videoFrameRate = defaults.string(forKey: Self.videoFrameRateKey) ?? "60"
+        videoBitrateMbps = defaults.string(forKey: Self.videoBitrateKey) ?? "6.0"
+        videoResolution = VideoStreamResolution(rawValue: defaults.string(forKey: Self.videoResolutionKey) ?? VideoStreamResolution.hd720p.rawValue) ?? .hd720p
         showPositionChart = defaults.object(forKey: Self.showPositionChartKey) as? Bool ?? true
         captureRecords = captureLibraryStore.loadRecords().sorted { $0.createdAt > $1.createdAt }
+        videoStatus = isVideoStreamingEnabled ? "Video ready" : "Video off"
+        videoStats = VideoStreamStatsViewState()
+        videoStats.state = videoStatus
 
         configureSender()
         refreshConnectedAccessories()
@@ -221,11 +328,16 @@ final class PositionViewModel: ObservableObject {
             configureSender()
         } else {
             sender?.updateDestination(hostIP: hostIP, port: port)
+            sender?.updateVideoStreamingConfiguration(makeVideoConfiguration())
         }
 
         sender?.start()
         isSending = true
-        sendStatus = "Streaming pose to \(hostIP):\(port)"
+        if isVideoStreamingEnabled {
+            sendStatus = "Streaming pose to \(hostIP):\(port) and video to \(hostIP):\(normalizedPort(videoPort) ?? 5560)"
+        } else {
+            sendStatus = "Streaming pose to \(hostIP):\(port)"
+        }
     }
 
     func stopSending() {
@@ -314,6 +426,7 @@ final class PositionViewModel: ObservableObject {
             configureSender()
         }
 
+        sender?.updateVideoStreamingConfiguration(makeVideoConfiguration())
         sender?.startPreview()
     }
 
@@ -468,7 +581,11 @@ final class PositionViewModel: ObservableObject {
 
     private func configureSender() {
         let senderPort = UInt16(hostPort) ?? 5555
-        let newSender = ARPoseUDPSender(hostIP: hostIP, port: senderPort)
+        let newSender = ARPoseUDPSender(
+            hostIP: hostIP,
+            port: senderPort,
+            videoConfiguration: makeVideoConfiguration()
+        )
         sender = newSender
 
         newSender?.onSampleUpdated = { [weak self] sample in
@@ -502,14 +619,27 @@ final class PositionViewModel: ObservableObject {
 
         newSender?.onError = { [weak self] error in
             Task { @MainActor [weak self] in
-                self?.sendStatus = "Send error: \(error.localizedDescription)"
-                self?.isSending = false
+                self?.sendStatus = "Transport error: \(error.localizedDescription)"
             }
         }
 
         newSender?.onTrackingStatusChange = { [weak self] status in
             Task { @MainActor [weak self] in
                 self?.trackingStatus = status
+            }
+        }
+
+        newSender?.onVideoStateChange = { [weak self] state in
+            Task { @MainActor [weak self] in
+                self?.videoStatus = state
+                self?.videoStats.state = state
+            }
+        }
+
+        newSender?.onVideoStatsChange = { [weak self] stats in
+            Task { @MainActor [weak self] in
+                self?.videoStats = VideoStreamStatsViewState(from: stats)
+                self?.videoStatus = stats.state
             }
         }
 
@@ -620,6 +750,27 @@ final class PositionViewModel: ObservableObject {
         }
     }
 
+    private func applySenderConfigurationIfNeeded() {
+        guard let sender else { return }
+
+        if isSending, let posePort = normalizedPort(hostPort) {
+            sender.updateDestination(hostIP: hostIP, port: posePort)
+        }
+
+        sender.updateVideoStreamingConfiguration(makeVideoConfiguration())
+    }
+
+    private func makeVideoConfiguration() -> LowLatencyVideoConfiguration {
+        LowLatencyVideoConfiguration(
+            isEnabled: isVideoStreamingEnabled,
+            hostIP: hostIP,
+            port: normalizedPort(videoPort) ?? LowLatencyVideoConfiguration.defaults.port,
+            resolution: videoResolution,
+            frameRate: Int(videoFrameRate) ?? LowLatencyVideoConfiguration.defaults.frameRate,
+            bitrateMbps: Double(videoBitrateMbps) ?? LowLatencyVideoConfiguration.defaults.bitrateMbps
+        )
+    }
+
     private func normalizedPort(_ value: String) -> UInt16? {
         UInt16(value)
     }
@@ -649,5 +800,10 @@ final class PositionViewModel: ObservableObject {
     private static let sensorPortKey = "ARPoseStreamer.sensorPort"
     private static let sensorAccessoryProtocolKey = "ARPoseStreamer.sensorAccessoryProtocol"
     private static let receiverPlatformKey = "ARPoseStreamer.receiverPlatform"
+    private static let isVideoStreamingEnabledKey = "ARPoseStreamer.video.enabled"
+    private static let videoPortKey = "ARPoseStreamer.video.port"
+    private static let videoFrameRateKey = "ARPoseStreamer.video.frameRate"
+    private static let videoBitrateKey = "ARPoseStreamer.video.bitrateMbps"
+    private static let videoResolutionKey = "ARPoseStreamer.video.resolution"
     private static let showPositionChartKey = "ARPoseStreamer.showPositionChart"
 }

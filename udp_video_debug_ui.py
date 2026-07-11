@@ -1,0 +1,774 @@
+from __future__ import annotations
+
+import argparse
+import socket
+import struct
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from select import select
+
+try:
+    import av
+except Exception as exc:  # pragma: no cover - import guard for runtime only
+    av = None
+    AV_IMPORT_ERROR = exc
+else:
+    AV_IMPORT_ERROR = None
+
+import numpy as np
+try:
+    import pyqtgraph as pg
+except Exception:  # pragma: no cover - optional UI enhancement fallback
+    pg = None
+from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QImage, QPalette, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QPlainTextEdit,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+POSE_PACKET = struct.Struct("<Id7f")
+VIDEO_PACKET_HEADER = struct.Struct("<4sBBHIdHHHH")
+VIDEO_MAGIC = b"APV1"
+VIDEO_VERSION = 1
+FRAME_STALE_SECONDS = 0.20
+MAX_INFLIGHT_FRAMES = 8
+LATENCY_HISTORY_SECONDS = 30.0
+
+
+def build_av_install_hint() -> str:
+    executable = Path(sys.executable).resolve()
+    return f"\"{executable}\" -m pip install av"
+
+
+def get_app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+@dataclass
+class NALAssembly:
+    total_fragments: int
+    fragments: dict[int, bytes] = field(default_factory=dict)
+
+    def is_complete(self) -> bool:
+        return len(self.fragments) == self.total_fragments
+
+
+@dataclass
+class FrameAssembly:
+    frame_id: int
+    capture_timestamp: float
+    nalu_count: int
+    is_keyframe: bool
+    created_at: float
+    last_update_at: float
+    nalus: dict[int, NALAssembly] = field(default_factory=dict)
+
+    def is_complete(self) -> bool:
+        if len(self.nalus) != self.nalu_count:
+            return False
+        return all(nalu.is_complete() for nalu in self.nalus.values())
+
+    def to_annexb(self) -> bytes:
+        chunks: list[bytes] = []
+        for nalu_index in range(self.nalu_count):
+            assembly = self.nalus.get(nalu_index)
+            if assembly is None or not assembly.is_complete():
+                raise ValueError(f"Frame {self.frame_id} is incomplete")
+            payload = b"".join(assembly.fragments[index] for index in range(assembly.total_fragments))
+            chunks.append(b"\x00\x00\x00\x01" + payload)
+        return b"".join(chunks)
+
+
+class VideoReceiverThread(QThread):
+    frame_ready = pyqtSignal(QImage)
+    video_metrics = pyqtSignal(dict)
+    pose_metrics = pyqtSignal(dict)
+    status_changed = pyqtSignal(str)
+    log_message = pyqtSignal(str)
+
+    def __init__(self, bind_host: str, video_port: int, pose_port: int | None) -> None:
+        super().__init__()
+        self.bind_host = bind_host
+        self.video_port = video_port
+        self.pose_port = pose_port
+        self._running = True
+        self._decoder = av.CodecContext.create("h264", "r") if av is not None else None
+        self._frames: dict[int, FrameAssembly] = {}
+        self._latest_decoded_frame_id: int | None = None
+        self._video_byte_window: deque[tuple[float, int]] = deque()
+        self._video_frame_window: deque[float] = deque()
+        self._video_state = {
+            "status": "Idle",
+            "frame_id": 0,
+            "fps": 0.0,
+            "bitrate_mbps": 0.0,
+            "latency_ms": 0.0,
+            "decoded_frames": 0,
+            "dropped_frames": 0,
+            "decode_errors": 0,
+            "keyframes": 0,
+            "packets": 0,
+            "bytes": 0,
+        }
+        self._pose_state = {
+            "status": "Pose idle",
+            "sequence": 0,
+            "latency_ms": 0.0,
+            "fps": 0.0,
+            "drops": 0,
+            "position": "(0.000, 0.000, 0.000)",
+        }
+        self._prev_pose_sequence: int | None = None
+        self._prev_pose_monotonic: float | None = None
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        try:
+            video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            video_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            video_socket.bind((self.bind_host, self.video_port))
+            video_socket.setblocking(False)
+
+            pose_socket = None
+            sockets = [video_socket]
+            if self.pose_port is not None and self.pose_port > 0:
+                pose_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                pose_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                pose_socket.bind((self.bind_host, self.pose_port))
+                pose_socket.setblocking(False)
+                sockets.append(pose_socket)
+        except OSError as exc:
+            self.status_changed.emit("Bind failed")
+            self.log_message.emit(f"Could not bind UDP sockets: {exc}")
+            return
+
+        self._video_state["status"] = f"Listening on {self.bind_host}:{self.video_port}"
+        self.status_changed.emit(self._video_state["status"])
+        self.video_metrics.emit(dict(self._video_state))
+        self.pose_metrics.emit(dict(self._pose_state))
+        self.log_message.emit(
+            f"Listening for H.264 video on {self.bind_host}:{self.video_port}"
+            + (f" and pose on {self.bind_host}:{self.pose_port}" if pose_socket else "")
+        )
+
+        try:
+            while self._running:
+                readable, _, _ = select(sockets, [], [], 0.1)
+                now = time.monotonic()
+
+                for current_socket in readable:
+                    try:
+                        packet, address = current_socket.recvfrom(65535)
+                    except OSError as exc:
+                        self.log_message.emit(f"Socket receive error: {exc}")
+                        continue
+
+                    if current_socket is video_socket:
+                        self._handle_video_packet(packet, address)
+                    else:
+                        self._handle_pose_packet(packet, address)
+
+                self._prune_stale_frames(now)
+                self._emit_video_metrics()
+        finally:
+            video_socket.close()
+            if pose_socket is not None:
+                pose_socket.close()
+            self.status_changed.emit("Stopped")
+            self.log_message.emit("Receiver stopped")
+
+    def _handle_pose_packet(self, packet: bytes, address: tuple[str, int]) -> None:
+        try:
+            sequence, sender_time, x, y, z, *_quaternion = POSE_PACKET.unpack(packet)
+        except struct.error:
+            return
+
+        recv_time = time.time()
+        monotonic_now = time.monotonic()
+        latency_ms = max(0.0, (recv_time - sender_time) * 1000.0)
+        if self._prev_pose_monotonic is None:
+            fps = 0.0
+        else:
+            fps = 1.0 / max(monotonic_now - self._prev_pose_monotonic, 1e-6)
+        self._prev_pose_monotonic = monotonic_now
+
+        dropped = 0
+        if self._prev_pose_sequence is not None:
+            dropped = max(0, sequence - self._prev_pose_sequence - 1)
+        self._prev_pose_sequence = sequence
+
+        self._pose_state.update(
+            {
+                "status": f"Pose from {address[0]}:{address[1]}",
+                "sequence": sequence,
+                "latency_ms": latency_ms,
+                "fps": fps,
+                "drops": dropped,
+                "position": f"({x:+.3f}, {y:+.3f}, {z:+.3f})",
+            }
+        )
+        self.pose_metrics.emit(dict(self._pose_state))
+
+    def _handle_video_packet(self, packet: bytes, address: tuple[str, int]) -> None:
+        if len(packet) < VIDEO_PACKET_HEADER.size:
+            return
+
+        try:
+            (
+                magic,
+                version,
+                flags,
+                _reserved,
+                frame_id,
+                capture_timestamp,
+                nalu_index,
+                nalu_count,
+                fragment_index,
+                fragment_count,
+            ) = VIDEO_PACKET_HEADER.unpack_from(packet)
+        except struct.error:
+            return
+
+        if magic != VIDEO_MAGIC or version != VIDEO_VERSION:
+            return
+
+        if self._latest_decoded_frame_id is not None and frame_id <= self._latest_decoded_frame_id:
+            return
+
+        payload = packet[VIDEO_PACKET_HEADER.size :]
+        if fragment_count <= 0 or nalu_count <= 0:
+            return
+
+        now = time.monotonic()
+        self._video_state["status"] = f"Receiving from {address[0]}:{address[1]}"
+        self._video_state["packets"] += 1
+        self._video_state["bytes"] += len(packet)
+        self._video_byte_window.append((now, len(packet)))
+
+        frame = self._frames.get(frame_id)
+        if frame is None:
+            frame = FrameAssembly(
+                frame_id=frame_id,
+                capture_timestamp=capture_timestamp,
+                nalu_count=nalu_count,
+                is_keyframe=bool(flags & 0x01),
+                created_at=now,
+                last_update_at=now,
+            )
+            self._frames[frame_id] = frame
+        else:
+            frame.last_update_at = now
+
+        nalu = frame.nalus.get(nalu_index)
+        if nalu is None:
+            nalu = NALAssembly(total_fragments=fragment_count)
+            frame.nalus[nalu_index] = nalu
+        elif nalu.total_fragments != fragment_count:
+            nalu.total_fragments = max(nalu.total_fragments, fragment_count)
+
+        if fragment_index not in nalu.fragments:
+            nalu.fragments[fragment_index] = payload
+
+        if frame.is_complete():
+            self._frames.pop(frame_id, None)
+            self._decode_frame(frame)
+
+        self._trim_inflight_frames()
+
+    def _trim_inflight_frames(self) -> None:
+        if len(self._frames) <= MAX_INFLIGHT_FRAMES:
+            return
+
+        for frame_id, _frame in sorted(self._frames.items(), key=lambda item: item[1].created_at)[:-MAX_INFLIGHT_FRAMES]:
+            self._frames.pop(frame_id, None)
+            self._video_state["dropped_frames"] += 1
+
+    def _prune_stale_frames(self, now: float) -> None:
+        stale_ids = [
+            frame_id
+            for frame_id, frame in self._frames.items()
+            if now - frame.last_update_at >= FRAME_STALE_SECONDS
+        ]
+        for frame_id in stale_ids:
+            self._frames.pop(frame_id, None)
+            self._video_state["dropped_frames"] += 1
+
+    def _decode_frame(self, frame: FrameAssembly) -> None:
+        if av is None or self._decoder is None:
+            return
+
+        try:
+            annexb = frame.to_annexb()
+            packets = self._decoder.parse(annexb)
+            decoded_any = False
+            for packet in packets:
+                decoded_frames = self._decoder.decode(packet)
+                for decoded_frame in decoded_frames:
+                    decoded_any = True
+                    self._handle_decoded_frame(decoded_frame, frame)
+            if not decoded_any and frame.is_keyframe:
+                self._decoder = av.CodecContext.create("h264", "r")
+        except Exception as exc:
+            self._video_state["decode_errors"] += 1
+            self._video_state["status"] = "Decode error"
+            self._decoder = av.CodecContext.create("h264", "r")
+            self.log_message.emit(f"Decode error on frame {frame.frame_id}: {exc}")
+
+    def _handle_decoded_frame(self, decoded_frame: av.VideoFrame, frame: FrameAssembly) -> None:
+        rgb = decoded_frame.to_ndarray(format="rgb24")
+        height, width, channels = rgb.shape
+        image = QImage(
+            rgb.data,
+            width,
+            height,
+            channels * width,
+            QImage.Format.Format_RGB888,
+        ).copy()
+
+        now_monotonic = time.monotonic()
+        now_wall_clock = time.time()
+        self._video_frame_window.append(now_monotonic)
+        self._latest_decoded_frame_id = frame.frame_id
+        self._video_state["frame_id"] = frame.frame_id
+        self._video_state["decoded_frames"] += 1
+        self._video_state["latency_ms"] = max(0.0, (now_wall_clock - frame.capture_timestamp) * 1000.0)
+        if frame.is_keyframe:
+            self._video_state["keyframes"] += 1
+
+        self._emit_video_metrics()
+        self.frame_ready.emit(image)
+
+    def _emit_video_metrics(self) -> None:
+        now = time.monotonic()
+        while self._video_frame_window and now - self._video_frame_window[0] > 1.0:
+            self._video_frame_window.popleft()
+        while self._video_byte_window and now - self._video_byte_window[0][0] > 1.0:
+            self._video_byte_window.popleft()
+
+        self._video_state["fps"] = float(len(self._video_frame_window))
+        bytes_last_second = sum(size for _, size in self._video_byte_window)
+        self._video_state["bitrate_mbps"] = (bytes_last_second * 8.0) / 1_000_000.0
+        self.video_metrics.emit(dict(self._video_state))
+
+
+class LabeledValue(QLabel):
+    def __init__(self, text: str = "--") -> None:
+        super().__init__(text)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.setFont(QFont("Consolas", 10))
+
+
+class VideoDebugWindow(QMainWindow):
+    def __init__(self, bind_host: str, video_port: int, pose_port: int | None) -> None:
+        super().__init__()
+        self.worker: VideoReceiverThread | None = None
+        self.video_latency_history: deque[tuple[float, float]] = deque()
+        self.pose_latency_history: deque[tuple[float, float]] = deque()
+        self.last_video_frame_id = -1
+        self.last_pose_sequence = -1
+        self.setWindowTitle("ARPose Low-Latency Video Debugger")
+        self.resize(1320, 860)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(14)
+
+        controls_box = QGroupBox("Receiver")
+        controls_layout = QGridLayout(controls_box)
+        controls_layout.setHorizontalSpacing(12)
+        controls_layout.setVerticalSpacing(10)
+        self.bind_host_edit = QLineEdit(bind_host)
+        self.video_port_edit = QLineEdit(str(video_port))
+        self.pose_port_edit = QLineEdit("" if pose_port is None else str(pose_port))
+        self.start_button = QPushButton("Start")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.status_value = LabeledValue("Idle")
+
+        controls_layout.addWidget(QLabel("Bind Host"), 0, 0)
+        controls_layout.addWidget(self.bind_host_edit, 0, 1)
+        controls_layout.addWidget(QLabel("Video Port"), 0, 2)
+        controls_layout.addWidget(self.video_port_edit, 0, 3)
+        controls_layout.addWidget(QLabel("Pose Port"), 0, 4)
+        controls_layout.addWidget(self.pose_port_edit, 0, 5)
+        controls_layout.addWidget(self.start_button, 0, 6)
+        controls_layout.addWidget(self.stop_button, 0, 7)
+        controls_layout.addWidget(QLabel("Status"), 1, 0)
+        controls_layout.addWidget(self.status_value, 1, 1, 1, 7)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        preview_column = QVBoxLayout()
+        preview_column.setSpacing(14)
+
+        preview_box = QGroupBox("Live Preview")
+        preview_layout = QVBoxLayout(preview_box)
+        self.preview_label = QLabel("No video frames yet")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumSize(860, 440)
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.preview_label.setStyleSheet(
+            "background-color: #0f1720; border: 1px solid #223040; border-radius: 14px; color: #93a9be;"
+        )
+        preview_layout.addWidget(self.preview_label)
+
+        latency_box = QGroupBox("Latency Curve")
+        latency_layout = QVBoxLayout(latency_box)
+        if pg is not None:
+            self.latency_plot = pg.PlotWidget()
+            self.latency_plot.setBackground("#111b24")
+            self.latency_plot.showGrid(x=True, y=True, alpha=0.18)
+            self.latency_plot.setMenuEnabled(False)
+            self.latency_plot.setMouseEnabled(x=False, y=False)
+            self.latency_plot.setYRange(0, 100, padding=0.05)
+            self.latency_plot.setXRange(-LATENCY_HISTORY_SECONDS, 0, padding=0.0)
+            self.latency_plot.setLabel("left", "Latency", units="ms")
+            self.latency_plot.setLabel("bottom", "Seconds Ago")
+            self.latency_plot.addLegend(offset=(12, 12))
+            self.latency_plot.getPlotItem().setClipToView(True)
+            self.latency_plot.getAxis("left").setTextPen("#9fb3c5")
+            self.latency_plot.getAxis("bottom").setTextPen("#9fb3c5")
+            self.latency_plot.getAxis("left").setPen(pg.mkPen("#38536a"))
+            self.latency_plot.getAxis("bottom").setPen(pg.mkPen("#38536a"))
+            self.latency_plot.getPlotItem().vb.setLimits(xMin=-LATENCY_HISTORY_SECONDS, xMax=0)
+            self.latency_video_curve = self.latency_plot.plot(
+                [],
+                [],
+                pen=pg.mkPen("#4db7ff", width=2),
+                name="Video",
+            )
+            self.latency_pose_curve = self.latency_plot.plot(
+                [],
+                [],
+                pen=pg.mkPen("#ffb14d", width=2),
+                name="Pose",
+            )
+            latency_layout.addWidget(self.latency_plot)
+        else:
+            self.latency_plot = None
+            self.latency_video_curve = None
+            self.latency_pose_curve = None
+            self.latency_plot_unavailable = QLabel("Latency curve needs pyqtgraph installed.")
+            self.latency_plot_unavailable.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.latency_plot_unavailable.setMinimumHeight(220)
+            self.latency_plot_unavailable.setStyleSheet(
+                "background-color: #111b24; border: 1px solid #223040; border-radius: 14px; color: #93a9be;"
+            )
+            latency_layout.addWidget(self.latency_plot_unavailable)
+
+        sidebar = QVBoxLayout()
+        sidebar.setSpacing(14)
+
+        video_box = QGroupBox("Video Metrics")
+        video_form = QFormLayout(video_box)
+        self.video_state_value = LabeledValue("Idle")
+        self.video_frame_id_value = LabeledValue("0")
+        self.video_fps_value = LabeledValue("0.0")
+        self.video_bitrate_value = LabeledValue("0.0")
+        self.video_latency_value = LabeledValue("0.0 ms")
+        self.video_decoded_value = LabeledValue("0")
+        self.video_dropped_value = LabeledValue("0")
+        self.video_keyframes_value = LabeledValue("0")
+        self.video_packets_value = LabeledValue("0")
+        self.video_bytes_value = LabeledValue("0 B")
+        for label, widget in [
+            ("State", self.video_state_value),
+            ("Frame ID", self.video_frame_id_value),
+            ("Decoded FPS", self.video_fps_value),
+            ("Bitrate", self.video_bitrate_value),
+            ("Approx Latency", self.video_latency_value),
+            ("Decoded Frames", self.video_decoded_value),
+            ("Dropped Frames", self.video_dropped_value),
+            ("Keyframes", self.video_keyframes_value),
+            ("Packets", self.video_packets_value),
+            ("Bytes", self.video_bytes_value),
+        ]:
+            video_form.addRow(label, widget)
+
+        pose_box = QGroupBox("Pose Feed")
+        pose_form = QFormLayout(pose_box)
+        self.pose_state_value = LabeledValue("Pose idle")
+        self.pose_sequence_value = LabeledValue("0")
+        self.pose_fps_value = LabeledValue("0.0")
+        self.pose_latency_value = LabeledValue("0.0 ms")
+        self.pose_drop_value = LabeledValue("0")
+        self.pose_position_value = LabeledValue("(0.000, 0.000, 0.000)")
+        for label, widget in [
+            ("State", self.pose_state_value),
+            ("Sequence", self.pose_sequence_value),
+            ("FPS", self.pose_fps_value),
+            ("Approx Latency", self.pose_latency_value),
+            ("Drops", self.pose_drop_value),
+            ("Position", self.pose_position_value),
+        ]:
+            pose_form.addRow(label, widget)
+
+        log_box = QGroupBox("Runtime Log")
+        log_layout = QVBoxLayout(log_box)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.document().setMaximumBlockCount(500)
+        log_layout.addWidget(self.log_view)
+
+        sidebar.addWidget(video_box)
+        sidebar.addWidget(pose_box)
+        sidebar.addWidget(log_box, 1)
+
+        preview_column.addWidget(preview_box, 3)
+        preview_column.addWidget(latency_box, 2)
+
+        body.addLayout(preview_column, 2)
+        body.addLayout(sidebar, 1)
+
+        root.addWidget(controls_box)
+        root.addLayout(body, 1)
+
+        self.start_button.clicked.connect(self.start_receiver)
+        self.stop_button.clicked.connect(self.stop_receiver)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#0b1218"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#e8f0f6"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#111b24"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#16232f"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#ecf3f8"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#193244"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#f5fbff"))
+        self.setPalette(palette)
+        self.setStyleSheet(
+            """
+            QWidget {
+                background-color: #0b1218;
+                color: #e8f0f6;
+                font-size: 13px;
+            }
+            QGroupBox {
+                border: 1px solid #223040;
+                border-radius: 14px;
+                margin-top: 10px;
+                padding-top: 14px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #cfe2f0;
+            }
+            QLineEdit, QPlainTextEdit {
+                background-color: #111b24;
+                border: 1px solid #2c455a;
+                border-radius: 10px;
+                padding: 8px 10px;
+                selection-background-color: #2a7db4;
+            }
+            QPushButton {
+                background-color: #1f6d9c;
+                border: none;
+                border-radius: 10px;
+                padding: 9px 16px;
+                font-weight: 600;
+            }
+            QPushButton:disabled {
+                background-color: #324452;
+                color: #9eb0bd;
+            }
+            QPushButton:hover:!disabled {
+                background-color: #2582ba;
+            }
+            """
+        )
+
+    def start_receiver(self) -> None:
+        if av is None:
+            self.append_log(f"PyAV import failed: {AV_IMPORT_ERROR}")
+            self.append_log(f"Active interpreter: {sys.executable}")
+            self.append_log(f"Install it with: {build_av_install_hint()}")
+            return
+
+        bind_host = self.bind_host_edit.text().strip() or "0.0.0.0"
+        try:
+            video_port = int(self.video_port_edit.text().strip())
+            pose_port_text = self.pose_port_edit.text().strip()
+            pose_port = int(pose_port_text) if pose_port_text else None
+        except ValueError:
+            self.append_log("Ports must be integers.")
+            return
+
+        self.worker = VideoReceiverThread(bind_host=bind_host, video_port=video_port, pose_port=pose_port)
+        self.worker.frame_ready.connect(self.update_preview)
+        self.worker.video_metrics.connect(self.update_video_metrics)
+        self.worker.pose_metrics.connect(self.update_pose_metrics)
+        self.worker.status_changed.connect(self.status_value.setText)
+        self.worker.log_message.connect(self.append_log)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+        self.reset_latency_history()
+
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.append_log(f"Starting receiver on {bind_host}:{video_port}")
+
+    def stop_receiver(self) -> None:
+        if self.worker is None:
+            return
+        self.worker.stop()
+        self.worker.wait(1500)
+
+    def on_worker_finished(self) -> None:
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.worker = None
+
+    def update_preview(self, image: QImage) -> None:
+        pixmap = QPixmap.fromImage(image)
+        scaled = pixmap.scaled(
+            self.preview_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(scaled)
+
+    def update_video_metrics(self, metrics: dict) -> None:
+        self.video_state_value.setText(str(metrics["status"]))
+        self.video_frame_id_value.setText(str(metrics["frame_id"]))
+        self.video_fps_value.setText(f"{metrics['fps']:.1f}")
+        self.video_bitrate_value.setText(f"{metrics['bitrate_mbps']:.2f} Mbps")
+        self.video_latency_value.setText(f"{metrics['latency_ms']:.1f} ms")
+        self.video_decoded_value.setText(str(metrics["decoded_frames"]))
+        self.video_dropped_value.setText(str(metrics["dropped_frames"]))
+        self.video_keyframes_value.setText(str(metrics["keyframes"]))
+        self.video_packets_value.setText(str(metrics["packets"]))
+        self.video_bytes_value.setText(self.format_bytes(int(metrics["bytes"])))
+
+        frame_id = int(metrics["frame_id"])
+        if frame_id > self.last_video_frame_id and metrics["latency_ms"] > 0:
+            self.last_video_frame_id = frame_id
+            self.append_latency_sample(self.video_latency_history, float(metrics["latency_ms"]))
+
+    def update_pose_metrics(self, metrics: dict) -> None:
+        self.pose_state_value.setText(str(metrics["status"]))
+        self.pose_sequence_value.setText(str(metrics["sequence"]))
+        self.pose_fps_value.setText(f"{metrics['fps']:.1f}")
+        self.pose_latency_value.setText(f"{metrics['latency_ms']:.1f} ms")
+        self.pose_drop_value.setText(str(metrics["drops"]))
+        self.pose_position_value.setText(str(metrics["position"]))
+
+        sequence = int(metrics["sequence"])
+        if sequence > self.last_pose_sequence and metrics["latency_ms"] > 0:
+            self.last_pose_sequence = sequence
+            self.append_latency_sample(self.pose_latency_history, float(metrics["latency_ms"]))
+
+    def append_log(self, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_view.appendPlainText(f"[{timestamp}] {message}")
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.stop_receiver()
+        super().closeEvent(event)
+
+    @staticmethod
+    def format_bytes(num_bytes: int) -> str:
+        units = ["B", "KB", "MB", "GB"]
+        value = float(num_bytes)
+        for unit in units:
+            if value < 1024.0 or unit == units[-1]:
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+            value /= 1024.0
+        return f"{num_bytes} B"
+
+    def reset_latency_history(self) -> None:
+        self.video_latency_history.clear()
+        self.pose_latency_history.clear()
+        self.last_video_frame_id = -1
+        self.last_pose_sequence = -1
+        self.refresh_latency_plot()
+
+    def append_latency_sample(self, history: deque[tuple[float, float]], latency_ms: float) -> None:
+        now = time.monotonic()
+        history.append((now, latency_ms))
+        cutoff = now - LATENCY_HISTORY_SECONDS
+        while history and history[0][0] < cutoff:
+            history.popleft()
+        self.refresh_latency_plot()
+
+    def refresh_latency_plot(self) -> None:
+        if self.latency_plot is None or self.latency_video_curve is None or self.latency_pose_curve is None:
+            return
+
+        now = time.monotonic()
+        cutoff = now - LATENCY_HISTORY_SECONDS
+
+        while self.video_latency_history and self.video_latency_history[0][0] < cutoff:
+            self.video_latency_history.popleft()
+        while self.pose_latency_history and self.pose_latency_history[0][0] < cutoff:
+            self.pose_latency_history.popleft()
+
+        video_x = [timestamp - now for timestamp, _ in self.video_latency_history]
+        video_y = [latency for _, latency in self.video_latency_history]
+        pose_x = [timestamp - now for timestamp, _ in self.pose_latency_history]
+        pose_y = [latency for _, latency in self.pose_latency_history]
+
+        self.latency_video_curve.setData(video_x, video_y)
+        self.latency_pose_curve.setData(pose_x, pose_y)
+
+        max_latency = max(video_y + pose_y, default=100.0)
+        upper_bound = max(50.0, min(max_latency * 1.25, 500.0))
+        self.latency_plot.setXRange(-LATENCY_HISTORY_SECONDS, 0, padding=0.0)
+        self.latency_plot.setYRange(0, upper_bound, padding=0.02)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Debug viewer for ARPose low-latency H.264 video over UDP.")
+    parser.add_argument("--bind", default="0.0.0.0", help="Host/IP to bind to.")
+    parser.add_argument("--video-port", type=int, default=5560, help="UDP video port to bind to.")
+    parser.add_argument("--pose-port", type=int, default=5555, help="Optional pose UDP port to bind to. Use 0 to disable.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("ARPose Low-Latency Video Debugger")
+    app.setOrganizationName("ARPoseStreamer")
+
+    if av is None:
+        print("PyAV is required for udp_video_debug_ui.py")
+        print(f"Active interpreter: {sys.executable}")
+        print(f"Import error: {AV_IMPORT_ERROR}")
+        print(f"Install it with: {build_av_install_hint()}")
+
+    pose_port = args.pose_port if args.pose_port > 0 else None
+    window = VideoDebugWindow(bind_host=args.bind, video_port=args.video_port, pose_port=pose_port)
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

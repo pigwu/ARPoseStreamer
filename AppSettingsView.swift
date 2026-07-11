@@ -29,6 +29,29 @@ struct AppSettingsView: View {
                     }
                 }
 
+                Section("Low-Latency Video") {
+                    Toggle("Enable Video Stream", isOn: $viewModel.isVideoStreamingEnabled)
+
+                    TextField("Video Port", text: $viewModel.videoPort)
+                        .keyboardType(.numberPad)
+
+                    Picker("Resolution", selection: $viewModel.videoResolution) {
+                        ForEach(VideoStreamResolution.allCases) { resolution in
+                            Text(resolution.displayName).tag(resolution)
+                        }
+                    }
+
+                    TextField("FPS", text: $viewModel.videoFrameRate)
+                        .keyboardType(.numberPad)
+
+                    TextField("Bitrate (Mbps)", text: $viewModel.videoBitrateMbps)
+                        .keyboardType(.decimalPad)
+
+                    Text("The video path uses H.264 over raw UDP with small packets for low-latency LAN debugging.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Wired Sensor") {
                     TextField("Accessory Protocol", text: $viewModel.sensorAccessoryProtocol)
                         .textInputAutocapitalization(.never)
@@ -113,7 +136,16 @@ struct AppSettingsView: View {
                             .multilineTextAlignment(.trailing)
                     }
 
+                    LabeledContent("Video") {
+                        Text(viewModel.videoTargetSummary)
+                            .multilineTextAlignment(.trailing)
+                    }
+
                     Text(viewModel.receiverPlatform.receiverCommand)
+                        .font(.footnote.monospaced())
+                        .textSelection(.enabled)
+
+                    Text(viewModel.videoReceiverCommand)
                         .font(.footnote.monospaced())
                         .textSelection(.enabled)
 

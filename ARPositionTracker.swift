@@ -64,7 +64,14 @@ final class ARPositionTracker: NSObject, ARSessionDelegate {
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        // Only use ARKit pose when tracking is stable.
+        guard case .normal = frame.camera.trackingState else {
+            return
+        }
+
         let cameraTransform = frame.camera.transform
+
+        // Set the first stable frame as the origin.
         if originTransform == nil {
             originTransform = cameraTransform
         }
@@ -94,7 +101,10 @@ final class ARPositionTracker: NSObject, ARSessionDelegate {
         let configuration = ARWorldTrackingConfiguration()
         configuration.planeDetection = []
         configuration.worldAlignment = .gravity
-        configuration.isAutoFocusEnabled = true
+
+        // Important for your gripper scenario:
+        // prevents autofocus from locking onto the nearby moving gripper.
+        configuration.isAutoFocusEnabled = false
 
         let options: ARSession.RunOptions = resetTracking
             ? [.resetTracking, .removeExistingAnchors]
@@ -109,6 +119,12 @@ final class ARPositionTracker: NSObject, ARSessionDelegate {
 
             let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
                 guard let self else { return }
+
+                // Do not send the initial zero sample before ARKit has produced a real frame.
+                guard self.latestSample.timestamp > 0 else {
+                    return
+                }
+
                 self.onFormattedSampleReady?(self.latestFormattedSample)
             }
 
@@ -129,11 +145,12 @@ final class ARPositionTracker: NSObject, ARSessionDelegate {
     }
 
     private func makePoseSample(from transform: simd_float4x4, timestamp: TimeInterval) -> CameraPoseSample {
-        let positionYUp = SIMD3(
+        let positionYUp = SIMD3<Float>(
             transform.columns.3.x,
             transform.columns.3.y,
             transform.columns.3.z
         )
+
         let orientationYUp = simd_quatf(simd_float3x3(transform))
 
         return CameraPoseSample(
@@ -144,19 +161,25 @@ final class ARPositionTracker: NSObject, ARSessionDelegate {
     }
 
     private func convertPositionToZUp(_ position: SIMD3<Float>) -> SIMD3<Float> {
-        SIMD3(position.x, -position.z, position.y)
+        SIMD3<Float>(position.x, -position.z, position.y)
     }
 
     private func convertQuaternionToZUp(_ quaternion: simd_quatf) -> simd_quatf {
         let alignmentMatrix = simd_float3x3(zUpAlignment)
         let rotationYUp = simd_float3x3(quaternion)
-        let converted = simd_mul(alignmentMatrix, simd_mul(rotationYUp, simd_transpose(alignmentMatrix)))
+
+        let converted = simd_mul(
+            alignmentMatrix,
+            simd_mul(rotationYUp, simd_transpose(alignmentMatrix))
+        )
+
         return normalizedQuaternion(simd_quatf(converted))
     }
 
     private func normalizedQuaternion(_ quaternion: simd_quatf) -> simd_quatf {
         let vector = quaternion.vector
         let norm = simd_length(vector)
+
         guard norm.isFinite, norm > 1e-6 else {
             return simd_quatf(angle: 0, axis: SIMD3<Float>(1, 0, 0))
         }

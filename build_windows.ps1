@@ -15,34 +15,43 @@ if ($LASTEXITCODE -ne 0) {
 function Build-DesktopTool {
     param(
         [Parameter(Mandatory=$true)] [string] $Name,
-        [Parameter(Mandatory=$true)] [string] $EntryPoint
+        [Parameter(Mandatory=$true)] [string] $EntryPoint,
+        [string[]] $ExtraArgs = @()
     )
 
     Write-Host "`nBuilding $Name..."
-    pyinstaller --name $Name `
-        --clean `
-        --windowed `
-        --onefile `
-        --icon=Assets.xcassets/AppIcon.appiconset/Icon-1024.png `
-        --add-data "requirements_visualizer.txt;." `
-        --hidden-import="OpenGL" `
-        --hidden-import="OpenGL.GL" `
-        --hidden-import="OpenGL.GLU" `
-        --hidden-import="OpenGL.GLUT" `
-        --hidden-import="pyqtgraph.opengl" `
-        --exclude-module PyQt5 `
-        --exclude-module PySide2 `
-        --exclude-module PySide6 `
-        --exclude-module torch `
-        --exclude-module pandas `
-        --exclude-module matplotlib `
-        --exclude-module IPython `
-        --exclude-module jupyter `
-        --exclude-module notebook `
-        --exclude-module sympy `
-        --exclude-module PIL `
-        --exclude-module tkinter `
-        $EntryPoint
+    $arguments = @(
+        "--name", $Name,
+        "--clean",
+        "--windowed",
+        "--onefile",
+        "--icon=Assets.xcassets/AppIcon.appiconset/Icon-1024.png",
+        "--add-data", "requirements_visualizer.txt;.",
+        "--hidden-import=OpenGL",
+        "--hidden-import=OpenGL.GL",
+        "--hidden-import=OpenGL.GLU",
+        "--hidden-import=OpenGL.GLUT",
+        "--hidden-import=pyqtgraph.opengl",
+        "--exclude-module", "PyQt5",
+        "--exclude-module", "PySide2",
+        "--exclude-module", "PySide6",
+        "--exclude-module", "torch",
+        "--exclude-module", "pandas",
+        "--exclude-module", "matplotlib",
+        "--exclude-module", "IPython",
+        "--exclude-module", "jupyter",
+        "--exclude-module", "notebook",
+        "--exclude-module", "sympy",
+        "--exclude-module", "PIL",
+        "--exclude-module", "tkinter"
+    )
+
+    if ($ExtraArgs.Count -gt 0) {
+        $arguments += $ExtraArgs
+    }
+
+    $arguments += $EntryPoint
+    pyinstaller @arguments
 
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed while building $Name"
@@ -55,6 +64,7 @@ Build-DesktopTool -Name "ARPose Tracking Validator" -EntryPoint "pose_tracking_v
 Build-DesktopTool -Name "ARPose Packet Loss Monitor" -EntryPoint "udp_packet_loss_monitor.py"
 Build-DesktopTool -Name "ARPose Zarr Exporter" -EntryPoint "zarr_exporter_ui.py"
 Build-DesktopTool -Name "AnySkin UDP Monitor" -EntryPoint "anyskin_udp_monitor.py"
+Build-DesktopTool -Name "ARPose Video Debugger" -EntryPoint "udp_video_debug_ui.py" -ExtraArgs @("--collect-all", "av")
 
 Write-Host "`nBuild complete!"
 Write-Host "Executable locations:"
@@ -63,4 +73,5 @@ Write-Host "  dist\ARPose Tracking Validator.exe"
 Write-Host "  dist\ARPose Packet Loss Monitor.exe"
 Write-Host "  dist\ARPose Zarr Exporter.exe"
 Write-Host "  dist\AnySkin UDP Monitor.exe"
+Write-Host "  dist\ARPose Video Debugger.exe"
 Write-Host "`nYou can now run the application by double-clicking the .exe file"

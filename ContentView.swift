@@ -142,6 +142,10 @@ private struct BottomDashboard: View {
                 AxisCard(axis: "Z", value: viewModel.formattedValue(for: viewModel.position.z))
             }
 
+            if viewModel.hasVideoStreamingEnabled {
+                VideoMetricsRow(viewModel: viewModel)
+            }
+
             if viewModel.showPositionChart {
                 Trajectory3DView(samples: viewModel.positionHistory)
                     .frame(height: 120)
@@ -183,6 +187,10 @@ private struct StatusStrip: View {
                 StatusChip(text: "Sensor", isActive: true)
             }
 
+            if viewModel.hasVideoStreamingEnabled {
+                StatusChip(text: viewModel.videoStatus, isActive: viewModel.videoStatus == "Video streaming")
+            }
+
             if viewModel.uploadDetails.isActive {
                 StatusChip(text: "Upload \(viewModel.uploadDetails.completedFiles)/\(viewModel.uploadDetails.totalFiles)", isActive: true)
             } else if viewModel.uploadStatus != "Upload idle" {
@@ -190,6 +198,19 @@ private struct StatusStrip: View {
             }
 
             Spacer(minLength: 0)
+        }
+    }
+}
+
+private struct VideoMetricsRow: View {
+    @ObservedObject var viewModel: PositionViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            CompactMetricCard(label: "Enc FPS", value: viewModel.videoEncodedFPSText)
+            CompactMetricCard(label: "Send FPS", value: viewModel.videoSentFPSText)
+            CompactMetricCard(label: "Mbps", value: viewModel.videoBitrateText)
+            CompactMetricCard(label: "Drops", value: viewModel.videoDroppedFramesText)
         }
     }
 }
@@ -355,6 +376,28 @@ private struct AxisCard: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 10)
         .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct CompactMetricCard: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.62))
+
+            Text(value)
+                .font(.subheadline.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 

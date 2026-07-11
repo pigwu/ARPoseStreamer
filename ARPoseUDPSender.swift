@@ -68,6 +68,8 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     var onRecordingStatusChange: ((VideoRecordingStatus) -> Void)?
     var onCaptureSessionSaved: ((PoseCaptureArtifact) -> Void)?
     var onTrackingStatusChange: ((String) -> Void)?
+    var onVideoStateChange: ((String) -> Void)?
+    var onVideoStatsChange: ((LowLatencyVideoStats) -> Void)?
 
     private let coordinateSystem: CoordinateSystem
     private let payloadEncoding: PayloadEncoding
@@ -77,9 +79,11 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     private let zUpAlignment = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0))
     private let videoRecorder = ARSessionVideoRecorder()
     private let poseSessionRecorder = PoseDataSessionRecorder()
+    private let videoSender: ARLowLatencyVideoSender
 
     private var host: NWEndpoint.Host
     private var port: NWEndpoint.Port
+    private var videoConfiguration: LowLatencyVideoConfiguration
     private var connection: NWConnection?
     private var originTransform: simd_float4x4?
     private var lastSentTimestamp: TimeInterval = -.infinity
@@ -96,7 +100,8 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         hostIP: String,
         port: UInt16 = 5555,
         coordinateSystem: CoordinateSystem = .zUpRightHanded,
-        payloadEncoding: PayloadEncoding = .binaryFloat32
+        payloadEncoding: PayloadEncoding = .binaryFloat32,
+        videoConfiguration: LowLatencyVideoConfiguration = .defaults
     ) {
         guard let udpPort = NWEndpoint.Port(rawValue: port) else {
             return nil
@@ -106,10 +111,21 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         self.port = udpPort
         self.coordinateSystem = coordinateSystem
         self.payloadEncoding = payloadEncoding
+        self.videoConfiguration = videoConfiguration
+        self.videoSender = ARLowLatencyVideoSender(configuration: videoConfiguration)
 
         super.init()
 
         session.delegate = self
+        videoSender.onStateChange = { [weak self] state in
+            self?.onVideoStateChange?(state)
+        }
+        videoSender.onStatsChange = { [weak self] stats in
+            self?.onVideoStatsChange?(stats)
+        }
+        videoSender.onError = { [weak self] error in
+            self?.onError?(error)
+        }
         videoRecorder.onStatusChange = { [weak self] status in
             self?.arQueue.async {
                 guard let self else { return }
@@ -153,6 +169,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         arQueue.async { [weak self] in
             guard let self else { return }
             self.isStreamingEnabled = true
+            self.videoSender.startStreaming()
             self.startSessionIfNeeded()
         }
     }
@@ -171,6 +188,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         arQueue.async { [weak self] in
             guard let self else { return }
             self.isStreamingEnabled = false
+            self.videoSender.stopStreaming()
             if !self.isRecordingEnabled {
                 self.finishPoseSessionIfNeeded()
                 self.pauseSessionIfNeeded()
@@ -198,6 +216,24 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             self.connection = nil
             self.isConnectionReady = false
             self.connectUDP()
+        }
+    }
+
+    func updateVideoStreamingConfiguration(_ configuration: LowLatencyVideoConfiguration) {
+        arQueue.async { [weak self] in
+            guard let self else { return }
+
+            let needsSessionRestart =
+                self.videoConfiguration.resolution != configuration.resolution ||
+                self.videoConfiguration.frameRate != configuration.frameRate
+
+            self.videoConfiguration = configuration
+            self.videoSender.updateConfiguration(configuration)
+
+            if needsSessionRestart, self.isSessionRunning, !self.isRecordingEnabled {
+                self.pauseSessionIfNeeded()
+                self.startSessionIfNeeded()
+            }
         }
     }
 
@@ -299,28 +335,14 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         let formats = ARWorldTrackingConfiguration.supportedVideoFormats
         guard !formats.isEmpty else { return nil }
 
-        let exact60 = formats
-            .filter { $0.framesPerSecond == 60 }
-            .sorted {
-                let lhsPixels = $0.imageResolution.width * $0.imageResolution.height
-                let rhsPixels = $1.imageResolution.width * $1.imageResolution.height
-                return lhsPixels < rhsPixels
-            }
+        let targetFPS = videoConfiguration.clampedFrameRate
+        let targetResolution = videoConfiguration.resolution.dimensions
+        let targetPixels = targetResolution.width * targetResolution.height
 
-        if let best60 = exact60.first {
-            return best60
+        return formats.min { lhs, rhs in
+            Self.videoFormatScore(lhs, targetFPS: targetFPS, targetPixels: targetPixels)
+                < Self.videoFormatScore(rhs, targetFPS: targetFPS, targetPixels: targetPixels)
         }
-
-        let bestAvailableFPS = formats.map(\.framesPerSecond).max() ?? 60
-        let fallback = formats
-            .filter { $0.framesPerSecond == bestAvailableFPS }
-            .sorted {
-                let lhsPixels = $0.imageResolution.width * $0.imageResolution.height
-                let rhsPixels = $1.imageResolution.width * $1.imageResolution.height
-                return lhsPixels < rhsPixels
-            }
-
-        return fallback.first ?? formats.first
     }
 
     private func connectUDP(port: NWEndpoint.Port? = nil) {
@@ -370,6 +392,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         arQueue.async { [weak self] in
             guard let self else { return }
             self.isSessionRunning = false
+            self.videoSender.stopStreaming()
             self.videoRecorder.cancelRecording(reason: "AR session failed: \(error.localizedDescription)")
             self.reportTrackingStatus("AR failed: \(error.localizedDescription)")
         }
@@ -379,6 +402,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         arQueue.async { [weak self] in
             guard let self else { return }
             self.isSessionRunning = false
+            self.videoSender.stopStreaming()
             self.videoRecorder.cancelRecording(reason: "AR session interrupted")
             self.reportTrackingStatus("AR interrupted")
         }
@@ -389,6 +413,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             guard let self else { return }
             self.isSessionRunning = false
             if self.isStreamingEnabled || self.isRecordingEnabled {
+                if self.isStreamingEnabled {
+                    self.videoSender.startStreaming()
+                }
                 self.startSessionIfNeeded()
             } else {
                 self.reportTrackingStatus("AR interruption ended")
@@ -433,6 +460,14 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         if isRecordingEnabled {
             poseSessionRecorder.markVideoStarted(frameTimestamp: frameTimestamp)
             videoRecorder.appendFrame(pixelBuffer: pixelBuffer, at: presentationTime)
+        }
+
+        if isStreamingEnabled && videoConfiguration.isEnabled {
+            videoSender.appendFrame(
+                pixelBuffer: pixelBuffer,
+                presentationTimeStamp: presentationTime,
+                captureTimestamp: sample.timestamp
+            )
         }
 
         guard isStreamingEnabled else { return }
@@ -520,6 +555,17 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.onTrackingStatusChange?(message)
         }
+    }
+
+    private static func videoFormatScore(
+        _ format: ARConfiguration.VideoFormat,
+        targetFPS: Int,
+        targetPixels: Int
+    ) -> Int {
+        let fpsDelta = abs(format.framesPerSecond - targetFPS)
+        let pixels = format.imageResolution.width * format.imageResolution.height
+        let pixelDelta = abs(pixels - targetPixels)
+        return fpsDelta * 10_000_000 + pixelDelta
     }
 
     private static func trackingDescription(for state: ARCamera.TrackingState) -> String {

@@ -30,6 +30,7 @@ targets:
       - path: CaptureHistoryView.swift
       - path: PositionViewModel.swift
       - path: ARPoseUDPSender.swift
+      - path: ARLowLatencyVideoSender.swift
       - path: WiredSensorPoseBridge.swift
       - path: SensorPoseStreamRecorder.swift
       - path: ARSessionVideoRecorder.swift

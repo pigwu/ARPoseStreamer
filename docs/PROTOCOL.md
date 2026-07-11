@@ -55,6 +55,42 @@ If you change the sender to ARKit-native output, update the documentation and th
 - the sequence field helps detect drops
 - the sender timestamp can be used for rough latency estimation when clocks are reasonably aligned
 
+## Low-Latency Video Stream
+
+The optional low-latency video stream uses a second UDP port, default `5560`, and carries H.264 NAL units without MP4/RTSP/WebRTC container overhead.
+
+Packet header layout:
+
+1. `magic` as ASCII `APV1`
+2. `version` as `UInt8`
+3. `flags` as `UInt8`
+4. `reserved` as `UInt16`
+5. `frame_id` as `UInt32`
+6. `capture_timestamp` as `Float64`
+7. `nalu_index` as `UInt16`
+8. `nalu_count` as `UInt16`
+9. `fragment_index` as `UInt16`
+10. `fragment_count` as `UInt16`
+11. `payload` as raw H.264 NAL bytes
+
+Header size:
+
+```text
+28 bytes
+```
+
+Flags:
+
+- bit `0`: key frame
+- bit `1`: packet belongs to an SPS/PPS parameter set
+
+Sender behavior:
+
+- target packet size is `<= 1200` bytes to avoid IP fragmentation
+- H.264 is encoded with `VideoToolbox` in real-time mode with frame reordering disabled
+- SPS/PPS is repeated on each key frame so receivers can recover quickly after packet loss
+- dropped packets are not retransmitted; the receiver should prefer dropping an incomplete frame over building up latency
+
 ## Wired Sensor Mirror
 
 The iPhone app can also mirror a supported wired sensor stream to the host for validation.
