@@ -110,7 +110,7 @@ private struct CaptureRecordCard: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!videoFileState.canUpload || isUploading)
 
-                Button("Upload Pose") {
+                Button("Upload Data") {
                     onUploadPose()
                 }
                 .buttonStyle(.bordered)
@@ -149,9 +149,11 @@ private struct CaptureRecordCard: View {
             return videoFileState.statusText
         case .pose:
             if let date = record.poseUploadedAt {
-                return "Pose uploaded before: \(date.formatted(date: .abbreviated, time: .shortened))"
+                return "Capture data uploaded before: \(date.formatted(date: .abbreviated, time: .shortened))"
             }
-            return "Pose: not uploaded yet"
+            return record.magneticCSVFileName == nil
+                ? "Pose data: not uploaded yet"
+                : "Pose + magnetic data: not uploaded yet"
         }
     }
 

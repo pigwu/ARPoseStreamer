@@ -52,6 +52,7 @@ struct CaptureRecord: Identifiable, Codable, Hashable {
     var displayName: String
     let sessionDirectoryName: String
     let poseCSVFileName: String
+    let magneticCSVFileName: String?
     let manifestFileName: String
     let videoFileName: String?
     var videoUploadedAt: Date?
@@ -94,6 +95,7 @@ final class CaptureLibraryStore {
             displayName: artifact.sessionDirectoryURL.lastPathComponent,
             sessionDirectoryName: artifact.sessionDirectoryURL.lastPathComponent,
             poseCSVFileName: artifact.poseCSVURL.lastPathComponent,
+            magneticCSVFileName: artifact.magneticCSVURL?.lastPathComponent,
             manifestFileName: artifact.manifestURL.lastPathComponent,
             videoFileName: artifact.videoURL?.lastPathComponent,
             videoUploadedAt: nil,
@@ -138,6 +140,11 @@ final class CaptureLibraryStore {
 
     func urlForManifest(record: CaptureRecord) -> URL {
         Self.captureDirectory(for: record).appendingPathComponent(record.manifestFileName)
+    }
+
+    func urlForMagneticCSV(record: CaptureRecord) -> URL? {
+        guard let magneticCSVFileName = record.magneticCSVFileName else { return nil }
+        return Self.captureDirectory(for: record).appendingPathComponent(magneticCSVFileName)
     }
 
     func urlForVideo(record: CaptureRecord) -> URL? {
@@ -212,6 +219,7 @@ final class CaptureLibraryStore {
 
         return .available(url, fileSize)
     }
+
 }
 
 private extension ByteCountFormatter {

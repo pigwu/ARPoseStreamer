@@ -2,12 +2,13 @@
 
 ## Overview
 
-ARPoseStreamer has two main parts:
+ARPoseStreamer has three cooperating parts:
 
-1. iPhone sender
-2. Host receiver
+1. optional Wi-Fi magnetic sensor board
+2. iPhone capture gateway
+3. optional host receiver
 
-The sender runs ARKit on iPhone and transmits compact pose packets over UDP. The receiver runs on macOS or Windows and prints or logs those packets.
+The iPhone always remains the capture authority. It runs ARKit, receives optional magnetic samples from a board on the phone hotspot, records locally, and forwards combined data only while a computer is registered. The computer is not required during capture.
 
 ## Data Flow
 
@@ -25,6 +26,15 @@ UDP send
 Python receiver
     ->
 terminal / CSV / downstream pipeline
+```
+
+Hotspot magnetic flow:
+
+```text
+optional board -- ASKN UDP 5557 --> iPhone gateway
+ARKit pose -----------------------> timestamp-preserving mux
+                                      |-> local pose/magnetic/video capture
+                                      `-> APM1 UDP 5558 when a PC is registered
 ```
 
 ## iPhone Side
@@ -47,6 +57,10 @@ Responsibilities:
 - optionally record camera video to a local MP4 file
 - store pose CSV and capture manifest for offline export
 - register each capture in a persistent local history library
+- receive five-chip ASKN magnetic samples from the hotspot DHCP gateway path
+- keep magnetic input optional so pose/video operation never waits for a board
+- multiplex pose and zero or more magnetic samples into APM1 packets
+- discover an optional computer through `PC_HELLO` heartbeats on UDP `5559`
 
 ## Host Side
 
@@ -54,6 +68,7 @@ Primary file:
 
 - `udp_pose_receiver.py`
 - `capture_upload_server.py`
+- `pose_magnetic_receiver.py`
 
 Responsibilities:
 
@@ -62,6 +77,7 @@ Responsibilities:
 - show stream rate and packet-drop hints
 - optionally log incoming pose to CSV
 - receive uploaded capture files over HTTP
+- register with the phone and persist combined pose/magnetic live data
 
 ## Design Goals
 

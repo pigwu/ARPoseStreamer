@@ -92,6 +92,13 @@ struct PositionHistorySample: Identifiable {
     let z: Double
 }
 
+struct MagneticHistorySample: Identifiable {
+    let id = UUID()
+    let timestamp: TimeInterval
+    let sequence: UInt32
+    let magnitudes: [Double]
+}
+
 struct ReuploadPrompt: Identifiable {
     let id = UUID()
     let recordID: UUID
@@ -155,6 +162,42 @@ final class PositionViewModel: ObservableObject {
     @Published var sensorAccessoryProtocol: String {
         didSet { UserDefaults.standard.set(sensorAccessoryProtocol, forKey: Self.sensorAccessoryProtocolKey) }
     }
+    @Published var magneticListenPort: String {
+        didSet {
+            UserDefaults.standard.set(magneticListenPort, forKey: Self.magneticListenPortKey)
+            applyMagneticConfigurationIfNeeded()
+        }
+    }
+    @Published var computerRegistrationPort: String {
+        didSet {
+            UserDefaults.standard.set(computerRegistrationPort, forKey: Self.computerRegistrationPortKey)
+            applyMagneticConfigurationIfNeeded()
+        }
+    }
+    @Published var combinedStreamPort: String {
+        didSet { UserDefaults.standard.set(combinedStreamPort, forKey: Self.combinedStreamPortKey) }
+    }
+    @Published var autoStartMagneticSensor: Bool {
+        didSet {
+            UserDefaults.standard.set(autoStartMagneticSensor, forKey: Self.autoStartMagneticSensorKey)
+            if autoStartMagneticSensor {
+                startMagneticSensor()
+            }
+        }
+    }
+    @Published var selectedMagneticChip: Int {
+        didSet {
+            let normalized = min(max(selectedMagneticChip, 0), MagneticSensorSample.chipCount - 1)
+            if normalized != selectedMagneticChip {
+                selectedMagneticChip = normalized
+                return
+            }
+            UserDefaults.standard.set(selectedMagneticChip, forKey: Self.selectedMagneticChipKey)
+        }
+    }
+    @Published var showMagneticChart: Bool {
+        didSet { UserDefaults.standard.set(showMagneticChart, forKey: Self.showMagneticChartKey) }
+    }
     @Published var receiverPlatform: ReceiverPlatform {
         didSet { UserDefaults.standard.set(receiverPlatform.rawValue, forKey: Self.receiverPlatformKey) }
     }
@@ -195,14 +238,23 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var position: SIMD3<Float> = .zero
     @Published private(set) var sensorPosition: SIMD3<Float> = .zero
     @Published private(set) var positionHistory: [PositionHistorySample] = []
+    @Published private(set) var magneticHistory: [MagneticHistorySample] = []
+    @Published private(set) var latestMagneticChips: [MagneticSensorChipValues] = Array(
+        repeating: MagneticSensorChipValues(t: 0, x: 0, y: 0, z: 0),
+        count: MagneticSensorSample.chipCount
+    )
     @Published private(set) var sendStatus = "Idle"
     @Published private(set) var sensorStatus = "Sensor idle"
+    @Published private(set) var magneticStatus = "Magnetic sensor idle"
+    @Published private(set) var computerGatewayStatus = "Computer offline; recording locally"
     @Published private(set) var uploadStatus = "Upload idle"
     @Published private(set) var trackingStatus = "AR tracking idle"
     @Published private(set) var uploadDetails = UploadStatusViewState()
     @Published private(set) var latestPacketSummary = "No packets yet"
     @Published private(set) var latestSensorSummary = "No sensor packets yet"
+    @Published private(set) var latestMagneticSummary = "No magnetic packets yet"
     @Published private(set) var wiredSensorStats = WiredSensorStatsViewState()
+    @Published private(set) var magneticStats = MagneticGatewayStats()
     @Published private(set) var videoStatus = "Video off"
     @Published private(set) var videoStats = VideoStreamStatsViewState.idle
     @Published private(set) var connectedAccessories: [WiredSensorAccessoryInfo] = []
@@ -210,6 +262,8 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var recordingPhase = VideoRecordingStatus.idle
     @Published private(set) var isSending = false
     @Published private(set) var isSensorStreaming = false
+    @Published private(set) var isMagneticListening = false
+    @Published private(set) var isComputerConnected = false
     @Published private(set) var isRecordingVideo = false
     @Published private(set) var lastSavedVideoURL: URL?
     @Published private(set) var lastSavedVideoName = "No saved video yet"
@@ -220,11 +274,13 @@ final class PositionViewModel: ObservableObject {
     @Published var pendingReuploadPrompt: ReuploadPrompt?
 
     private let maxHistorySamples = 120
+    private let maxMagneticHistorySamples = 160
     private let captureLibraryStore = CaptureLibraryStore()
     private let captureUploadService = CaptureUploadService()
     private let sensorRecorder = SensorPoseStreamRecorder()
     private var sender: ARPoseUDPSender?
     private var sensorBridge: WiredSensorPoseBridge?
+    private var magneticGateway: MagneticSensorHotspotGateway?
 
     var previewSession: ARSession? {
         sender?.session
@@ -291,6 +347,46 @@ final class PositionViewModel: ObservableObject {
         "Wired sensor mirror at \(hostIP):\(sensorPort)"
     }
 
+    var magneticListenSummary: String {
+        "Phone hotspot gateway listens on UDP \(magneticListenPort)"
+    }
+
+    var combinedReceiverCommand: String {
+        let port = normalizedPort(combinedStreamPort) ?? 5558
+        let registrationPort = normalizedPort(computerRegistrationPort) ?? 5559
+        switch receiverPlatform {
+        case .macOS:
+            return "python3 pose_magnetic_receiver.py --port \(port) --phone-ip 172.20.10.1 --registration-port \(registrationPort)"
+        case .windows:
+            return "py pose_magnetic_receiver.py --port \(port) --phone-ip 172.20.10.1 --registration-port \(registrationPort)"
+        }
+    }
+
+    var magneticReceiveRateText: String {
+        String(format: "%.1f", magneticStats.receiveRateHz)
+    }
+
+    var magneticLossText: String {
+        String(format: "%.2f%%", magneticStats.lossPercent)
+    }
+
+    var magneticSequenceText: String {
+        magneticStats.lastSequence.map { String($0) } ?? "--"
+    }
+
+    var selectedMagneticValues: MagneticSensorChipValues {
+        guard latestMagneticChips.indices.contains(selectedMagneticChip) else {
+            return MagneticSensorChipValues(t: 0, x: 0, y: 0, z: 0)
+        }
+        return latestMagneticChips[selectedMagneticChip]
+    }
+
+    var selectedMagneticMagnitudeText: String {
+        let value = selectedMagneticValues
+        let magnitude = sqrt(Double(value.x * value.x + value.y * value.y + value.z * value.z))
+        return String(format: "%.3f", magnitude)
+    }
+
     init() {
         let defaults = UserDefaults.standard
         hostIP = defaults.string(forKey: Self.hostIPKey) ?? "192.168.1.10"
@@ -298,19 +394,29 @@ final class PositionViewModel: ObservableObject {
         uploadPort = defaults.string(forKey: Self.uploadPortKey) ?? "8000"
         sensorPort = defaults.string(forKey: Self.sensorPortKey) ?? "5556"
         sensorAccessoryProtocol = defaults.string(forKey: Self.sensorAccessoryProtocolKey) ?? "com.example.sensor.pose"
+        magneticListenPort = defaults.string(forKey: Self.magneticListenPortKey) ?? "5557"
+        computerRegistrationPort = defaults.string(forKey: Self.computerRegistrationPortKey) ?? "5559"
+        combinedStreamPort = defaults.string(forKey: Self.combinedStreamPortKey) ?? "5558"
+        autoStartMagneticSensor = Self.storedBool(defaults, key: Self.autoStartMagneticSensorKey, fallback: true)
+        selectedMagneticChip = min(
+            max(defaults.integer(forKey: Self.selectedMagneticChipKey), 0),
+            MagneticSensorSample.chipCount - 1
+        )
+        showMagneticChart = Self.storedBool(defaults, key: Self.showMagneticChartKey, fallback: true)
         receiverPlatform = ReceiverPlatform(rawValue: defaults.string(forKey: Self.receiverPlatformKey) ?? ReceiverPlatform.macOS.rawValue) ?? .macOS
-        isVideoStreamingEnabled = defaults.object(forKey: Self.isVideoStreamingEnabledKey) as? Bool ?? false
+        isVideoStreamingEnabled = Self.storedBool(defaults, key: Self.isVideoStreamingEnabledKey, fallback: false)
         videoPort = defaults.string(forKey: Self.videoPortKey) ?? "5560"
         videoFrameRate = defaults.string(forKey: Self.videoFrameRateKey) ?? "60"
         videoBitrateMbps = defaults.string(forKey: Self.videoBitrateKey) ?? "6.0"
         videoResolution = VideoStreamResolution(rawValue: defaults.string(forKey: Self.videoResolutionKey) ?? VideoStreamResolution.hd720p.rawValue) ?? .hd720p
-        showPositionChart = defaults.object(forKey: Self.showPositionChartKey) as? Bool ?? true
+        showPositionChart = Self.storedBool(defaults, key: Self.showPositionChartKey, fallback: true)
         captureRecords = captureLibraryStore.loadRecords().sorted { $0.createdAt > $1.createdAt }
         videoStatus = isVideoStreamingEnabled ? "Video ready" : "Video off"
         videoStats = VideoStreamStatsViewState()
         videoStats.state = videoStatus
 
         configureSender()
+        configureMagneticGateway()
         refreshConnectedAccessories()
     }
 
@@ -331,6 +437,10 @@ final class PositionViewModel: ObservableObject {
             sender?.updateVideoStreamingConfiguration(makeVideoConfiguration())
         }
 
+        startMagneticSensor()
+        if !isRecordingVideo {
+            magneticGateway?.resetStreamSession()
+        }
         sender?.start()
         isSending = true
         if isVideoStreamingEnabled {
@@ -385,6 +495,31 @@ final class PositionViewModel: ObservableObject {
         sensorStatus = "Sensor idle"
     }
 
+    func startMagneticSensor() {
+        guard
+            let listenPort = normalizedPort(magneticListenPort),
+            let registrationPort = normalizedPort(computerRegistrationPort)
+        else {
+            magneticStatus = "Invalid magnetic or computer registration port"
+            return
+        }
+
+        if magneticGateway == nil {
+            configureMagneticGateway()
+        }
+
+        magneticGateway?.start(sensorPort: listenPort, computerPort: registrationPort)
+        magneticStatus = "Starting hotspot magnetic listener"
+    }
+
+    func stopMagneticSensor() {
+        magneticGateway?.stop()
+        isMagneticListening = false
+        isComputerConnected = false
+        magneticStatus = "Magnetic sensor idle"
+        computerGatewayStatus = "Computer offline; recording locally"
+    }
+
     func startRecording() {
         guard canStartRecording else { return }
 
@@ -392,6 +527,8 @@ final class PositionViewModel: ObservableObject {
             configureSender()
         }
 
+        startMagneticSensor()
+        magneticGateway?.resetStreamSession()
         sender?.startRecording()
     }
 
@@ -418,6 +555,10 @@ final class PositionViewModel: ObservableObject {
             stopWiredSensor()
         }
 
+        if isMagneticListening {
+            stopMagneticSensor()
+        }
+
         sender?.stopPreview()
     }
 
@@ -428,6 +569,9 @@ final class PositionViewModel: ObservableObject {
 
         sender?.updateVideoStreamingConfiguration(makeVideoConfiguration())
         sender?.startPreview()
+        if autoStartMagneticSensor {
+            startMagneticSensor()
+        }
     }
 
     func deactivatePreviewIfPossible() {
@@ -475,7 +619,7 @@ final class PositionViewModel: ObservableObject {
             pendingReuploadPrompt = ReuploadPrompt(
                 recordID: record.id,
                 kind: .pose,
-                title: "Pose data already uploaded",
+                title: "Capture data already uploaded",
                 previousUploadDate: previousUploadDate
             )
         } else {
@@ -509,10 +653,16 @@ final class PositionViewModel: ObservableObject {
             }
             descriptors = [UploadDescriptor(fileURL: videoURL, component: "video")]
         case .pose:
-            descriptors = [
-                UploadDescriptor(fileURL: captureLibraryStore.urlForPoseCSV(record: record), component: "pose_csv"),
-                UploadDescriptor(fileURL: captureLibraryStore.urlForManifest(record: record), component: "manifest")
+            var dataDescriptors = [
+                UploadDescriptor(fileURL: captureLibraryStore.urlForPoseCSV(record: record), component: "pose_csv")
             ]
+            if let magneticURL = captureLibraryStore.urlForMagneticCSV(record: record) {
+                dataDescriptors.append(UploadDescriptor(fileURL: magneticURL, component: "magnetic_csv"))
+            }
+            dataDescriptors.append(
+                UploadDescriptor(fileURL: captureLibraryStore.urlForManifest(record: record), component: "manifest")
+            )
+            descriptors = dataDescriptors
         }
 
         guard let baseURL = URL(string: "http://\(hostIP):\(uploadPort)") else {
@@ -521,7 +671,7 @@ final class PositionViewModel: ObservableObject {
         }
 
         uploadingRecordIDs.insert(record.id)
-        uploadStatus = "Uploading \(kind == .video ? "video" : "pose") for \(record.displayName)..."
+        uploadStatus = "Uploading \(kind == .video ? "video" : "capture data") for \(record.displayName)..."
         uploadDetails = UploadStatusViewState(
             currentFileName: descriptors.first?.fileURL.lastPathComponent ?? "",
             currentComponent: descriptors.first?.component ?? "",
@@ -547,7 +697,7 @@ final class PositionViewModel: ObservableObject {
                                 totalFiles: snapshot.totalFiles,
                                 savedPaths: self.uploadDetails.savedPaths + (snapshot.savedTo.map { [$0] } ?? [])
                             )
-                            let kindLabel = kind == .video ? "video" : "pose"
+                            let kindLabel = kind == .video ? "video" : "capture data"
                             self.uploadStatus = "Uploading \(kindLabel) for \(record.displayName): \(snapshot.completedFiles)/\(snapshot.totalFiles)"
                         }
                     }
@@ -567,7 +717,7 @@ final class PositionViewModel: ObservableObject {
                         savedPaths: savedPaths
                     )
                     let suffix = savedPaths.last.map { " -> \($0)" } ?? ""
-                    uploadStatus = "Uploaded \(kind == .video ? "video" : "pose") for \(record.displayName)\(suffix)"
+                    uploadStatus = "Uploaded \(kind == .video ? "video" : "capture data") for \(record.displayName)\(suffix)"
                 }
             } catch {
                 await MainActor.run {
@@ -676,6 +826,8 @@ final class PositionViewModel: ObservableObject {
                 }
             }
         }
+
+        wirePoseToMagneticGateway()
     }
 
     private func configureSensorBridge(port: UInt16) {
@@ -750,6 +902,124 @@ final class PositionViewModel: ObservableObject {
         }
     }
 
+    private func configureMagneticGateway() {
+        let gateway = MagneticSensorHotspotGateway()
+        magneticGateway = gateway
+        bindMagneticGatewayCallbacks()
+        wirePoseToMagneticGateway()
+    }
+
+    private func bindMagneticGatewayCallbacks() {
+        guard let gateway = magneticGateway else { return }
+        let currentSender = sender
+        var lastUIPublishTime: TimeInterval = 0
+
+        gateway.onSampleReceived = { [weak currentSender, weak self] sample in
+            currentSender?.appendMagneticSample(sample)
+
+            guard sample.receivedMonotonicTime - lastUIPublishTime >= 0.05 else { return }
+            lastUIPublishTime = sample.receivedMonotonicTime
+            Task { @MainActor [weak self] in
+                self?.updateMagneticUI(with: sample)
+            }
+        }
+
+        gateway.onSensorStatusChanged = { [weak self] status in
+            Task { @MainActor [weak self] in
+                self?.magneticStatus = status
+            }
+        }
+
+        gateway.onComputerStatusChanged = { [weak self] status in
+            Task { @MainActor [weak self] in
+                self?.computerGatewayStatus = status
+            }
+        }
+
+        gateway.onComputerAvailabilityChanged = { [weak self] isAvailable in
+            Task { @MainActor [weak self] in
+                self?.isComputerConnected = isAvailable
+            }
+        }
+
+        gateway.onListeningChanged = { [weak self] isListening in
+            Task { @MainActor [weak self] in
+                self?.isMagneticListening = isListening
+            }
+        }
+
+        gateway.onStatsChanged = { [weak self] stats in
+            Task { @MainActor [weak self] in
+                self?.magneticStats = stats
+            }
+        }
+
+        gateway.onError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                self?.latestMagneticSummary = "Magnetic transport: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func wirePoseToMagneticGateway() {
+        guard let gateway = magneticGateway else { return }
+        sender?.onPoseProduced = { [weak gateway] sample in
+            gateway?.handlePose(
+                PoseMagneticPoseValue(
+                    sequence: sample.sequence,
+                    senderUnixTime: sample.timestamp,
+                    frameMonotonicTime: sample.frameTimestamp,
+                    position: sample.position,
+                    quaternionXYZW: sample.orientation.vector
+                )
+            )
+        }
+
+        bindMagneticGatewayCallbacks()
+    }
+
+    private func applyMagneticConfigurationIfNeeded() {
+        guard
+            isMagneticListening,
+            let listenPort = normalizedPort(magneticListenPort),
+            let registrationPort = normalizedPort(computerRegistrationPort)
+        else { return }
+
+        magneticGateway?.start(sensorPort: listenPort, computerPort: registrationPort)
+    }
+
+    private func updateMagneticUI(with sample: MagneticSensorSample) {
+        latestMagneticChips = sample.chips
+        let selectedIndex = min(max(selectedMagneticChip, 0), sample.chips.count - 1)
+        let selected = sample.chips[selectedIndex]
+        latestMagneticSummary = String(
+            format: "#%u  S%d  t=%.3f  x=%.3f  y=%.3f  z=%.3f",
+            sample.sequence,
+            selectedIndex,
+            selected.t,
+            selected.x,
+            selected.y,
+            selected.z
+        )
+
+        let magnitudes = sample.chips.map { chip in
+            sqrt(Double(chip.x * chip.x + chip.y * chip.y + chip.z * chip.z))
+        }
+        magneticHistory.append(
+            MagneticHistorySample(
+                timestamp: sample.receivedMonotonicTime,
+                sequence: sample.sequence,
+                magnitudes: magnitudes
+            )
+        )
+
+        let cutoff = sample.receivedMonotonicTime - 5
+        magneticHistory.removeAll { $0.timestamp < cutoff }
+        if magneticHistory.count > maxMagneticHistorySamples {
+            magneticHistory.removeFirst(magneticHistory.count - maxMagneticHistorySamples)
+        }
+    }
+
     private func applySenderConfigurationIfNeeded() {
         guard let sender else { return }
 
@@ -772,7 +1042,8 @@ final class PositionViewModel: ObservableObject {
     }
 
     private func normalizedPort(_ value: String) -> UInt16? {
-        UInt16(value)
+        guard let port = UInt16(value), port > 0 else { return nil }
+        return port
     }
 
     private func appendHistory(_ sample: ARPoseUDPSender.PoseSample) {
@@ -794,11 +1065,22 @@ final class PositionViewModel: ObservableObject {
         }
     }
 
+    private static func storedBool(_ defaults: UserDefaults, key: String, fallback: Bool) -> Bool {
+        guard defaults.object(forKey: key) != nil else { return fallback }
+        return defaults.bool(forKey: key)
+    }
+
     private static let hostIPKey = "ARPoseStreamer.hostIP"
     private static let hostPortKey = "ARPoseStreamer.hostPort"
     private static let uploadPortKey = "ARPoseStreamer.uploadPort"
     private static let sensorPortKey = "ARPoseStreamer.sensorPort"
     private static let sensorAccessoryProtocolKey = "ARPoseStreamer.sensorAccessoryProtocol"
+    private static let magneticListenPortKey = "ARPoseStreamer.magnetic.listenPort"
+    private static let computerRegistrationPortKey = "ARPoseStreamer.magnetic.computerRegistrationPort"
+    private static let combinedStreamPortKey = "ARPoseStreamer.magnetic.combinedStreamPort"
+    private static let autoStartMagneticSensorKey = "ARPoseStreamer.magnetic.autoStart"
+    private static let selectedMagneticChipKey = "ARPoseStreamer.magnetic.selectedChip"
+    private static let showMagneticChartKey = "ARPoseStreamer.magnetic.showChart"
     private static let receiverPlatformKey = "ARPoseStreamer.receiverPlatform"
     private static let isVideoStreamingEnabledKey = "ARPoseStreamer.video.enabled"
     private static let videoPortKey = "ARPoseStreamer.video.port"

@@ -146,6 +146,28 @@ private struct BottomDashboard: View {
                 VideoMetricsRow(viewModel: viewModel)
             }
 
+            if viewModel.isMagneticListening && viewModel.magneticStats.receivedPackets > 0 {
+                MagneticMetricsRow(viewModel: viewModel)
+
+                HStack {
+                    Text(viewModel.latestMagneticSummary)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.72))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.68)
+
+                    Spacer()
+                }
+
+                if viewModel.showMagneticChart {
+                    MagneticMagnitudeChart(
+                        samples: viewModel.magneticHistory,
+                        chipIndex: viewModel.selectedMagneticChip
+                    )
+                    .frame(height: 76)
+                }
+            }
+
             if viewModel.showPositionChart {
                 Trajectory3DView(samples: viewModel.positionHistory)
                     .frame(height: 120)
@@ -174,30 +196,38 @@ private struct StatusStrip: View {
     @ObservedObject var viewModel: PositionViewModel
 
     var body: some View {
-        HStack(spacing: 6) {
-            StatusChip(text: viewModel.recordingStatus, isActive: viewModel.recordingPhase.isActive)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                StatusChip(text: viewModel.recordingStatus, isActive: viewModel.recordingPhase.isActive)
 
-            StatusChip(text: viewModel.trackingStatus, isActive: viewModel.trackingStatus == "Tracking normal")
+                StatusChip(text: viewModel.trackingStatus, isActive: viewModel.trackingStatus == "Tracking normal")
 
-            if viewModel.isSending {
-                StatusChip(text: "Streaming", isActive: true)
+                if viewModel.isSending {
+                    StatusChip(text: "Streaming", isActive: true)
+                }
+
+                if viewModel.isSensorStreaming {
+                    StatusChip(text: "Sensor", isActive: true)
+                }
+
+                if viewModel.isMagneticListening {
+                    StatusChip(text: "Magnetic", isActive: viewModel.magneticStats.receiveRateHz > 0)
+                }
+
+                if viewModel.isComputerConnected {
+                    StatusChip(text: "PC linked", isActive: true)
+                }
+
+                if viewModel.hasVideoStreamingEnabled {
+                    StatusChip(text: viewModel.videoStatus, isActive: viewModel.videoStatus == "Video streaming")
+                }
+
+                if viewModel.uploadDetails.isActive {
+                    StatusChip(text: "Upload \(viewModel.uploadDetails.completedFiles)/\(viewModel.uploadDetails.totalFiles)", isActive: true)
+                } else if viewModel.uploadStatus != "Upload idle" {
+                    StatusChip(text: viewModel.uploadStatus.hasPrefix("Upload failed") ? "Upload failed" : "Upload done", isActive: false)
+                }
             }
-
-            if viewModel.isSensorStreaming {
-                StatusChip(text: "Sensor", isActive: true)
-            }
-
-            if viewModel.hasVideoStreamingEnabled {
-                StatusChip(text: viewModel.videoStatus, isActive: viewModel.videoStatus == "Video streaming")
-            }
-
-            if viewModel.uploadDetails.isActive {
-                StatusChip(text: "Upload \(viewModel.uploadDetails.completedFiles)/\(viewModel.uploadDetails.totalFiles)", isActive: true)
-            } else if viewModel.uploadStatus != "Upload idle" {
-                StatusChip(text: viewModel.uploadStatus.hasPrefix("Upload failed") ? "Upload failed" : "Upload done", isActive: false)
-            }
-
-            Spacer(minLength: 0)
         }
     }
 }
@@ -211,6 +241,19 @@ private struct VideoMetricsRow: View {
             CompactMetricCard(label: "Send FPS", value: viewModel.videoSentFPSText)
             CompactMetricCard(label: "Mbps", value: viewModel.videoBitrateText)
             CompactMetricCard(label: "Drops", value: viewModel.videoDroppedFramesText)
+        }
+    }
+}
+
+private struct MagneticMetricsRow: View {
+    @ObservedObject var viewModel: PositionViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            CompactMetricCard(label: "Mag Hz", value: viewModel.magneticReceiveRateText)
+            CompactMetricCard(label: "Loss", value: viewModel.magneticLossText)
+            CompactMetricCard(label: "Seq", value: viewModel.magneticSequenceText)
+            CompactMetricCard(label: "S\(viewModel.selectedMagneticChip) |B|", value: viewModel.selectedMagneticMagnitudeText)
         }
     }
 }
@@ -282,7 +325,7 @@ private struct SidebarDrawer: View {
                 .font(.headline)
                 .foregroundStyle(.white)
 
-            Button(viewModel.isSending ? "Stop Streaming" : "Start Streaming") {
+            Button(viewModel.isSending ? "Stop Legacy/Video Stream" : "Start Legacy/Video Stream") {
                 if viewModel.isSending {
                     viewModel.stopSending()
                 } else {
@@ -291,11 +334,11 @@ private struct SidebarDrawer: View {
             }
             .buttonStyle(.borderedProminent)
 
-            Button(viewModel.isSensorStreaming ? "Stop Wired Sensor" : "Start Wired Sensor") {
-                if viewModel.isSensorStreaming {
-                    viewModel.stopWiredSensor()
+            Button(viewModel.isMagneticListening ? "Stop Magnetic Sensor" : "Start Magnetic Sensor") {
+                if viewModel.isMagneticListening {
+                    viewModel.stopMagneticSensor()
                 } else {
-                    viewModel.startWiredSensor()
+                    viewModel.startMagneticSensor()
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -326,6 +369,10 @@ private struct SidebarDrawer: View {
             }
 
             Spacer()
+
+            Text(viewModel.computerGatewayStatus)
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.72))
 
             Text(viewModel.videoAccessHint)
                 .font(.footnote)
@@ -397,6 +444,49 @@ private struct CompactMetricCard: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 10)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct MagneticMagnitudeChart: View {
+    let samples: [MagneticHistorySample]
+    let chipIndex: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("5 Second Magnetic Magnitude - S\(chipIndex)")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.72))
+
+            Canvas { context, size in
+                let points = samples.compactMap { sample -> (TimeInterval, Double)? in
+                    guard sample.magnitudes.indices.contains(chipIndex) else { return nil }
+                    return (sample.timestamp, sample.magnitudes[chipIndex])
+                }
+                guard points.count > 1, let firstTime = points.first?.0, let lastTime = points.last?.0 else { return }
+
+                let values = points.map { $0.1 }
+                let low = values.min() ?? 0
+                let high = values.max() ?? 1
+                let valueRange = max(high - low, 1e-6)
+                let timeRange = max(lastTime - firstTime, 1e-6)
+
+                var path = Path()
+                for (index, point) in points.enumerated() {
+                    let x = CGFloat((point.0 - firstTime) / timeRange) * size.width
+                    let normalized = (point.1 - low) / valueRange
+                    let y = size.height - CGFloat(normalized) * size.height
+                    if index == 0 {
+                        path.move(to: CGPoint(x: x, y: y))
+                    } else {
+                        path.addLine(to: CGPoint(x: x, y: y))
+                    }
+                }
+
+                context.stroke(path, with: .color(.mint), lineWidth: 2)
+            }
+        }
+        .padding(8)
         .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }

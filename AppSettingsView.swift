@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 struct AppSettingsView: View {
@@ -19,7 +20,7 @@ struct AppSettingsView: View {
                     TextField("Upload Port", text: $viewModel.uploadPort)
                         .keyboardType(.numberPad)
 
-                    TextField("Sensor UDP Port", text: $viewModel.sensorPort)
+                    TextField("Legacy Sensor Mirror Port", text: $viewModel.sensorPort)
                         .keyboardType(.numberPad)
 
                     Picker("Receiver OS", selection: $viewModel.receiverPlatform) {
@@ -52,7 +53,93 @@ struct AppSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Wired Sensor") {
+                Section("Phone Hotspot Magnetic Sensor") {
+                    Toggle("Start Listener Automatically", isOn: $viewModel.autoStartMagneticSensor)
+
+                    TextField("Board -> Phone UDP Port", text: $viewModel.magneticListenPort)
+                        .keyboardType(.numberPad)
+
+                    TextField("Computer Registration Port", text: $viewModel.computerRegistrationPort)
+                        .keyboardType(.numberPad)
+
+                    TextField("Phone -> Computer APM1 Port", text: $viewModel.combinedStreamPort)
+                        .keyboardType(.numberPad)
+
+                    Picker("Displayed Chip", selection: $viewModel.selectedMagneticChip) {
+                        ForEach(0..<MagneticSensorSample.chipCount, id: \.self) { index in
+                            Text("S\(index)").tag(index)
+                        }
+                    }
+
+                    Toggle("Show Magnetic Chart", isOn: $viewModel.showMagneticChart)
+
+                    Button(viewModel.isMagneticListening ? "Stop Magnetic Listener" : "Start Magnetic Listener") {
+                        if viewModel.isMagneticListening {
+                            viewModel.stopMagneticSensor()
+                        } else {
+                            viewModel.startMagneticSensor()
+                        }
+                    }
+
+                    LabeledContent("Sensor") {
+                        Text(viewModel.magneticStatus)
+                            .multilineTextAlignment(.trailing)
+                    }
+
+                    LabeledContent("Computer") {
+                        Text(viewModel.computerGatewayStatus)
+                            .multilineTextAlignment(.trailing)
+                    }
+
+                    Text("Turn on Personal Hotspot manually. For ESP32-class boards, enable Maximum Compatibility and use a simple ASCII iPhone name and password. The board should send ASKN UDP to its DHCP gateway on the configured port; do not hard-code the phone IP.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text("The magnetic board is optional during experiments. Pose/video recording and computer output continue normally while the app is waiting for the first magnetic packet.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Magnetic Diagnostics") {
+                    LabeledContent("Receive Rate") {
+                        Text("\(viewModel.magneticReceiveRateText) Hz")
+                    }
+                    LabeledContent("Packets") {
+                        Text("\(viewModel.magneticStats.receivedPackets)")
+                    }
+                    LabeledContent("Missing") {
+                        Text("\(viewModel.magneticStats.droppedPackets)")
+                    }
+                    LabeledContent("Invalid") {
+                        Text("\(viewModel.magneticStats.invalidPackets)")
+                    }
+                    LabeledContent("Forwarded") {
+                        Text("\(viewModel.magneticStats.combinedPacketsSent)")
+                    }
+                    if !viewModel.magneticStats.boardEndpoint.isEmpty {
+                        LabeledContent("Board") {
+                            Text(viewModel.magneticStats.boardEndpoint)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                    if !viewModel.magneticStats.computerEndpoint.isEmpty {
+                        LabeledContent("Computer") {
+                            Text(viewModel.magneticStats.computerEndpoint)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+
+                    ForEach(0..<viewModel.latestMagneticChips.count, id: \.self) { index in
+                        let chip = viewModel.latestMagneticChips[index]
+                        LabeledContent("S\(index)") {
+                            Text(String(format: "t %.3f  x %.3f  y %.3f  z %.3f", chip.t, chip.x, chip.y, chip.z))
+                                .font(.footnote.monospacedDigit())
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                }
+
+                Section("Legacy Wired Pose Sensor") {
                     TextField("Accessory Protocol", text: $viewModel.sensorAccessoryProtocol)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -92,7 +179,7 @@ struct AppSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Sensor Diagnostics") {
+                Section("Legacy Wired Sensor Diagnostics") {
                     LabeledContent("Bytes") {
                         Text("\(viewModel.wiredSensorStats.bytesRead)")
                     }
@@ -142,6 +229,10 @@ struct AppSettingsView: View {
                     }
 
                     Text(viewModel.receiverPlatform.receiverCommand)
+                        .font(.footnote.monospaced())
+                        .textSelection(.enabled)
+
+                    Text(viewModel.combinedReceiverCommand)
                         .font(.footnote.monospaced())
                         .textSelection(.enabled)
 

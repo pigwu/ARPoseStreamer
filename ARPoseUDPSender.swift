@@ -18,6 +18,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     struct PoseSample {
         let sequence: UInt32
         let timestamp: TimeInterval
+        let frameTimestamp: TimeInterval
         let position: SIMD3<Float>
         let orientation: simd_quatf
 
@@ -63,6 +64,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     let session = ARSession()
 
     var onSampleUpdated: ((PoseSample) -> Void)?
+    var onPoseProduced: ((PoseSample) -> Void)?
     var onSampleSent: ((PoseSample) -> Void)?
     var onError: ((Error) -> Void)?
     var onRecordingStatusChange: ((VideoRecordingStatus) -> Void)?
@@ -244,6 +246,14 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         }
     }
 
+    func appendMagneticSample(_ sample: MagneticSensorSample) {
+        arQueue.async { [weak self] in
+            guard let self, self.isStreamingEnabled || self.isRecordingEnabled else { return }
+            self.ensurePoseSession()
+            self.poseSessionRecorder.append(magneticSample: sample)
+        }
+    }
+
     func startRecording() {
         arQueue.async { [weak self] in
             guard let self else { return }
@@ -340,8 +350,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         let targetPixels = targetResolution.width * targetResolution.height
 
         return formats.min { lhs, rhs in
-            Self.videoFormatScore(lhs, targetFPS: targetFPS, targetPixels: targetPixels)
-                < Self.videoFormatScore(rhs, targetFPS: targetFPS, targetPixels: targetPixels)
+            let lhsScore = Self.videoFormatScore(lhs, targetFPS: targetFPS, targetPixels: targetPixels)
+            let rhsScore = Self.videoFormatScore(rhs, targetFPS: targetFPS, targetPixels: targetPixels)
+            return lhsScore < rhsScore
         }
     }
 
@@ -437,8 +448,10 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             relativeTransform.columns.3.z -= originTransform.columns.3.z
         }
 
-        let sample = makePoseSample(from: relativeTransform)
+        let sample = makePoseSample(from: relativeTransform, frameTimestamp: frameTimestamp)
         let presentationTime = CMTime(seconds: frameTimestamp, preferredTimescale: 600)
+
+        onPoseProduced?(sample)
 
         DispatchQueue.main.async { [sample, weak self] in
             self?.onSampleUpdated?(sample)
@@ -507,7 +520,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         hasPoseCaptureSession = false
     }
 
-    private func makePoseSample(from transform: simd_float4x4) -> PoseSample {
+    private func makePoseSample(from transform: simd_float4x4, frameTimestamp: TimeInterval) -> PoseSample {
         let positionYUp = SIMD3(
             transform.columns.3.x,
             transform.columns.3.y,
@@ -537,6 +550,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         return PoseSample(
             sequence: sequenceNumber,
             timestamp: Date().timeIntervalSince1970,
+            frameTimestamp: frameTimestamp,
             position: convertedPosition,
             orientation: convertedOrientation
         )

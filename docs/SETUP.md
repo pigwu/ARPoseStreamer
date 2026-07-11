@@ -75,6 +75,41 @@ Pose CSV and capture manifest files are also saved locally, so offline sessions 
 Each capture segment is stored as a separate historical record and can be renamed later in the app.
 For actual uploads, open `Past Records` and use the upload buttons after you start the host upload server.
 
+## Phone Hotspot Magnetic Capture
+
+This mode does not require the school Wi-Fi or a computer during capture.
+
+1. On the iPhone, enable Personal Hotspot and `Allow Others to Join`.
+2. For 2.4 GHz boards such as many ESP32 variants, enable `Maximize Compatibility`.
+3. Use an ASCII-only iPhone name and hotspot password for the most reliable embedded Wi-Fi compatibility.
+4. Configure the board with the hotspot SSID/password and power it from the phone USB-C port.
+5. The board reads the DHCP gateway and sends 96-byte ASKN UDP packets to gateway port `5557`.
+6. Open the app. The magnetic listener starts automatically by default and shows receive rate, loss, sequence, and five-chip values.
+7. Tap `Start Recording`. Pose, magnetic data, and optional video are saved in one local capture directory.
+
+The app cannot turn Personal Hotspot on through a public iOS API. Enable it manually before powering the board. The board must use the DHCP gateway address instead of assuming the phone is always `172.20.10.1`.
+
+The magnetic board is optional during experiments. With no board connected,
+ARKit preview, pose/video recording, legacy pose UDP, APM1 pose packets with
+`magnetic_count = 0`, history, and later upload all continue to work. The app
+creates `magnetic.csv` only after the first valid magnetic sample arrives.
+
+When a computer is available, connect it to the same hotspot and run:
+
+```bash
+python3 pose_magnetic_receiver.py --phone-ip 172.20.10.1
+```
+
+On Windows:
+
+```powershell
+py pose_magnetic_receiver.py --phone-ip 172.20.10.1
+```
+
+The computer sends `PC_HELLO` heartbeats to the app and receives combined APM1 packets on UDP `5558`. If the computer disconnects, local phone recording continues. Start `capture_upload_server.py` later and use `Past Records -> Upload Data` to transfer `pose.csv`, `magnetic.csv`, and the capture manifest.
+
+Personal Hotspot routing must be validated on the target iPhone and iOS version; the simulator cannot test this path.
+
 ## Validation Checklist
 
 - receiver is listening on port `5555`

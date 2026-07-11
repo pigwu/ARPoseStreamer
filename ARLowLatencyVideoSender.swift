@@ -451,7 +451,7 @@ final class ARLowLatencyVideoSender {
                     return
                 }
 
-                let bytesSent = self.sendFrameLocked(
+                let bytesSent = try self.sendFrameLocked(
                     frameID: metadata.frameID,
                     captureTimestamp: metadata.captureTimestamp,
                     nalUnits: allNALUnits,
@@ -641,7 +641,7 @@ final class ARLowLatencyVideoSender {
         }
 
         var parameterSetCount = 0
-        var headerLength = 0
+        var headerLength: Int32 = 0
         let countStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
             formatDescription,
             parameterSetIndex: 0,

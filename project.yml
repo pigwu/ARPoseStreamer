@@ -31,6 +31,9 @@ targets:
       - path: PositionViewModel.swift
       - path: ARPoseUDPSender.swift
       - path: ARLowLatencyVideoSender.swift
+      - path: MagneticSensorProtocol.swift
+      - path: PoseMagneticPacket.swift
+      - path: MagneticSensorHotspotGateway.swift
       - path: WiredSensorPoseBridge.swift
       - path: SensorPoseStreamRecorder.swift
       - path: ARSessionVideoRecorder.swift

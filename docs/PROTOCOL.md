@@ -55,6 +55,88 @@ If you change the sender to ARKit-native output, update the documentation and th
 - the sequence field helps detect drops
 - the sender timestamp can be used for rough latency estimation when clocks are reasonably aligned
 
+## Phone-Hotspot Magnetic Sensor Input
+
+The sensor board joins the iPhone Personal Hotspot and sends UDP datagrams to
+the DHCP gateway address on port `5557`. The board must discover the gateway
+from DHCP rather than hard-code `172.20.10.1`.
+
+ASKN v1 input is exactly 96 bytes and uses little-endian values:
+
+```text
+uint32 magic = 0x41534B4E
+uint32 sequence
+uint64 mcu_time_us
+float32 sensor[5][4]  // each chip is t, x, y, z
+```
+
+Because `magic` is encoded as a little-endian integer, its wire bytes are
+`4E 4B 53 41`. They are not raw ASCII `ASKN`.
+
+The app replies once per UDP flow with the optional UTF-8 acknowledgement:
+
+```text
+APP_ACK,1,5557\n
+```
+
+The app records every valid sample locally. Computer availability never gates
+local recording.
+
+## Computer Registration
+
+A computer connected to the same phone hotspot registers by sending the
+following UTF-8 datagram to phone UDP port `5559` every two seconds:
+
+```text
+PC_HELLO,1,combined_port,video_port\n
+```
+
+The app obtains the computer IP from the datagram source endpoint and leases it
+for five seconds. The phone does not reply because the desktop tool uses the
+same socket for APM1 receive traffic.
+
+## Combined Pose and Magnetic Stream (APM1)
+
+After registration, the app sends APM1 UDP datagrams to the advertised
+`combined_port`, normally `5558`. All numeric fields are little-endian:
+
+```text
+char[4] magic = "APM1"
+uint16 version = 1
+uint16 flags                 // bit 0: pose block is valid
+uint32 packet_sequence
+uint8 session_uuid[16]
+float64 phone_send_unix
+
+uint32 pose_sequence
+float64 pose_sender_unix
+float64 pose_frame_monotonic
+float32 position[3]
+float32 quaternion_xyzw[4]
+
+uint16 magnetic_count
+uint16 reserved = 0
+
+repeated magnetic_count times:
+    uint32 sensor_sequence
+    uint64 mcu_time_us
+    float64 phone_receive_unix
+    float64 phone_receive_monotonic
+    float32 sensor[5][4]
+
+uint32 crc32
+```
+
+The fixed data before magnetic samples is 88 bytes, each magnetic sample is
+108 bytes, and the trailing CRC is 4 bytes. At most ten magnetic samples are
+included, so the largest datagram is 1172 bytes. CRC uses standard
+CRC-32/ISO-HDLC over every preceding byte.
+
+Each AR pose drains magnetic samples received up to that AR frame time. If pose
+frames stop for 50 ms, the app sends magnetic-only packets with flag bit 0
+cleared. A missing computer only drops the live forwarding copy; the capture
+continues on the phone.
+
 ## Low-Latency Video Stream
 
 The optional low-latency video stream uses a second UDP port, default `5560`, and carries H.264 NAL units without MP4/RTSP/WebRTC container overhead.
