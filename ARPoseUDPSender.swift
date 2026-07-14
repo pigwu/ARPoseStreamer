@@ -577,7 +577,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         targetPixels: Int
     ) -> Int {
         let fpsDelta = abs(format.framesPerSecond - targetFPS)
-        let pixels = format.imageResolution.width * format.imageResolution.height
+        let pixels = Int(format.imageResolution.width) * Int(format.imageResolution.height)
         let pixelDelta = abs(pixels - targetPixels)
         return fpsDelta * 10_000_000 + pixelDelta
     }

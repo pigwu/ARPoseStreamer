@@ -110,9 +110,10 @@ class VideoReceiverThread(QThread):
         self.video_port = video_port
         self.pose_port = pose_port
         self._running = True
-        self._decoder = av.CodecContext.create("h264", "r") if av is not None else None
+        self._decoder = self._create_decoder()
         self._frames: dict[int, FrameAssembly] = {}
         self._latest_decoded_frame_id: int | None = None
+        self._waiting_for_keyframe = True
         self._video_byte_window: deque[tuple[float, int]] = deque()
         self._video_frame_window: deque[float] = deque()
         self._video_state = {
@@ -138,6 +139,12 @@ class VideoReceiverThread(QThread):
         }
         self._prev_pose_sequence: int | None = None
         self._prev_pose_monotonic: float | None = None
+
+    @staticmethod
+    def _create_decoder():
+        if av is None:
+            return None
+        return av.CodecContext.create("h264", "r")
 
     def stop(self) -> None:
         self._running = False
@@ -317,22 +324,50 @@ class VideoReceiverThread(QThread):
         if av is None or self._decoder is None:
             return
 
+        if self._waiting_for_keyframe and not frame.is_keyframe:
+            self._video_state["status"] = "Waiting for keyframe"
+            return
+
         try:
             annexb = frame.to_annexb()
-            packets = self._decoder.parse(annexb)
+            if frame.is_keyframe:
+                self._decoder = self._create_decoder()
+                self._waiting_for_keyframe = False
+
+            decoded_frames = self._decode_annexb_packet(annexb)
             decoded_any = False
-            for packet in packets:
-                decoded_frames = self._decoder.decode(packet)
-                for decoded_frame in decoded_frames:
-                    decoded_any = True
-                    self._handle_decoded_frame(decoded_frame, frame)
-            if not decoded_any and frame.is_keyframe:
-                self._decoder = av.CodecContext.create("h264", "r")
+            for decoded_frame in decoded_frames:
+                decoded_any = True
+                self._handle_decoded_frame(decoded_frame, frame)
+
+            if not decoded_any:
+                if frame.is_keyframe:
+                    self._waiting_for_keyframe = True
+                    self._video_state["status"] = "Waiting for decoded keyframe"
+                return
+
+            self._waiting_for_keyframe = False
+            self._video_state["status"] = "Video decoding"
         except Exception as exc:
             self._video_state["decode_errors"] += 1
             self._video_state["status"] = "Decode error"
-            self._decoder = av.CodecContext.create("h264", "r")
+            self._waiting_for_keyframe = True
+            self._decoder = self._create_decoder()
             self.log_message.emit(f"Decode error on frame {frame.frame_id}: {exc}")
+
+    def _decode_annexb_packet(self, annexb: bytes):
+        if self._decoder is None:
+            return []
+
+        packet = av.Packet(annexb)
+        decoded_frames = self._decoder.decode(packet)
+        if decoded_frames:
+            return decoded_frames
+
+        fallback_frames = []
+        for parsed_packet in self._decoder.parse(annexb):
+            fallback_frames.extend(self._decoder.decode(parsed_packet))
+        return fallback_frames
 
     def _handle_decoded_frame(self, decoded_frame: av.VideoFrame, frame: FrameAssembly) -> None:
         rgb = decoded_frame.to_ndarray(format="rgb24")
