@@ -167,7 +167,7 @@ class ExperimentDataset:
             video_path=video_path,
             duration_seconds=max(duration, 0.001),
             video_start_offset_seconds=_float(manifest.get("videoStartOffsetSeconds"), 0.0),
-            is_complete=bool(upload_state.get("complete")) or bool(manifest),
+            is_complete=(bool(upload_state.get("complete")) if upload_state else bool(manifest)),
         )
 
 

@@ -190,7 +190,7 @@ The app sends JSON control events to `POST /experiment/control` on the upload se
 }
 ```
 
-`stop` uses the same shape and UUID. After the MP4 is finalized, the app uploads all available components with `X-Upload-Kind: experiment` and the shared UUID as `X-Capture-ID`. The computer stores one directory per UUID containing:
+`stop` uses the same shape and UUID. After the MP4 is finalized, the app uploads all available components with `X-Upload-Kind: experiment`, the shared UUID as `X-Capture-ID`, and the start time as `X-Experiment-Start-Unix-Time`. The computer stores one timestamp-named directory per experiment (for example `20260714-205900`); the UUID remains in its metadata. Each directory contains:
 
 - `pose.csv`
 - `magnetic.csv` when sensor samples were available
@@ -198,6 +198,7 @@ The app sends JSON control events to `POST /experiment/control` on the upload se
 - `sender_transport.csv`
 - `receiver_transport.csv` when the integrated monitor observed the live session
 - `capture_manifest.json`
+- `dataset.zarr` after the automatic background conversion completes
 - `upload_state.json` and `experiment_state.json`
 
 ## Wired Sensor Mirror

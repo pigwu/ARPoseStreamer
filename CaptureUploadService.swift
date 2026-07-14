@@ -76,6 +76,7 @@ final class CaptureUploadService {
         captureID: String,
         serverBaseURL: URL,
         kind: CaptureUploadKind,
+        experimentStartUnixTime: TimeInterval? = nil,
         progress: (@Sendable (UploadProgressSnapshot) async -> Void)? = nil
     ) async throws -> [UploadResponse] {
         var responses: [UploadResponse] = []
@@ -87,7 +88,8 @@ final class CaptureUploadService {
                 serverBaseURL: serverBaseURL,
                 kind: kind,
                 fileIndex: index + 1,
-                totalFiles: descriptors.count
+                totalFiles: descriptors.count,
+                experimentStartUnixTime: experimentStartUnixTime
             )
 
             responses.append(response)
@@ -114,7 +116,8 @@ final class CaptureUploadService {
         serverBaseURL: URL,
         kind: CaptureUploadKind,
         fileIndex: Int,
-        totalFiles: Int
+        totalFiles: Int,
+        experimentStartUnixTime: TimeInterval?
     ) async throws -> UploadResponse {
         let fileSize = try validateUploadFile(descriptor)
 
@@ -131,6 +134,12 @@ final class CaptureUploadService {
         request.setValue(String(fileSize), forHTTPHeaderField: "X-Upload-File-Size")
         request.setValue(String(fileIndex), forHTTPHeaderField: "X-Experiment-File-Index")
         request.setValue(String(totalFiles), forHTTPHeaderField: "X-Experiment-File-Count")
+        if let experimentStartUnixTime {
+            request.setValue(
+                String(format: "%.6f", experimentStartUnixTime),
+                forHTTPHeaderField: "X-Experiment-Start-Unix-Time"
+            )
+        }
 
         let (data, response) = try await session.upload(for: request, fromFile: descriptor.fileURL)
 

@@ -6,9 +6,16 @@ import threading
 import unittest
 from pathlib import Path
 
-from capture_upload_server import create_upload_server
+import zarr
+
+from capture_upload_server import (
+    create_upload_server,
+    migrate_uuid_experiment_directories,
+    readable_experiment_name,
+)
 from experiment_data import ExperimentDataset, discover_experiments
 from experiment_replay_ui import ReceiverDiagnosticsRecorder
+from experiment_zarr import AutoZarrExporter
 
 
 class ExperimentWorkflowTests(unittest.TestCase):
@@ -16,7 +23,13 @@ class ExperimentWorkflowTests(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
         self.events: list[dict] = []
-        self.server = create_upload_server("127.0.0.1", 0, self.root, self.events.append)
+        self.server = create_upload_server(
+            "127.0.0.1",
+            0,
+            self.root,
+            self.events.append,
+            auto_zarr=False,
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.port = self.server.server_address[1]
@@ -53,7 +66,8 @@ class ExperimentWorkflowTests(unittest.TestCase):
         self._upload(experiment_id, "pose_csv", "pose.csv", pose, 1, 2)
         self._upload(experiment_id, "manifest", "capture_manifest.json", manifest, 2, 2)
 
-        folder = self.root / experiment_id
+        folder = self.root / readable_experiment_name(1_700_000_000.0)
+        self.assertRegex(folder.name, r"^\d{8}-\d{6}$")
         self.assertTrue((folder / "pose.csv").is_file())
         self.assertTrue((folder / "capture_manifest.json").is_file())
         state = json.loads((folder / "upload_state.json").read_text(encoding="utf-8"))
@@ -123,6 +137,70 @@ class ExperimentWorkflowTests(unittest.TestCase):
             rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(float(rows[0]["experiment_time"]), 0.125)
+
+    def test_uuid_folder_is_migrated_to_readable_timestamp(self) -> None:
+        experiment_id = "ABCDEF12-1234-5678-9ABC-DEF012345678"
+        folder = self.root / experiment_id
+        folder.mkdir()
+        (folder / "experiment_state.json").write_text(
+            json.dumps({"experiment_id": experiment_id, "start_unix_time": 1_700_000_100.0}),
+            encoding="utf-8",
+        )
+
+        migrated = migrate_uuid_experiment_directories(self.root)
+
+        expected = self.root / readable_experiment_name(1_700_000_100.0)
+        self.assertEqual(migrated, [(folder, expected)])
+        self.assertTrue(expected.is_dir())
+        self.assertFalse(folder.exists())
+
+    def test_zarr_contains_pose_and_all_five_magnetic_chips(self) -> None:
+        folder = self.root / "zarr-source"
+        folder.mkdir()
+        start = 1_700_000_000.0
+        (folder / "capture_manifest.json").write_text(
+            json.dumps(
+                {
+                    "createdAtUnixTime": start,
+                    "experimentStartUnixTime": start,
+                    "experimentStartMonotonicTime": 100.0,
+                    "sessionStartFrameTime": 100.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (folder / "pose.csv").write_text(
+            "sequence,relative_time,x,y,z,qx,qy,qz,qw\n"
+            "1,0.0,0,0,0,0,0,0,1\n"
+            "2,0.1,1,2,3,0,0,0,1\n",
+            encoding="utf-8",
+        )
+        magnetic_columns = [
+            f"s{chip}_{axis}"
+            for chip in range(5)
+            for axis in ("t", "x", "y", "z")
+        ]
+        first_values = [str(chip * 10 + axis) for chip in range(5) for axis in range(4)]
+        second_values = [str(chip * 10 + axis + 1) for chip in range(5) for axis in range(4)]
+        (folder / "magnetic.csv").write_text(
+            "relative_time," + ",".join(magnetic_columns) + "\n"
+            "0.0," + ",".join(first_values) + "\n"
+            "0.1," + ",".join(second_values) + "\n",
+            encoding="utf-8",
+        )
+
+        exporter = AutoZarrExporter(image_size=64)
+        self.assertTrue(exporter.schedule(folder, "zarr-test"))
+        exporter.wait_for_all()
+        output = folder / "dataset.zarr"
+        root = zarr.open_group(str(output), mode="r")
+
+        zarr_state = json.loads((folder / "zarr_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(zarr_state["status"], "complete")
+        self.assertEqual(root["data/magnetic_txyz"].shape, (2, 5, 4))
+        self.assertEqual(root["data/magnetic_valid"].shape, (2, 5))
+        self.assertTrue(root["data/magnetic_valid"][:].all())
+        self.assertAlmostEqual(float(root["data/magnetic_txyz"][1, 4, 3]), 44.0)
 
     def _post_json(self, path: str, value: dict) -> dict:
         body = json.dumps(value).encode()

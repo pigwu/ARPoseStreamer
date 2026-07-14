@@ -18,6 +18,8 @@ IMAGE_SIZE = 224
 POSE_DIM = 6
 ACTION_DIM = 7
 FORCE_DIM = 6
+MAGNETIC_CHIP_COUNT = 5
+MAGNETIC_VALUE_DIM = 4
 ZARR_CHUNK_ROWS = 1024
 
 
@@ -27,6 +29,7 @@ class CaptureInputs:
     manifest_path: Optional[Path]
     manifest: dict
     pose_csv: Optional[Path]
+    magnetic_csv: Optional[Path]
     force_csv: Optional[Path]
     video_path: Optional[Path]
 
@@ -45,6 +48,12 @@ class ForceSeries:
 
 
 @dataclass
+class MagneticSeries:
+    time: np.ndarray
+    values: np.ndarray
+
+
+@dataclass
 class EpisodeArrays:
     camera_rgb: np.ndarray
     timestamp: np.ndarray
@@ -56,6 +65,8 @@ class EpisodeArrays:
     action: np.ndarray
     force_torque: np.ndarray
     force_valid: np.ndarray
+    magnetic_txyz: np.ndarray
+    magnetic_valid: np.ndarray
 
 
 def main() -> int:
@@ -129,6 +140,16 @@ def discover_capture(directory: Path) -> CaptureInputs:
         require_nonempty=True,
     )
 
+    magnetic_name = manifest.get("magneticCSVFileName")
+    magnetic_csv = find_capture_file(
+        directory,
+        logical_name=magnetic_name,
+        component_prefix="magnetic_csv",
+        fallback_patterns=("magnetic.csv", "magnetic_csv__*.csv", "*magnetic*.csv"),
+        require_nonempty=True,
+        required=False,
+    )
+
     force_csv = find_capture_file(
         directory,
         logical_name=None,
@@ -153,6 +174,7 @@ def discover_capture(directory: Path) -> CaptureInputs:
         manifest_path=manifest_path,
         manifest=manifest,
         pose_csv=pose_csv,
+        magnetic_csv=magnetic_csv,
         force_csv=force_csv,
         video_path=video_path,
     )
@@ -160,6 +182,7 @@ def discover_capture(directory: Path) -> CaptureInputs:
 
 def build_episode(capture: CaptureInputs, image_size: int, action_source: str) -> EpisodeArrays:
     pose = load_pose_series(capture.pose_csv, capture.manifest) if capture.pose_csv else None
+    magnetic = load_magnetic_series(capture.magnetic_csv, capture.manifest) if capture.magnetic_csv else None
     force = load_force_series(capture.force_csv, capture.manifest) if capture.force_csv else None
 
     camera_rgb, sample_time = load_video_frames(
@@ -174,6 +197,7 @@ def build_episode(capture: CaptureInputs, image_size: int, action_source: str) -
 
     eef_pos, eef_rot_axis_angle = sample_pose_on_time(pose, sample_time)
     force_torque, force_valid = sample_force_on_time(force, sample_time)
+    magnetic_txyz, magnetic_valid = sample_magnetic_on_time(magnetic, sample_time)
 
     pose6 = np.concatenate([eef_pos, eef_rot_axis_angle], axis=1).astype(np.float32)
     start_pose = pose6[0] if len(pose6) else np.zeros(POSE_DIM, dtype=np.float32)
@@ -196,6 +220,8 @@ def build_episode(capture: CaptureInputs, image_size: int, action_source: str) -
         action=action,
         force_torque=force_torque.astype(np.float32, copy=False),
         force_valid=force_valid.astype(bool, copy=False),
+        magnetic_txyz=magnetic_txyz.astype(np.float32, copy=False),
+        magnetic_valid=magnetic_valid.astype(bool, copy=False),
     )
 
 
@@ -352,6 +378,100 @@ def sample_pose_on_time(pose: Optional[PoseSeries], sample_time: np.ndarray) -> 
     return sampled_pos.astype(np.float32), rotvec.astype(np.float32)
 
 
+def load_magnetic_series(path: Optional[Path], manifest: dict) -> Optional[MagneticSeries]:
+    if path is None:
+        return None
+    rows = read_csv_rows(path)
+    if not rows:
+        return None
+
+    start_unix = optional_float(
+        manifest.get("experimentStartUnixTime", manifest.get("createdAtUnixTime"))
+    )
+    start_monotonic = optional_float(
+        manifest.get("experimentStartMonotonicTime", manifest.get("sessionStartFrameTime"))
+    )
+    times = []
+    samples = []
+    for row in rows:
+        relative_time = first_float(row, ("relative_time", "experiment_time"), required=False)
+        receive_time = first_float(row, ("phone_receive_time", "sender_time"), required=False)
+        monotonic_time = first_float(row, ("phone_monotonic_time",), required=False)
+        if start_unix is not None and relative_time is not None:
+            time_value = start_unix + relative_time
+        elif receive_time is not None:
+            time_value = receive_time
+        elif start_unix is not None and start_monotonic is not None and monotonic_time is not None:
+            time_value = start_unix + monotonic_time - start_monotonic
+        elif relative_time is not None:
+            time_value = relative_time
+        else:
+            continue
+
+        chip_values = []
+        for chip in range(MAGNETIC_CHIP_COUNT):
+            chip_values.append(
+                [
+                    first_float(row, (f"s{chip}_t",), required=False),
+                    first_float(row, (f"s{chip}_x",), required=False),
+                    first_float(row, (f"s{chip}_y",), required=False),
+                    first_float(row, (f"s{chip}_z",), required=False),
+                ]
+            )
+        values = np.asarray(
+            [[np.nan if value is None else value for value in chip] for chip in chip_values],
+            dtype=np.float64,
+        )
+        if not np.isfinite(values).any():
+            continue
+        times.append(time_value)
+        samples.append(values)
+
+    if not times:
+        return None
+    order = np.argsort(np.asarray(times, dtype=np.float64))
+    return MagneticSeries(
+        time=np.asarray(times, dtype=np.float64)[order],
+        values=np.asarray(samples, dtype=np.float64)[order],
+    )
+
+
+def sample_magnetic_on_time(
+    magnetic: Optional[MagneticSeries],
+    sample_time: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    values = np.zeros(
+        (len(sample_time), MAGNETIC_CHIP_COUNT, MAGNETIC_VALUE_DIM),
+        dtype=np.float32,
+    )
+    valid = np.zeros((len(sample_time), MAGNETIC_CHIP_COUNT), dtype=bool)
+    if magnetic is None or len(magnetic.time) == 0:
+        return values, valid
+
+    unique_time, unique_indices = np.unique(magnetic.time, return_index=True)
+    source = magnetic.values[unique_indices]
+    for chip in range(MAGNETIC_CHIP_COUNT):
+        finite_rows = np.all(np.isfinite(source[:, chip, :]), axis=1)
+        chip_time = unique_time[finite_rows]
+        chip_values = source[finite_rows, chip, :]
+        if len(chip_time) == 0:
+            continue
+        if len(chip_time) == 1:
+            nearest = np.isclose(sample_time, chip_time[0], atol=1e-3)
+            values[nearest, chip, :] = chip_values[0]
+            valid[nearest, chip] = True
+            continue
+        in_range = (sample_time >= chip_time[0]) & (sample_time <= chip_time[-1])
+        for axis in range(MAGNETIC_VALUE_DIM):
+            values[in_range, chip, axis] = np.interp(
+                sample_time[in_range],
+                chip_time,
+                chip_values[:, axis],
+            )
+        valid[in_range, chip] = True
+    return values, valid
+
+
 def load_force_series(path: Optional[Path], manifest: dict) -> Optional[ForceSeries]:
     if path is None:
         return None
@@ -446,6 +566,8 @@ def write_zarr(out_path: Path, episodes: List[EpisodeArrays]) -> None:
     action = np.concatenate([ep.action for ep in episodes], axis=0)
     force_torque = np.concatenate([ep.force_torque for ep in episodes], axis=0)
     force_valid = np.concatenate([ep.force_valid for ep in episodes], axis=0)
+    magnetic_txyz = np.concatenate([ep.magnetic_txyz for ep in episodes], axis=0)
+    magnetic_valid = np.concatenate([ep.magnetic_valid for ep in episodes], axis=0)
     episode_ends = np.cumsum([len(ep.timestamp) for ep in episodes], dtype=np.int64)
 
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
@@ -464,6 +586,20 @@ def write_zarr(out_path: Path, episodes: List[EpisodeArrays]) -> None:
     write_array(data_group, "action", action, (ZARR_CHUNK_ROWS, ACTION_DIM), compressor)
     write_array(data_group, "force_torque", force_torque, (ZARR_CHUNK_ROWS, FORCE_DIM), compressor)
     write_array(data_group, "force_valid", force_valid, (ZARR_CHUNK_ROWS,), compressor)
+    write_array(
+        data_group,
+        "magnetic_txyz",
+        magnetic_txyz,
+        (ZARR_CHUNK_ROWS, MAGNETIC_CHIP_COUNT, MAGNETIC_VALUE_DIM),
+        compressor,
+    )
+    write_array(
+        data_group,
+        "magnetic_valid",
+        magnetic_valid,
+        (ZARR_CHUNK_ROWS, MAGNETIC_CHIP_COUNT),
+        compressor,
+    )
     write_array(meta_group, "episode_ends", episode_ends, (len(episode_ends),), None)
 
 

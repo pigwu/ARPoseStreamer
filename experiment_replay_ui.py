@@ -21,15 +21,17 @@ try:
 except Exception:
     pg = None
 
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QObject, QThread, QTimer, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QDesktopServices, QImage, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -38,6 +40,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSlider,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -69,6 +72,13 @@ RECEIVER_FIELDS = [
     "bytes",
 ]
 
+PC_GENERATED_EXPERIMENT_FILES = {
+    "experiment_state.json",
+    "receiver_transport.csv",
+    "upload_state.json",
+    "zarr_state.json",
+}
+
 
 def metric_text(value: object, suffix: str = "", precision: int = 1) -> str:
     try:
@@ -78,6 +88,15 @@ def metric_text(value: object, suffix: str = "", precision: int = 1) -> str:
     if not math.isfinite(number):
         return "--"
     return f"{number:.{precision}f}{suffix}"
+
+
+def file_size_text(size: int) -> str:
+    value = float(max(0, size))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024.0 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024.0
+    return "--"
 
 
 class UploadServerBridge(QObject):
@@ -486,6 +505,32 @@ class ExperimentMonitorWindow(QMainWindow):
         self.experiment_list = QListWidget()
         self.experiment_list.currentRowChanged.connect(self.load_experiment)
         library_layout.addWidget(self.experiment_list)
+
+        uploads_box = QGroupBox("Phone Upload Files")
+        uploads_layout = QVBoxLayout(uploads_box)
+        uploads_layout.setContentsMargins(8, 8, 8, 8)
+        uploads_layout.setSpacing(5)
+        self.phone_upload_status = QLabel("Select an experiment")
+        self.phone_upload_status.setWordWrap(True)
+        uploads_layout.addWidget(self.phone_upload_status)
+        self.zarr_export_status = QLabel("Zarr: waiting for a complete experiment")
+        self.zarr_export_status.setWordWrap(True)
+        uploads_layout.addWidget(self.zarr_export_status)
+        self.phone_upload_table = QTableWidget(0, 3)
+        self.phone_upload_table.setHorizontalHeaderLabels(["Type", "File", "Size"])
+        self.phone_upload_table.verticalHeader().setVisible(False)
+        self.phone_upload_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.phone_upload_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.phone_upload_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.phone_upload_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.phone_upload_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.phone_upload_table.setMinimumHeight(175)
+        uploads_layout.addWidget(self.phone_upload_table)
+        self.open_experiment_folder_button = QPushButton("Open Selected Folder")
+        self.open_experiment_folder_button.setEnabled(False)
+        self.open_experiment_folder_button.clicked.connect(self.open_selected_experiment_folder)
+        uploads_layout.addWidget(self.open_experiment_folder_button)
+        library_layout.addWidget(uploads_box)
         splitter.addWidget(library)
 
         replay = QWidget()
@@ -498,8 +543,11 @@ class ExperimentMonitorWindow(QMainWindow):
         top.addWidget(self.replay_video, 3)
 
         values = QVBoxLayout()
+        values.setSpacing(5)
         pose_box = QGroupBox("Pose at Cursor")
+        pose_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         pose_form = QFormLayout(pose_box)
+        pose_form.setVerticalSpacing(4)
         self.pose_values = {name: QLabel("--") for name in ("sequence", "position", "quaternion")}
         pose_form.addRow("Sequence", self.pose_values["sequence"])
         pose_form.addRow("Position", self.pose_values["position"])
@@ -507,7 +555,9 @@ class ExperimentMonitorWindow(QMainWindow):
         values.addWidget(pose_box)
 
         transport_box = QGroupBox("Propagation at Cursor")
+        transport_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         transport_form = QFormLayout(transport_box)
+        transport_form.setVerticalSpacing(3)
         self.transport_values = {
             name: QLabel("--")
             for name in ("video_latency", "pose_latency", "raw_latency", "clock_offset", "fps", "bitrate", "drops")
@@ -525,7 +575,7 @@ class ExperimentMonitorWindow(QMainWindow):
         values.addWidget(transport_box)
         values.addWidget(QLabel("Magnetic sensor values"))
         self.replay_sensor_table = self._make_sensor_table()
-        values.addWidget(self.replay_sensor_table, 1)
+        values.addWidget(self.replay_sensor_table)
         top.addLayout(values, 2)
         replay_layout.addLayout(top, 3)
 
@@ -568,14 +618,23 @@ class ExperimentMonitorWindow(QMainWindow):
         self.plot_tabs.addTab(self.transport_plot, "Propagation")
         replay_layout.addWidget(self.plot_tabs, 2)
         splitter.addWidget(replay)
-        splitter.setSizes([300, 1200])
+        splitter.setSizes([360, 1140])
         return tab
 
     @staticmethod
     def _make_sensor_table() -> QTableWidget:
         table = QTableWidget(5, 6)
         table.setHorizontalHeaderLabels(["Chip", "T", "X", "Y", "Z", "|B|"])
-        table.setVerticalHeaderLabels(["" for _ in range(5)])
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(27)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setMinimumSectionSize(45)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setAlternatingRowColors(True)
+        table.setFixedHeight(170)
         for row in range(5):
             table.setItem(row, 0, QTableWidgetItem(f"S{row}"))
         return table
@@ -616,6 +675,7 @@ class ExperimentMonitorWindow(QMainWindow):
         root.mkdir(parents=True, exist_ok=True)
         self.diagnostics.set_root(root)
         self.upload_bridge.start(bind, upload_port, root)
+        self.refresh_experiments()
 
         self.video_worker = VideoReceiverThread(bind, video_port, pose_port)
         self.video_worker.frame_ready.connect(self.update_live_video)
@@ -716,6 +776,9 @@ class ExperimentMonitorWindow(QMainWindow):
             self.set_service_status(f"Experiment {event.get('event')}: {event.get('experiment_id')}")
         if event.get("type") == "upload":
             self.set_service_status(f"Received {event.get('component')} for {event.get('capture_id')}")
+        if event.get("type") == "zarr":
+            status = event.get("status", "--")
+            self.set_service_status(f"Zarr {status}: {event.get('capture_id')}")
         self.refresh_experiments()
 
     def refresh_experiments(self) -> None:
@@ -731,20 +794,153 @@ class ExperimentMonitorWindow(QMainWindow):
             if dataset.experiment_id == current_id:
                 selected_row = index
         self.experiment_list.blockSignals(False)
+        if selected_row < 0 and self.datasets:
+            selected_row = 0
         if selected_row >= 0:
             self.experiment_list.setCurrentRow(selected_row)
+        else:
+            self.dataset = None
+            self._update_phone_upload_files(None)
 
     def load_experiment(self, row: int) -> None:
         if row < 0 or row >= len(self.datasets):
             return
         self.dataset = ExperimentDataset.load(self.datasets[row].directory)
+        self._update_phone_upload_files(self.dataset.directory)
         self.playback.open(self.dataset.video_path)
         self.playing = False
         self.play_button.setText("Play")
         self.play_time = 0.0
+        self._update_sensor_table(self.replay_sensor_table, ())
         self.timeline.setRange(0, max(1, int(self.dataset.duration_seconds * 1000)))
         self._build_data_plots()
         self.update_replay_cursor()
+
+    def open_selected_experiment_folder(self) -> None:
+        if self.dataset is None:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.dataset.directory)))
+
+    def _update_phone_upload_files(self, directory: Path | None) -> None:
+        self.phone_upload_table.setRowCount(0)
+        self.open_experiment_folder_button.setEnabled(directory is not None and directory.is_dir())
+        if directory is None or not directory.is_dir():
+            self.phone_upload_status.setText("Select an experiment")
+            self.zarr_export_status.setText("Zarr: waiting for a complete experiment")
+            return
+
+        state = {}
+        state_path = directory / "upload_state.json"
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        components = state.get("components") if isinstance(state.get("components"), dict) else {}
+        component_by_name = {
+            Path(filename).name: str(component)
+            for component, filename in components.items()
+            if isinstance(filename, str)
+        }
+        files = sorted(
+            (
+                path
+                for path in directory.iterdir()
+                if path.is_file()
+                and path.name not in PC_GENERATED_EXPERIMENT_FILES
+                and not path.name.endswith(".part")
+            ),
+            key=lambda path: (self._phone_file_order(component_by_name.get(path.name, ""), path.name), path.name),
+        )
+
+        self.phone_upload_table.setRowCount(len(files))
+        for row, path in enumerate(files):
+            component = component_by_name.get(path.name) or self._infer_phone_component(path.name)
+            type_item = QTableWidgetItem(self._phone_component_label(component))
+            name_item = QTableWidgetItem(path.name)
+            name_item.setToolTip(str(path))
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            size_item = QTableWidgetItem(file_size_text(size))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.phone_upload_table.setItem(row, 0, type_item)
+            self.phone_upload_table.setItem(row, 1, name_item)
+            self.phone_upload_table.setItem(row, 2, size_item)
+
+        uploaded = len(state.get("uploaded_components", [])) if isinstance(state.get("uploaded_components"), list) else len(files)
+        expected = state.get("expected_files")
+        if expected:
+            progress = f"{uploaded}/{expected} files"
+        else:
+            progress = f"{len(files)} files"
+        if state.get("complete"):
+            status = f"Complete phone upload · {progress}"
+        elif state:
+            status = f"Receiving from phone · {progress}"
+        else:
+            status = f"Imported/legacy experiment · {progress}"
+        self.phone_upload_status.setText(status)
+
+        zarr_state = {}
+        try:
+            loaded = json.loads((directory / "zarr_state.json").read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                zarr_state = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+        zarr_status = str(zarr_state.get("status", ""))
+        if (directory / "dataset.zarr").is_dir() and zarr_status == "complete":
+            frames = zarr_state.get("frames")
+            suffix = f" · {frames} frames" if frames is not None else ""
+            self.zarr_export_status.setText(f"Zarr: ready · dataset.zarr{suffix}")
+        elif zarr_status == "running":
+            self.zarr_export_status.setText("Zarr: converting video and synchronized data...")
+        elif zarr_status == "queued":
+            self.zarr_export_status.setText("Zarr: queued for automatic conversion")
+        elif zarr_status == "failed":
+            self.zarr_export_status.setText(f"Zarr: failed · {zarr_state.get('error', 'unknown error')}")
+        else:
+            self.zarr_export_status.setText("Zarr: waiting for upload completion")
+
+    @staticmethod
+    def _infer_phone_component(filename: str) -> str:
+        lowered = filename.lower()
+        if lowered.startswith("pose"):
+            return "pose_csv"
+        if lowered.startswith("magnetic"):
+            return "magnetic_csv"
+        if lowered.startswith("sender_transport"):
+            return "sender_transport"
+        if lowered.startswith("video"):
+            return "video"
+        if "manifest" in lowered:
+            return "manifest"
+        return "file"
+
+    @staticmethod
+    def _phone_component_label(component: str) -> str:
+        return {
+            "pose_csv": "Pose",
+            "magnetic_csv": "Magnetic",
+            "sender_transport": "Sender stats",
+            "video": "Video",
+            "manifest": "Manifest",
+        }.get(component, "File")
+
+    @staticmethod
+    def _phone_file_order(component: str, filename: str) -> int:
+        inferred = component or ExperimentMonitorWindow._infer_phone_component(filename)
+        return {
+            "video": 0,
+            "pose_csv": 1,
+            "magnetic_csv": 2,
+            "sender_transport": 3,
+            "manifest": 4,
+        }.get(inferred, 5)
 
     def toggle_playback(self) -> None:
         if self.dataset is None:
@@ -809,6 +1005,8 @@ class ExperimentMonitorWindow(QMainWindow):
                 for index in range(5)
             ]
             self._update_sensor_table(self.replay_sensor_table, chips)
+        else:
+            self._update_sensor_table(self.replay_sensor_table, ())
 
         video_transport = self._nearest_kind(dataset.receiver_transport, self.play_time, "video")
         pose_transport = self._nearest_kind(dataset.receiver_transport, self.play_time, "pose")

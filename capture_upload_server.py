@@ -7,6 +7,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Optional
 
+from experiment_zarr import AutoZarrExporter
+
 
 UPLOAD_CHUNK_SIZE = 64 * 1024
 COMPONENT_FILENAMES = {
@@ -16,6 +18,9 @@ COMPONENT_FILENAMES = {
     "receiver_transport": "receiver_transport.csv",
     "manifest": "capture_manifest.json",
 }
+UUID_DIRECTORY_PATTERN = re.compile(
+    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+)
 
 
 def get_default_upload_dir() -> Path:
@@ -35,11 +40,120 @@ def console_print(*values, **kwargs) -> None:
     print(*values, **kwargs)
 
 
+def read_json_file(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def experiment_directory_identity(directory: Path) -> str:
+    experiment_state = read_json_file(directory / "experiment_state.json")
+    upload_state = read_json_file(directory / "upload_state.json")
+    manifest = read_json_file(directory / "capture_manifest.json")
+    if not manifest:
+        manifest = read_json_file(directory / "manifest__capture_manifest.json")
+    return str(
+        experiment_state.get("experiment_id")
+        or upload_state.get("capture_id")
+        or manifest.get("experimentID")
+        or manifest.get("experiment_id")
+        or ""
+    )
+
+
+def experiment_start_unix(directory: Path) -> float | None:
+    manifest = read_json_file(directory / "capture_manifest.json")
+    if not manifest:
+        manifest = read_json_file(directory / "manifest__capture_manifest.json")
+    experiment_state = read_json_file(directory / "experiment_state.json")
+    value = (
+        manifest.get("experimentStartUnixTime")
+        or manifest.get("createdAtUnixTime")
+        or experiment_state.get("start_unix_time")
+    )
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def readable_experiment_name(start_unix: float) -> str:
+    return datetime.fromtimestamp(start_unix).strftime("%Y%m%d-%H%M%S")
+
+
+def find_experiment_directory(root: Path, capture_id: str) -> Path | None:
+    direct = root / capture_id
+    if direct.is_dir():
+        return direct
+    for directory in root.iterdir() if root.is_dir() else ():
+        if directory.is_dir() and experiment_directory_identity(directory) == capture_id:
+            return directory
+    return None
+
+
+def available_readable_directory(root: Path, start_unix: float, capture_id: str) -> Path:
+    base_name = readable_experiment_name(start_unix)
+    candidate = root / base_name
+    suffix = 2
+    while candidate.exists() and experiment_directory_identity(candidate) not in ("", capture_id):
+        candidate = root / f"{base_name}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def resolve_experiment_directory(
+    root: Path,
+    capture_id: str,
+    start_unix: float | None = None,
+) -> Path:
+    root = root.expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    existing = find_experiment_directory(root, capture_id)
+    if existing is not None:
+        return existing
+    if start_unix is not None:
+        try:
+            target = available_readable_directory(root, float(start_unix), capture_id)
+        except (OSError, OverflowError, TypeError, ValueError):
+            target = root / capture_id
+    else:
+        target = root / capture_id
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def migrate_uuid_experiment_directories(root: Path) -> list[tuple[Path, Path]]:
+    """Rename UUID experiment folders to local timestamp names without merging data."""
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        return []
+    migrated: list[tuple[Path, Path]] = []
+    for directory in sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name):
+        if UUID_DIRECTORY_PATTERN.fullmatch(directory.name) is None:
+            continue
+        start_unix = experiment_start_unix(directory)
+        if start_unix is None:
+            continue
+        capture_id = experiment_directory_identity(directory) or directory.name
+        try:
+            target = available_readable_directory(root, start_unix, capture_id)
+        except (OSError, OverflowError, TypeError, ValueError):
+            continue
+        if target == directory:
+            continue
+        directory.rename(target)
+        migrated.append((directory, target))
+    return migrated
+
+
 class UploadHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     upload_root = get_default_upload_dir()
     upload_count = 0
     on_event: Optional[Callable[[dict], None]] = None
+    zarr_exporter: AutoZarrExporter | None = None
 
     def handle_expect_100(self):
         self.send_response_only(100)
@@ -63,6 +177,7 @@ class UploadHandler(BaseHTTPRequestHandler):
         is_chunked = "chunked" in transfer_encoding
         expected_file_count = self._optional_positive_int_header("X-Experiment-File-Count")
         file_index = self._optional_positive_int_header("X-Experiment-File-Index")
+        experiment_start_time = self._optional_float_header("X-Experiment-Start-Unix-Time")
 
         if not capture_id or not component or not original_filename or not upload_kind:
             self.send_error(400, "Missing required headers")
@@ -84,8 +199,15 @@ class UploadHandler(BaseHTTPRequestHandler):
 
         safe_capture_id = self.sanitize_token(capture_id)
         safe_filename = Path(original_filename).name
-        target_dir = self.upload_root / safe_capture_id
-        target_dir.mkdir(parents=True, exist_ok=True)
+        if upload_kind == "experiment":
+            target_dir = resolve_experiment_directory(
+                self.upload_root,
+                safe_capture_id,
+                experiment_start_time,
+            )
+        else:
+            target_dir = self.upload_root / safe_capture_id
+            target_dir.mkdir(parents=True, exist_ok=True)
 
         file_path = target_dir / self.canonical_filename(component, safe_filename)
         temp_path = file_path.with_name(f"{file_path.name}.part")
@@ -136,6 +258,12 @@ class UploadHandler(BaseHTTPRequestHandler):
             expected_file_count=expected_file_count,
             file_index=file_index,
         )
+        if state.get("complete") and self.__class__.zarr_exporter is not None:
+            self.__class__.zarr_exporter.schedule(
+                target_dir,
+                safe_capture_id,
+                self.__class__.on_event,
+            )
 
         console_print(f" Complete!")
         console_print(f"  Saved to: {file_path.resolve()}")
@@ -193,8 +321,11 @@ class UploadHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Experiment event must be start or stop")
             return
 
-        target_dir = self.upload_root / experiment_id
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = resolve_experiment_directory(
+            self.upload_root,
+            experiment_id,
+            event_unix_time if event == "start" else None,
+        )
         state_path = target_dir / "experiment_state.json"
         state = self.read_json(state_path)
         state.update(
@@ -278,6 +409,15 @@ class UploadHandler(BaseHTTPRequestHandler):
         except ValueError:
             return None
         return value if value > 0 else None
+
+    def _optional_float_header(self, name: str) -> Optional[float]:
+        raw_value = self.headers.get(name)
+        if not raw_value:
+            return None
+        try:
+            return float(raw_value)
+        except ValueError:
+            return None
 
     @staticmethod
     def read_json(path: Path) -> dict:
@@ -381,15 +521,24 @@ def create_upload_server(
     port: int,
     upload_root: Path,
     on_event: Optional[Callable[[dict], None]] = None,
+    *,
+    auto_zarr: bool = True,
 ) -> ThreadingHTTPServer:
     class ConfiguredUploadHandler(UploadHandler):
         pass
 
     ConfiguredUploadHandler.upload_root = Path(upload_root).expanduser().resolve()
     ConfiguredUploadHandler.upload_root.mkdir(parents=True, exist_ok=True)
+    migrate_uuid_experiment_directories(ConfiguredUploadHandler.upload_root)
     ConfiguredUploadHandler.on_event = staticmethod(on_event) if on_event is not None else None
+    ConfiguredUploadHandler.zarr_exporter = AutoZarrExporter() if auto_zarr else None
     server = ThreadingHTTPServer((host, port), ConfiguredUploadHandler)
     server.daemon_threads = True
+    if ConfiguredUploadHandler.zarr_exporter is not None:
+        ConfiguredUploadHandler.zarr_exporter.backfill(
+            ConfiguredUploadHandler.upload_root,
+            ConfiguredUploadHandler.on_event,
+        )
     return server
 
 

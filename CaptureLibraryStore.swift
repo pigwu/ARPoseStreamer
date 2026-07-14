@@ -94,7 +94,7 @@ final class CaptureLibraryStore {
 
         let record = CaptureRecord(
             id: artifact.experimentID,
-            createdAt: Date(),
+            createdAt: Date(timeIntervalSince1970: artifact.experimentStartUnixTime),
             displayName: artifact.sessionDirectoryURL.lastPathComponent,
             sessionDirectoryName: artifact.sessionDirectoryURL.lastPathComponent,
             poseCSVFileName: artifact.poseCSVURL.lastPathComponent,

@@ -3,6 +3,7 @@ import simd
 
 struct PoseCaptureArtifact {
     let experimentID: UUID
+    let experimentStartUnixTime: TimeInterval
     let sessionDirectoryURL: URL
     let poseCSVURL: URL
     let magneticCSVURL: URL?
@@ -266,6 +267,7 @@ final class PoseDataSessionRecorder {
         onSessionSaved?(
             PoseCaptureArtifact(
                 experimentID: experimentID,
+                experimentStartUnixTime: creationTime.timeIntervalSince1970,
                 sessionDirectoryURL: sessionDirectoryURL,
                 poseCSVURL: poseCSVURL,
                 magneticCSVURL: magneticCSVURL,

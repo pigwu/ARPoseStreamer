@@ -759,6 +759,7 @@ final class PositionViewModel: ObservableObject {
                     captureID: kind == .experiment ? record.id.uuidString : record.sessionDirectoryName,
                     serverBaseURL: baseURL,
                     kind: kind,
+                    experimentStartUnixTime: kind == .experiment ? record.createdAt.timeIntervalSince1970 : nil,
                     progress: { [weak self] snapshot in
                         await MainActor.run {
                             guard let self else { return }

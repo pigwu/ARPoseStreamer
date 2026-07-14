@@ -63,6 +63,8 @@ The exporter writes:
 - `data/action`: `float32`, `[N, 7]`
 - `data/force_torque`: `float32`, `[N, 6]`
 - `data/force_valid`: `bool`, `[N]`
+- `data/magnetic_txyz`: `float32`, `[N, 5, 4]`
+- `data/magnetic_valid`: `bool`, `[N, 5]`
 - `meta/episode_ends`: `int64`, `[episode_count]`
 
 Video is decoded from MP4 into RGB frames. The MP4 itself is not embedded.
@@ -75,6 +77,8 @@ Video is decoded from MP4 into RGB frames. The MP4 itself is not embedded.
 - `demo_start_pose` and `demo_end_pose` repeat the first and last `[pos, rotvec]`.
 - `force_torque` stores `[fx, fy, fz, tx, ty, tz]` when a force CSV exists.
 - `force_valid` marks frames that were within the force data time range.
+- `magnetic_txyz` stores synchronized `[temperature, x, y, z]` for magnetic chips S0-S4.
+- `magnetic_valid` marks frames within each magnetic chip's recorded time range.
 - `action` is zero-filled by default because ARPoseStreamer does not capture true
   7-DoF robot actions.
 
