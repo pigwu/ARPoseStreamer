@@ -5,6 +5,7 @@ import Network
 import VideoToolbox
 
 enum VideoStreamResolution: String, CaseIterable, Identifiable {
+    case sd480p
     case hd720p
     case fullHD1080p
 
@@ -12,6 +13,8 @@ enum VideoStreamResolution: String, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
+        case .sd480p:
+            return "480p"
         case .hd720p:
             return "720p"
         case .fullHD1080p:
@@ -21,6 +24,8 @@ enum VideoStreamResolution: String, CaseIterable, Identifiable {
 
     var dimensions: (width: Int, height: Int) {
         switch self {
+        case .sd480p:
+            return (640, 480)
         case .hd720p:
             return (1280, 720)
         case .fullHD1080p:

@@ -139,6 +139,12 @@ struct UploadStatusViewState {
     }
 }
 
+struct ActiveExperimentSession {
+    let id: UUID
+    let startUnixTime: TimeInterval
+    let startMonotonicTime: TimeInterval
+}
+
 @MainActor
 final class PositionViewModel: ObservableObject {
     @Published var hostIP: String {
@@ -155,6 +161,9 @@ final class PositionViewModel: ObservableObject {
     }
     @Published var uploadPort: String {
         didSet { UserDefaults.standard.set(uploadPort, forKey: Self.uploadPortKey) }
+    }
+    @Published var autoUploadExperiments: Bool {
+        didSet { UserDefaults.standard.set(autoUploadExperiments, forKey: Self.autoUploadExperimentsKey) }
     }
     @Published var sensorPort: String {
         didSet { UserDefaults.standard.set(sensorPort, forKey: Self.sensorPortKey) }
@@ -281,6 +290,7 @@ final class PositionViewModel: ObservableObject {
     private var sender: ARPoseUDPSender?
     private var sensorBridge: WiredSensorPoseBridge?
     private var magneticGateway: MagneticSensorHotspotGateway?
+    private var activeExperiment: ActiveExperimentSession?
 
     var previewSession: ARSession? {
         sender?.session
@@ -392,6 +402,7 @@ final class PositionViewModel: ObservableObject {
         hostIP = defaults.string(forKey: Self.hostIPKey) ?? "192.168.1.10"
         hostPort = defaults.string(forKey: Self.hostPortKey) ?? "5555"
         uploadPort = defaults.string(forKey: Self.uploadPortKey) ?? "8000"
+        autoUploadExperiments = Self.storedBool(defaults, key: Self.autoUploadExperimentsKey, fallback: true)
         sensorPort = defaults.string(forKey: Self.sensorPortKey) ?? "5556"
         sensorAccessoryProtocol = defaults.string(forKey: Self.sensorAccessoryProtocolKey) ?? "com.example.sensor.pose"
         magneticListenPort = defaults.string(forKey: Self.magneticListenPortKey) ?? "5557"
@@ -521,21 +532,51 @@ final class PositionViewModel: ObservableObject {
     }
 
     func startRecording() {
-        guard canStartRecording else { return }
+        guard canStartRecording, activeExperiment == nil else { return }
 
         if sender == nil {
             configureSender()
         }
 
+        let experiment = ActiveExperimentSession(
+            id: UUID(),
+            startUnixTime: Date().timeIntervalSince1970,
+            startMonotonicTime: ProcessInfo.processInfo.systemUptime
+        )
+        activeExperiment = experiment
         startMagneticSensor()
-        magneticGateway?.resetStreamSession()
-        sender?.startRecording()
+        magneticGateway?.resetStreamSession(sessionID: experiment.id)
+        sender?.startRecording(
+            experimentID: experiment.id,
+            startUnixTime: experiment.startUnixTime,
+            startMonotonicTime: experiment.startMonotonicTime
+        )
+        sendExperimentControlEvent(
+            experimentID: experiment.id,
+            event: "start",
+            unixTime: experiment.startUnixTime,
+            monotonicTime: experiment.startMonotonicTime
+        )
     }
 
     func stopRecording() {
         guard canStopRecording else { return }
 
-        sender?.stopRecording()
+        let stopUnixTime = Date().timeIntervalSince1970
+        let stopMonotonicTime = ProcessInfo.processInfo.systemUptime
+        sender?.stopRecording(
+            stopUnixTime: stopUnixTime,
+            stopMonotonicTime: stopMonotonicTime
+        )
+        if let activeExperiment {
+            sendExperimentControlEvent(
+                experimentID: activeExperiment.id,
+                event: "stop",
+                unixTime: stopUnixTime,
+                monotonicTime: stopMonotonicTime
+            )
+        }
+        activeExperiment = nil
     }
 
     func resetOrigin() {
@@ -627,6 +668,19 @@ final class PositionViewModel: ObservableObject {
         }
     }
 
+    func requestExperimentUpload(for record: CaptureRecord) {
+        if let previousUploadDate = record.experimentUploadedAt {
+            pendingReuploadPrompt = ReuploadPrompt(
+                recordID: record.id,
+                kind: .experiment,
+                title: "Experiment already uploaded",
+                previousUploadDate: previousUploadDate
+            )
+        } else {
+            upload(record: record, kind: .experiment)
+        }
+    }
+
     func confirmReupload(_ prompt: ReuploadPrompt) {
         guard let record = captureRecords.first(where: { $0.id == prompt.recordID }) else { return }
         pendingReuploadPrompt = nil
@@ -663,6 +717,23 @@ final class PositionViewModel: ObservableObject {
                 UploadDescriptor(fileURL: captureLibraryStore.urlForManifest(record: record), component: "manifest")
             )
             descriptors = dataDescriptors
+        case .experiment:
+            var experimentDescriptors = [
+                UploadDescriptor(fileURL: captureLibraryStore.urlForPoseCSV(record: record), component: "pose_csv")
+            ]
+            if let magneticURL = captureLibraryStore.urlForMagneticCSV(record: record) {
+                experimentDescriptors.append(UploadDescriptor(fileURL: magneticURL, component: "magnetic_csv"))
+            }
+            if let senderTransportURL = captureLibraryStore.urlForSenderTransportCSV(record: record) {
+                experimentDescriptors.append(UploadDescriptor(fileURL: senderTransportURL, component: "sender_transport"))
+            }
+            if let videoURL = captureLibraryStore.videoFileState(for: record).uploadURL {
+                experimentDescriptors.append(UploadDescriptor(fileURL: videoURL, component: "video"))
+            }
+            experimentDescriptors.append(
+                UploadDescriptor(fileURL: captureLibraryStore.urlForManifest(record: record), component: "manifest")
+            )
+            descriptors = experimentDescriptors
         }
 
         guard let baseURL = URL(string: "http://\(hostIP):\(uploadPort)") else {
@@ -671,7 +742,8 @@ final class PositionViewModel: ObservableObject {
         }
 
         uploadingRecordIDs.insert(record.id)
-        uploadStatus = "Uploading \(kind == .video ? "video" : "capture data") for \(record.displayName)..."
+        let kindLabel = uploadKindLabel(kind)
+        uploadStatus = "Uploading \(kindLabel) for \(record.displayName)..."
         uploadDetails = UploadStatusViewState(
             currentFileName: descriptors.first?.fileURL.lastPathComponent ?? "",
             currentComponent: descriptors.first?.component ?? "",
@@ -684,7 +756,7 @@ final class PositionViewModel: ObservableObject {
             do {
                 let responses = try await captureUploadService.upload(
                     descriptors: descriptors,
-                    captureID: record.sessionDirectoryName,
+                    captureID: kind == .experiment ? record.id.uuidString : record.sessionDirectoryName,
                     serverBaseURL: baseURL,
                     kind: kind,
                     progress: { [weak self] snapshot in
@@ -697,7 +769,7 @@ final class PositionViewModel: ObservableObject {
                                 totalFiles: snapshot.totalFiles,
                                 savedPaths: self.uploadDetails.savedPaths + (snapshot.savedTo.map { [$0] } ?? [])
                             )
-                            let kindLabel = kind == .video ? "video" : "capture data"
+                            let kindLabel = self.uploadKindLabel(kind)
                             self.uploadStatus = "Uploading \(kindLabel) for \(record.displayName): \(snapshot.completedFiles)/\(snapshot.totalFiles)"
                         }
                     }
@@ -717,7 +789,7 @@ final class PositionViewModel: ObservableObject {
                         savedPaths: savedPaths
                     )
                     let suffix = savedPaths.last.map { " -> \($0)" } ?? ""
-                    uploadStatus = "Uploaded \(kind == .video ? "video" : "capture data") for \(record.displayName)\(suffix)"
+                    uploadStatus = "Uploaded \(self.uploadKindLabel(kind)) for \(record.displayName)\(suffix)"
                 }
             } catch {
                 await MainActor.run {
@@ -799,6 +871,18 @@ final class PositionViewModel: ObservableObject {
                 self?.recordingPhase = status
                 self?.isRecordingVideo = status.isActive
 
+                if status.isTerminal, let experiment = self?.activeExperiment {
+                    let stopUnixTime = Date().timeIntervalSince1970
+                    let stopMonotonicTime = ProcessInfo.processInfo.systemUptime
+                    self?.sendExperimentControlEvent(
+                        experimentID: experiment.id,
+                        event: "stop",
+                        unixTime: stopUnixTime,
+                        monotonicTime: stopMonotonicTime
+                    )
+                    self?.activeExperiment = nil
+                }
+
                 if case .saved(let url) = status {
                     self?.lastSavedVideoURL = url
                     self?.lastSavedVideoName = url.lastPathComponent
@@ -812,6 +896,9 @@ final class PositionViewModel: ObservableObject {
 
                 if let record = self.captureLibraryStore.addCapture(from: artifact) {
                     self.captureRecords.insert(record, at: 0)
+                    if self.autoUploadExperiments {
+                        self.upload(record: record, kind: .experiment)
+                    }
                 } else {
                     self.captureRecords = self.captureLibraryStore.loadRecords().sorted { $0.createdAt > $1.createdAt }
                 }
@@ -1041,6 +1128,39 @@ final class PositionViewModel: ObservableObject {
         )
     }
 
+    private func uploadKindLabel(_ kind: CaptureUploadKind) -> String {
+        switch kind {
+        case .video:
+            return "video"
+        case .pose:
+            return "capture data"
+        case .experiment:
+            return "complete experiment"
+        }
+    }
+
+    private func sendExperimentControlEvent(
+        experimentID: UUID,
+        event: String,
+        unixTime: TimeInterval,
+        monotonicTime: TimeInterval
+    ) {
+        guard
+            let port = normalizedPort(uploadPort),
+            let baseURL = URL(string: "http://\(hostIP):\(port)")
+        else { return }
+
+        Task {
+            try? await captureUploadService.sendExperimentEvent(
+                experimentID: experimentID,
+                event: event,
+                eventUnixTime: unixTime,
+                eventMonotonicTime: monotonicTime,
+                serverBaseURL: baseURL
+            )
+        }
+    }
+
     private func normalizedPort(_ value: String) -> UInt16? {
         guard let port = UInt16(value), port > 0 else { return nil }
         return port
@@ -1073,6 +1193,7 @@ final class PositionViewModel: ObservableObject {
     private static let hostIPKey = "ARPoseStreamer.hostIP"
     private static let hostPortKey = "ARPoseStreamer.hostPort"
     private static let uploadPortKey = "ARPoseStreamer.uploadPort"
+    private static let autoUploadExperimentsKey = "ARPoseStreamer.autoUploadExperiments"
     private static let sensorPortKey = "ARPoseStreamer.sensorPort"
     private static let sensorAccessoryProtocolKey = "ARPoseStreamer.sensorAccessoryProtocol"
     private static let magneticListenPortKey = "ARPoseStreamer.magnetic.listenPort"

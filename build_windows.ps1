@@ -65,6 +65,7 @@ Build-DesktopTool -Name "ARPose Packet Loss Monitor" -EntryPoint "udp_packet_los
 Build-DesktopTool -Name "ARPose Zarr Exporter" -EntryPoint "zarr_exporter_ui.py"
 Build-DesktopTool -Name "AnySkin UDP Monitor" -EntryPoint "anyskin_udp_monitor.py"
 Build-DesktopTool -Name "ARPose Video Debugger" -EntryPoint "udp_video_debug_ui.py" -ExtraArgs @("--collect-all", "av")
+Build-DesktopTool -Name "ARPose Experiment Monitor" -EntryPoint "experiment_replay_ui.py" -ExtraArgs @("--collect-all", "av")
 
 Write-Host "`nBuild complete!"
 Write-Host "Executable locations:"
@@ -74,4 +75,5 @@ Write-Host "  dist\ARPose Packet Loss Monitor.exe"
 Write-Host "  dist\ARPose Zarr Exporter.exe"
 Write-Host "  dist\AnySkin UDP Monitor.exe"
 Write-Host "  dist\ARPose Video Debugger.exe"
+Write-Host "  dist\ARPose Experiment Monitor.exe"
 Write-Host "`nYou can now run the application by double-clicking the .exe file"

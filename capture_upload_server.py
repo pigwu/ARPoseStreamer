@@ -1,22 +1,45 @@
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable, Optional
 
 
 UPLOAD_CHUNK_SIZE = 64 * 1024
+COMPONENT_FILENAMES = {
+    "pose_csv": "pose.csv",
+    "magnetic_csv": "magnetic.csv",
+    "sender_transport": "sender_transport.csv",
+    "receiver_transport": "receiver_transport.csv",
+    "manifest": "capture_manifest.json",
+}
 
 
 def get_default_upload_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        # A PyInstaller one-file build extracts modules into a temporary
+        # directory.  Store experiments next to the executable so they
+        # survive after the monitor exits.
+        return (Path(sys.executable).resolve().parent / "uploads").resolve()
     return (Path(__file__).resolve().parent / "uploads").resolve()
+
+
+def console_print(*values, **kwargs) -> None:
+    """Print when a console exists; PyInstaller --windowed sets it to None."""
+    stream = kwargs.get("file", sys.stdout)
+    if stream is None:
+        return
+    print(*values, **kwargs)
 
 
 class UploadHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     upload_root = get_default_upload_dir()
     upload_count = 0
+    on_event: Optional[Callable[[dict], None]] = None
 
     def handle_expect_100(self):
         self.send_response_only(100)
@@ -24,6 +47,9 @@ class UploadHandler(BaseHTTPRequestHandler):
         return True
 
     def do_POST(self):
+        if self.path == "/experiment/control":
+            self.handle_experiment_control()
+            return
         if self.path != "/upload":
             self.send_error(404, "Unknown endpoint")
             return
@@ -35,6 +61,8 @@ class UploadHandler(BaseHTTPRequestHandler):
         content_length = self.headers.get("Content-Length")
         transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
         is_chunked = "chunked" in transfer_encoding
+        expected_file_count = self._optional_positive_int_header("X-Experiment-File-Count")
+        file_index = self._optional_positive_int_header("X-Experiment-File-Index")
 
         if not capture_id or not component or not original_filename or not upload_kind:
             self.send_error(400, "Missing required headers")
@@ -54,22 +82,22 @@ class UploadHandler(BaseHTTPRequestHandler):
             self.send_error(411, "Missing Content-Length or chunked Transfer-Encoding")
             return
 
-        safe_capture_id = capture_id.replace("/", "_").replace("\\", "_")
+        safe_capture_id = self.sanitize_token(capture_id)
         safe_filename = Path(original_filename).name
         target_dir = self.upload_root / safe_capture_id
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        file_path = target_dir / f"{component}__{safe_filename}"
+        file_path = target_dir / self.canonical_filename(component, safe_filename)
         temp_path = file_path.with_name(f"{file_path.name}.part")
 
         # Progress display
         timestamp = datetime.now().strftime("%H:%M:%S")
         size_text = f"{body_length / (1024 * 1024):.2f} MB" if body_length is not None else "chunked"
-        print(f"\n[{timestamp}] Receiving upload...")
-        print(f"  File: {original_filename}")
-        print(f"  Type: {upload_kind}")
-        print(f"  Size: {size_text}")
-        print(f"  Progress: ", end="", flush=True)
+        console_print(f"\n[{timestamp}] Receiving upload...")
+        console_print(f"  File: {original_filename}")
+        console_print(f"  Type: {upload_kind}")
+        console_print(f"  Size: {size_text}")
+        console_print(f"  Progress: ", end="", flush=True)
 
         # Read with progress
         try:
@@ -83,7 +111,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-            print(f" failed ({exc})")
+            console_print(f" failed ({exc})")
             self.send_error(400, "Incomplete upload body")
             return
 
@@ -92,17 +120,26 @@ class UploadHandler(BaseHTTPRequestHandler):
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-            print(" failed")
+            console_print(" failed")
             self.send_error(400, "Incomplete upload body")
             return
 
         temp_path.replace(file_path)
 
         UploadHandler.upload_count += 1
+        state = self.update_upload_state(
+            target_dir=target_dir,
+            capture_id=safe_capture_id,
+            component=component,
+            filename=file_path.name,
+            upload_kind=upload_kind,
+            expected_file_count=expected_file_count,
+            file_index=file_index,
+        )
 
-        print(f" Complete!")
-        print(f"  Saved to: {file_path.resolve()}")
-        print(f"  Total uploads: {UploadHandler.upload_count}")
+        console_print(f" Complete!")
+        console_print(f"  Saved to: {file_path.resolve()}")
+        console_print(f"  Total uploads: {UploadHandler.upload_count}")
 
         response = {
             "ok": True,
@@ -110,6 +147,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             "component": component,
             "upload_kind": upload_kind,
             "saved_to": str(file_path.resolve()),
+            "complete": state.get("complete", False),
         }
 
         encoded = json.dumps(response).encode("utf-8")
@@ -120,6 +158,158 @@ class UploadHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
         self.close_connection = True
+        self.emit_event(
+            {
+                "type": "upload",
+                "capture_id": safe_capture_id,
+                "component": component,
+                "path": str(file_path.resolve()),
+                "complete": state.get("complete", False),
+            }
+        )
+
+    def handle_experiment_control(self) -> None:
+        content_length = self.headers.get("Content-Length")
+        try:
+            body_length = int(content_length or "0")
+        except ValueError:
+            self.send_error(400, "Invalid Content-Length")
+            return
+        if body_length <= 0 or body_length > 64 * 1024:
+            self.send_error(400, "Invalid experiment control body")
+            return
+
+        try:
+            payload = json.loads(self.rfile.read(body_length).decode("utf-8"))
+            event = str(payload["event"]).lower()
+            experiment_id = self.sanitize_token(str(payload["experimentID"]))
+            event_unix_time = float(payload["eventUnixTime"])
+            event_monotonic_time = float(payload["eventMonotonicTime"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self.send_error(400, "Invalid experiment control payload")
+            return
+
+        if event not in {"start", "stop"}:
+            self.send_error(400, "Experiment event must be start or stop")
+            return
+
+        target_dir = self.upload_root / experiment_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        state_path = target_dir / "experiment_state.json"
+        state = self.read_json(state_path)
+        state.update(
+            {
+                "experiment_id": experiment_id,
+                "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+            }
+        )
+        state[f"{event}_unix_time"] = event_unix_time
+        state[f"{event}_monotonic_time"] = event_monotonic_time
+        self.write_json_atomic(state_path, state)
+
+        event_payload = {
+            "type": "experiment_control",
+            "event": event,
+            "experiment_id": experiment_id,
+            "event_unix_time": event_unix_time,
+            "event_monotonic_time": event_monotonic_time,
+            "directory": str(target_dir.resolve()),
+        }
+        self.emit_event(event_payload)
+        self.send_json(200, {"ok": True, **event_payload})
+
+    def update_upload_state(
+        self,
+        *,
+        target_dir: Path,
+        capture_id: str,
+        component: str,
+        filename: str,
+        upload_kind: str,
+        expected_file_count: Optional[int],
+        file_index: Optional[int],
+    ) -> dict:
+        state_path = target_dir / "upload_state.json"
+        state = self.read_json(state_path)
+        components = state.get("components")
+        if not isinstance(components, dict):
+            components = {}
+        components[component] = filename
+        uploaded_components = state.get("uploaded_components")
+        if not isinstance(uploaded_components, list):
+            uploaded_components = []
+        if component not in uploaded_components:
+            uploaded_components.append(component)
+
+        expected = expected_file_count or state.get("expected_files")
+        state.update(
+            {
+                "capture_id": capture_id,
+                "upload_kind": upload_kind,
+                "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+                "expected_files": expected,
+                "last_file_index": file_index,
+                "components": components,
+                "uploaded_components": uploaded_components,
+                "complete": bool(expected and len(uploaded_components) >= int(expected)),
+            }
+        )
+        self.write_json_atomic(state_path, state)
+        return state
+
+    @staticmethod
+    def canonical_filename(component: str, original_filename: str) -> str:
+        if component == "video":
+            suffix = Path(original_filename).suffix.lower() or ".mp4"
+            return f"video{suffix}"
+        return COMPONENT_FILENAMES.get(component, f"{UploadHandler.sanitize_token(component)}__{original_filename}")
+
+    @staticmethod
+    def sanitize_token(value: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+        return sanitized or "unnamed"
+
+    def _optional_positive_int_header(self, name: str) -> Optional[int]:
+        raw_value = self.headers.get(name)
+        if not raw_value:
+            return None
+        try:
+            value = int(raw_value)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def read_json(path: Path) -> dict:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def write_json_atomic(path: Path, value: dict) -> None:
+        temp_path = path.with_suffix(path.suffix + ".part")
+        temp_path.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+        temp_path.replace(path)
+
+    def send_json(self, status: int, value: dict) -> None:
+        encoded = json.dumps(value).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(encoded)
+        self.close_connection = True
+
+    def emit_event(self, event: dict) -> None:
+        callback = self.__class__.on_event
+        if callback is not None:
+            try:
+                callback(event)
+            except Exception as exc:
+                console_print(f"[WARN] Upload event callback failed: {exc}", file=sys.stderr)
 
     def log_message(self, format, *args):
         return
@@ -139,7 +329,7 @@ class UploadHandler(BaseHTTPRequestHandler):
 
             percent = int((received / body_length) * 100) if body_length else 100
             if percent != last_percent and percent % 10 == 0:
-                print(f"{percent}%...", end="", flush=True)
+                console_print(f"{percent}%...", end="", flush=True)
                 last_percent = percent
 
         return received
@@ -180,10 +370,27 @@ class UploadHandler(BaseHTTPRequestHandler):
                 raise ValueError("invalid chunk terminator")
 
             if received >= next_report:
-                print(f"{received / (1024 * 1024):.1f}MB...", end="", flush=True)
+                console_print(f"{received / (1024 * 1024):.1f}MB...", end="", flush=True)
                 next_report += 1024 * 1024
 
         return received
+
+
+def create_upload_server(
+    host: str,
+    port: int,
+    upload_root: Path,
+    on_event: Optional[Callable[[dict], None]] = None,
+) -> ThreadingHTTPServer:
+    class ConfiguredUploadHandler(UploadHandler):
+        pass
+
+    ConfiguredUploadHandler.upload_root = Path(upload_root).expanduser().resolve()
+    ConfiguredUploadHandler.upload_root.mkdir(parents=True, exist_ok=True)
+    ConfiguredUploadHandler.on_event = staticmethod(on_event) if on_event is not None else None
+    server = ThreadingHTTPServer((host, port), ConfiguredUploadHandler)
+    server.daemon_threads = True
+    return server
 
 
 def main() -> None:
@@ -196,25 +403,25 @@ def main() -> None:
     UploadHandler.upload_root = Path(args.out_dir).resolve()
     UploadHandler.upload_root.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 70)
-    print("ARPoseStreamer Upload Server")
-    print("=" * 70)
-    print(f"Server URL: http://{args.host}:{args.port}")
-    print(f"Upload folder: {UploadHandler.upload_root}")
-    print(f"iPhone setup:")
-    print(f"   1. Open ARPoseStreamer app")
-    print(f"   2. Go to 'Past Records' page")
-    print(f"   3. Select a recording and tap 'Upload'")
-    print(f"   4. Enter server IP and port in app settings")
-    print("=" * 70)
-    print("Waiting for uploads...\n")
+    console_print("=" * 70)
+    console_print("ARPoseStreamer Upload Server")
+    console_print("=" * 70)
+    console_print(f"Server URL: http://{args.host}:{args.port}")
+    console_print(f"Upload folder: {UploadHandler.upload_root}")
+    console_print(f"iPhone setup:")
+    console_print(f"   1. Open ARPoseStreamer app")
+    console_print(f"   2. Go to 'Past Records' page")
+    console_print(f"   3. Select a recording and tap 'Upload'")
+    console_print(f"   4. Enter server IP and port in app settings")
+    console_print("=" * 70)
+    console_print("Waiting for uploads...\n")
 
     try:
-        server = HTTPServer((args.host, args.port), UploadHandler)
+        server = create_upload_server(args.host, args.port, UploadHandler.upload_root)
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n\nServer stopped by user")
-        print(f"Total files received: {UploadHandler.upload_count}")
+        console_print("\n\nServer stopped by user")
+        console_print(f"Total files received: {UploadHandler.upload_count}")
         sys.exit(0)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import socket
 import struct
 import sys
@@ -49,6 +50,8 @@ VIDEO_VERSION = 1
 FRAME_STALE_SECONDS = 0.20
 MAX_INFLIGHT_FRAMES = 8
 LATENCY_HISTORY_SECONDS = 30.0
+CLOCK_SAMPLE_WINDOW_SECONDS = 60.0
+MAX_CLOCK_DELTA_SECONDS = 24.0 * 60.0 * 60.0
 
 
 def build_av_install_hint() -> str:
@@ -79,6 +82,7 @@ class FrameAssembly:
     is_keyframe: bool
     created_at: float
     last_update_at: float
+    first_received_wall_time: float
     nalus: dict[int, NALAssembly] = field(default_factory=dict)
 
     def is_complete(self) -> bool:
@@ -95,6 +99,67 @@ class FrameAssembly:
             payload = b"".join(assembly.fragments[index] for index in range(assembly.total_fragments))
             chunks.append(b"\x00\x00\x00\x01" + payload)
         return b"".join(chunks)
+
+
+class LatencyClockCompensator:
+    """Remove sender/receiver wall-clock offset from one-way latency samples.
+
+    Pose packets are preferred as the low-overhead reference path. Video packet
+    arrival is used only as a fallback when the pose receiver is disabled.
+    """
+
+    def __init__(self, sample_window_seconds: float = CLOCK_SAMPLE_WINDOW_SECONDS) -> None:
+        self.sample_window_seconds = sample_window_seconds
+        self._pose_samples: deque[tuple[float, float]] = deque()
+        self._video_samples: deque[tuple[float, float]] = deque()
+
+    def observe(
+        self,
+        sender_timestamp: float,
+        receive_wall_time: float,
+        receive_monotonic: float,
+        *,
+        is_pose_reference: bool,
+    ) -> float | None:
+        raw_delay = receive_wall_time - sender_timestamp
+        if not self._is_valid_raw_delay(raw_delay):
+            return None
+
+        samples = self._pose_samples if is_pose_reference else self._video_samples
+        samples.append((receive_monotonic, raw_delay))
+        self._prune(receive_monotonic)
+        return self.compensate_raw_delay(raw_delay)
+
+    def compensate_raw_delay(self, raw_delay: float) -> float | None:
+        offset = self.offset_seconds
+        if offset is None or not self._is_valid_raw_delay(raw_delay):
+            return None
+        return max(0.0, (raw_delay - offset) * 1000.0)
+
+    @property
+    def offset_seconds(self) -> float | None:
+        samples = self._pose_samples if self._pose_samples else self._video_samples
+        if not samples:
+            return None
+        return min(raw_delay for _, raw_delay in samples)
+
+    @property
+    def reference_name(self) -> str:
+        if self._pose_samples:
+            return "Pose packets"
+        if self._video_samples:
+            return "Video fallback"
+        return "Calibrating"
+
+    def _prune(self, now_monotonic: float) -> None:
+        cutoff = now_monotonic - self.sample_window_seconds
+        for samples in (self._pose_samples, self._video_samples):
+            while samples and samples[0][0] < cutoff:
+                samples.popleft()
+
+    @staticmethod
+    def _is_valid_raw_delay(raw_delay: float) -> bool:
+        return math.isfinite(raw_delay) and abs(raw_delay) <= MAX_CLOCK_DELTA_SECONDS
 
 
 class VideoReceiverThread(QThread):
@@ -114,14 +179,24 @@ class VideoReceiverThread(QThread):
         self._frames: dict[int, FrameAssembly] = {}
         self._latest_decoded_frame_id: int | None = None
         self._waiting_for_keyframe = True
+        self._latency_clock = LatencyClockCompensator()
+        self._last_video_raw_delay: float | None = None
+        self._last_pose_raw_delay: float | None = None
         self._video_byte_window: deque[tuple[float, int]] = deque()
         self._video_frame_window: deque[float] = deque()
+        self._pose_packet_window: deque[float] = deque()
         self._video_state = {
             "status": "Idle",
             "frame_id": 0,
             "fps": 0.0,
             "bitrate_mbps": 0.0,
-            "latency_ms": 0.0,
+            "latency_ms": None,
+            "raw_latency_ms": None,
+            "capture_timestamp": None,
+            "first_receive_wall_time": None,
+            "decode_wall_time": None,
+            "clock_offset_ms": None,
+            "clock_reference": "Calibrating",
             "decoded_frames": 0,
             "dropped_frames": 0,
             "decode_errors": 0,
@@ -132,13 +207,15 @@ class VideoReceiverThread(QThread):
         self._pose_state = {
             "status": "Pose idle",
             "sequence": 0,
-            "latency_ms": 0.0,
+            "latency_ms": None,
+            "raw_latency_ms": None,
+            "sender_timestamp": None,
+            "receive_wall_time": None,
             "fps": 0.0,
             "drops": 0,
             "position": "(0.000, 0.000, 0.000)",
         }
         self._prev_pose_sequence: int | None = None
-        self._prev_pose_monotonic: float | None = None
 
     @staticmethod
     def _create_decoder():
@@ -197,10 +274,15 @@ class VideoReceiverThread(QThread):
 
                 self._prune_stale_frames(now)
                 self._emit_video_metrics()
+                self._emit_pose_metrics()
         finally:
             video_socket.close()
             if pose_socket is not None:
                 pose_socket.close()
+            self._video_state.update({"status": "Stopped", "fps": 0.0, "bitrate_mbps": 0.0})
+            self._pose_state.update({"status": "Pose stopped", "fps": 0.0})
+            self.video_metrics.emit(dict(self._video_state))
+            self.pose_metrics.emit(dict(self._pose_state))
             self.status_changed.emit("Stopped")
             self.log_message.emit("Receiver stopped")
 
@@ -212,12 +294,14 @@ class VideoReceiverThread(QThread):
 
         recv_time = time.time()
         monotonic_now = time.monotonic()
-        latency_ms = max(0.0, (recv_time - sender_time) * 1000.0)
-        if self._prev_pose_monotonic is None:
-            fps = 0.0
-        else:
-            fps = 1.0 / max(monotonic_now - self._prev_pose_monotonic, 1e-6)
-        self._prev_pose_monotonic = monotonic_now
+        self._last_pose_raw_delay = recv_time - sender_time
+        latency_ms = self._latency_clock.observe(
+            sender_time,
+            recv_time,
+            monotonic_now,
+            is_pose_reference=True,
+        )
+        self._pose_packet_window.append(monotonic_now)
 
         dropped = 0
         if self._prev_pose_sequence is not None:
@@ -229,12 +313,14 @@ class VideoReceiverThread(QThread):
                 "status": f"Pose from {address[0]}:{address[1]}",
                 "sequence": sequence,
                 "latency_ms": latency_ms,
-                "fps": fps,
-                "drops": dropped,
+                "raw_latency_ms": self._last_pose_raw_delay * 1000.0,
+                "sender_timestamp": sender_time,
+                "receive_wall_time": recv_time,
+                "drops": self._pose_state["drops"] + dropped,
                 "position": f"({x:+.3f}, {y:+.3f}, {z:+.3f})",
             }
         )
-        self.pose_metrics.emit(dict(self._pose_state))
+        self._emit_pose_metrics()
 
     def _handle_video_packet(self, packet: bytes, address: tuple[str, int]) -> None:
         if len(packet) < VIDEO_PACKET_HEADER.size:
@@ -267,6 +353,7 @@ class VideoReceiverThread(QThread):
             return
 
         now = time.monotonic()
+        now_wall_clock = time.time()
         self._video_state["status"] = f"Receiving from {address[0]}:{address[1]}"
         self._video_state["packets"] += 1
         self._video_state["bytes"] += len(packet)
@@ -274,6 +361,12 @@ class VideoReceiverThread(QThread):
 
         frame = self._frames.get(frame_id)
         if frame is None:
+            self._latency_clock.observe(
+                capture_timestamp,
+                now_wall_clock,
+                now,
+                is_pose_reference=False,
+            )
             frame = FrameAssembly(
                 frame_id=frame_id,
                 capture_timestamp=capture_timestamp,
@@ -281,6 +374,7 @@ class VideoReceiverThread(QThread):
                 is_keyframe=bool(flags & 0x01),
                 created_at=now,
                 last_update_at=now,
+                first_received_wall_time=now_wall_clock,
             )
             self._frames[frame_id] = frame
         else:
@@ -382,11 +476,18 @@ class VideoReceiverThread(QThread):
 
         now_monotonic = time.monotonic()
         now_wall_clock = time.time()
+        self._last_video_raw_delay = now_wall_clock - frame.capture_timestamp
         self._video_frame_window.append(now_monotonic)
         self._latest_decoded_frame_id = frame.frame_id
         self._video_state["frame_id"] = frame.frame_id
         self._video_state["decoded_frames"] += 1
-        self._video_state["latency_ms"] = max(0.0, (now_wall_clock - frame.capture_timestamp) * 1000.0)
+        self._video_state["latency_ms"] = self._latency_clock.compensate_raw_delay(
+            self._last_video_raw_delay
+        )
+        self._video_state["raw_latency_ms"] = self._last_video_raw_delay * 1000.0
+        self._video_state["capture_timestamp"] = frame.capture_timestamp
+        self._video_state["first_receive_wall_time"] = frame.first_received_wall_time
+        self._video_state["decode_wall_time"] = now_wall_clock
         if frame.is_keyframe:
             self._video_state["keyframes"] += 1
 
@@ -403,7 +504,28 @@ class VideoReceiverThread(QThread):
         self._video_state["fps"] = float(len(self._video_frame_window))
         bytes_last_second = sum(size for _, size in self._video_byte_window)
         self._video_state["bitrate_mbps"] = (bytes_last_second * 8.0) / 1_000_000.0
+        if self._last_video_raw_delay is not None:
+            self._video_state["latency_ms"] = self._latency_clock.compensate_raw_delay(
+                self._last_video_raw_delay
+            )
+        offset_seconds = self._latency_clock.offset_seconds
+        self._video_state["clock_offset_ms"] = (
+            offset_seconds * 1000.0 if offset_seconds is not None else None
+        )
+        self._video_state["clock_reference"] = self._latency_clock.reference_name
         self.video_metrics.emit(dict(self._video_state))
+
+    def _emit_pose_metrics(self) -> None:
+        now = time.monotonic()
+        while self._pose_packet_window and now - self._pose_packet_window[0] > 1.0:
+            self._pose_packet_window.popleft()
+
+        self._pose_state["fps"] = float(len(self._pose_packet_window))
+        if self._last_pose_raw_delay is not None:
+            self._pose_state["latency_ms"] = self._latency_clock.compensate_raw_delay(
+                self._last_pose_raw_delay
+            )
+        self.pose_metrics.emit(dict(self._pose_state))
 
 
 class LabeledValue(QLabel):
@@ -523,7 +645,9 @@ class VideoDebugWindow(QMainWindow):
         self.video_frame_id_value = LabeledValue("0")
         self.video_fps_value = LabeledValue("0.0")
         self.video_bitrate_value = LabeledValue("0.0")
-        self.video_latency_value = LabeledValue("0.0 ms")
+        self.video_latency_value = LabeledValue("--")
+        self.video_clock_offset_value = LabeledValue("--")
+        self.video_clock_reference_value = LabeledValue("Calibrating")
         self.video_decoded_value = LabeledValue("0")
         self.video_dropped_value = LabeledValue("0")
         self.video_keyframes_value = LabeledValue("0")
@@ -534,7 +658,9 @@ class VideoDebugWindow(QMainWindow):
             ("Frame ID", self.video_frame_id_value),
             ("Decoded FPS", self.video_fps_value),
             ("Bitrate", self.video_bitrate_value),
-            ("Approx Latency", self.video_latency_value),
+            ("Est. Latency", self.video_latency_value),
+            ("Clock Offset", self.video_clock_offset_value),
+            ("Clock Reference", self.video_clock_reference_value),
             ("Decoded Frames", self.video_decoded_value),
             ("Dropped Frames", self.video_dropped_value),
             ("Keyframes", self.video_keyframes_value),
@@ -542,20 +668,26 @@ class VideoDebugWindow(QMainWindow):
             ("Bytes", self.video_bytes_value),
         ]:
             video_form.addRow(label, widget)
+        self.video_latency_value.setToolTip(
+            "Capture-to-display latency after removing the estimated phone/PC clock offset."
+        )
+        self.video_clock_offset_value.setToolTip(
+            "Estimated phone-to-PC wall-clock offset; pose packets are used when available."
+        )
 
         pose_box = QGroupBox("Pose Feed")
         pose_form = QFormLayout(pose_box)
         self.pose_state_value = LabeledValue("Pose idle")
         self.pose_sequence_value = LabeledValue("0")
         self.pose_fps_value = LabeledValue("0.0")
-        self.pose_latency_value = LabeledValue("0.0 ms")
+        self.pose_latency_value = LabeledValue("--")
         self.pose_drop_value = LabeledValue("0")
         self.pose_position_value = LabeledValue("(0.000, 0.000, 0.000)")
         for label, widget in [
             ("State", self.pose_state_value),
             ("Sequence", self.pose_sequence_value),
             ("FPS", self.pose_fps_value),
-            ("Approx Latency", self.pose_latency_value),
+            ("Est. Latency", self.pose_latency_value),
             ("Drops", self.pose_drop_value),
             ("Position", self.pose_position_value),
         ]:
@@ -694,7 +826,12 @@ class VideoDebugWindow(QMainWindow):
         self.video_frame_id_value.setText(str(metrics["frame_id"]))
         self.video_fps_value.setText(f"{metrics['fps']:.1f}")
         self.video_bitrate_value.setText(f"{metrics['bitrate_mbps']:.2f} Mbps")
-        self.video_latency_value.setText(f"{metrics['latency_ms']:.1f} ms")
+        latency_ms = metrics.get("latency_ms")
+        self.video_latency_value.setText(self.format_latency(latency_ms))
+        self.video_clock_offset_value.setText(
+            self.format_latency(metrics.get("clock_offset_ms"), include_sign=True)
+        )
+        self.video_clock_reference_value.setText(str(metrics.get("clock_reference", "--")))
         self.video_decoded_value.setText(str(metrics["decoded_frames"]))
         self.video_dropped_value.setText(str(metrics["dropped_frames"]))
         self.video_keyframes_value.setText(str(metrics["keyframes"]))
@@ -702,22 +839,25 @@ class VideoDebugWindow(QMainWindow):
         self.video_bytes_value.setText(self.format_bytes(int(metrics["bytes"])))
 
         frame_id = int(metrics["frame_id"])
-        if frame_id > self.last_video_frame_id and metrics["latency_ms"] > 0:
+        if frame_id > self.last_video_frame_id:
             self.last_video_frame_id = frame_id
-            self.append_latency_sample(self.video_latency_history, float(metrics["latency_ms"]))
+            if self.is_valid_metric(latency_ms):
+                self.append_latency_sample(self.video_latency_history, float(latency_ms))
 
     def update_pose_metrics(self, metrics: dict) -> None:
         self.pose_state_value.setText(str(metrics["status"]))
         self.pose_sequence_value.setText(str(metrics["sequence"]))
         self.pose_fps_value.setText(f"{metrics['fps']:.1f}")
-        self.pose_latency_value.setText(f"{metrics['latency_ms']:.1f} ms")
+        latency_ms = metrics.get("latency_ms")
+        self.pose_latency_value.setText(self.format_latency(latency_ms))
         self.pose_drop_value.setText(str(metrics["drops"]))
         self.pose_position_value.setText(str(metrics["position"]))
 
         sequence = int(metrics["sequence"])
-        if sequence > self.last_pose_sequence and metrics["latency_ms"] > 0:
+        if sequence > self.last_pose_sequence:
             self.last_pose_sequence = sequence
-            self.append_latency_sample(self.pose_latency_history, float(metrics["latency_ms"]))
+            if self.is_valid_metric(latency_ms):
+                self.append_latency_sample(self.pose_latency_history, float(latency_ms))
 
     def append_log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -736,6 +876,17 @@ class VideoDebugWindow(QMainWindow):
                 return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
             value /= 1024.0
         return f"{num_bytes} B"
+
+    @staticmethod
+    def is_valid_metric(value: object) -> bool:
+        return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+    @classmethod
+    def format_latency(cls, value: object, *, include_sign: bool = False) -> str:
+        if not cls.is_valid_metric(value):
+            return "--"
+        sign = "+" if include_sign else ""
+        return f"{float(value):{sign}.1f} ms"
 
     def reset_latency_history(self) -> None:
         self.video_latency_history.clear()

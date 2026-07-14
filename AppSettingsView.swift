@@ -20,6 +20,8 @@ struct AppSettingsView: View {
                     TextField("Upload Port", text: $viewModel.uploadPort)
                         .keyboardType(.numberPad)
 
+                    Toggle("Auto-upload Completed Experiments", isOn: $viewModel.autoUploadExperiments)
+
                     TextField("Legacy Sensor Mirror Port", text: $viewModel.sensorPort)
                         .keyboardType(.numberPad)
 
@@ -48,7 +50,7 @@ struct AppSettingsView: View {
                     TextField("Bitrate (Mbps)", text: $viewModel.videoBitrateMbps)
                         .keyboardType(.decimalPad)
 
-                    Text("The video path uses H.264 over raw UDP with small packets for low-latency LAN debugging.")
+                    Text("The video path uses H.264 over raw UDP with small packets. For a lower-latency test, try 480p at 2–3 Mbps.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

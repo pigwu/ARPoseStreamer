@@ -162,6 +162,8 @@ It is especially useful when you want a clean building block for:
 - Hidden side menu for operational actions
 - Capture history with renaming and re-upload prompts
 - Local pose CSV + manifest export for offline upload
+- One-button experiment capture for synchronized pose, magnetic sensor, MP4, and sender/receiver transport diagnostics
+- Integrated desktop experiment library with synchronized video/data replay and selectable latency, bitrate, FPS, and drop overlays
 - SwiftUI control panel on iPhone
 - XcodeGen project spec included
 
@@ -311,6 +313,14 @@ For Windows uploads:
 ```powershell
 py capture_upload_server.py --host 0.0.0.0 --port 8000
 ```
+
+For the integrated live monitor, grouped upload receiver, and synchronized experiment replay UI:
+
+```powershell
+py experiment_replay_ui.py --bind 0.0.0.0 --video-port 5560 --pose-port 5555 --combined-port 5558 --upload-port 8000 --phone-ip 172.20.10.1
+```
+
+Keep live streaming and sensor reception running as needed. On the iPhone, `Start Experiment` defines the shared time origin; `Stop & Save Experiment` finalizes the MP4 and uploads the entire experiment into one UUID-named folder under `uploads/`. Source runs use the repository `uploads/` directory; the packaged Windows monitor uses an `uploads/` directory beside the EXE so experiments persist after the one-file app exits. The replay tab can then select any complete experiment and synchronously inspect video, pose, all five magnetic chips, sender statistics, receiver latency, clock offset, bitrate, FPS, drops, and packet counters.
 
 ### Install The iPhone App
 
@@ -517,7 +527,7 @@ For the default lab setup, yes. They should be on the same LAN or Wi-Fi so the i
 
 ### Why does the receiver show approximate latency?
 
-Because it compares sender time and receiver time. If those clocks are not synchronized, the value is only a rough hint.
+The sender and receiver run on different clocks. The video debugger removes an estimated clock offset, preferring the low-overhead pose stream as its reference, then shows the remaining capture-to-display delay. The estimate is most useful with the pose port enabled and may read near zero for the fastest pose packets because true one-way delay cannot be measured exactly without synchronized clocks.
 
 ## Contributing
 

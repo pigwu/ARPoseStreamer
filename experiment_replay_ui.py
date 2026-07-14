@@ -1,0 +1,965 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import socket
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+try:
+    import av
+except Exception:
+    av = None
+
+try:
+    import pyqtgraph as pg
+except Exception:
+    pg = None
+
+from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QPushButton,
+    QSlider,
+    QSplitter,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from capture_upload_server import create_upload_server, get_default_upload_dir
+from experiment_data import ExperimentDataset, TimedRows, discover_experiments
+from pose_magnetic_receiver import APM1DecodeError, decode_apm1_packet
+from udp_video_debug_ui import LatencyClockCompensator, VideoReceiverThread
+
+
+RECEIVER_FIELDS = [
+    "kind",
+    "identifier",
+    "sender_time",
+    "pc_receive_time",
+    "pc_decode_time",
+    "experiment_time",
+    "raw_latency_ms",
+    "corrected_latency_ms",
+    "clock_offset_ms",
+    "fps",
+    "bitrate_mbps",
+    "dropped_frames",
+    "packets",
+    "bytes",
+]
+
+
+def metric_text(value: object, suffix: str = "", precision: int = 1) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if not math.isfinite(number):
+        return "--"
+    return f"{number:.{precision}f}{suffix}"
+
+
+class UploadServerBridge(QObject):
+    event_received = pyqtSignal(dict)
+    status_changed = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.server = None
+        self.thread: threading.Thread | None = None
+
+    def start(self, host: str, port: int, root: Path) -> None:
+        if self.server is not None:
+            return
+        try:
+            self.server = create_upload_server(host, port, root, self.event_received.emit)
+        except OSError as exc:
+            self.status_changed.emit(f"Upload bind failed: {exc}")
+            return
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.status_changed.emit(f"Upload server {host}:{port}")
+
+    def stop(self) -> None:
+        server = self.server
+        self.server = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        self.thread = None
+        self.status_changed.emit("Upload server stopped")
+
+
+class CombinedReceiverThread(QThread):
+    metrics_ready = pyqtSignal(dict)
+    status_changed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        bind_host: str,
+        port: int,
+        phone_ip: str,
+        registration_port: int,
+        video_port: int,
+    ) -> None:
+        super().__init__()
+        self.bind_host = bind_host
+        self.port = port
+        self.phone_ip = phone_ip
+        self.registration_port = registration_port
+        self.video_port = video_port
+        self.running = True
+        self.clock = LatencyClockCompensator()
+        self.packet_times: deque[float] = deque()
+
+    def stop(self) -> None:
+        self.running = False
+
+    def run(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((self.bind_host, self.port))
+        except OSError as exc:
+            self.status_changed.emit(f"Combined bind failed: {exc}")
+            sock.close()
+            return
+        sock.settimeout(0.2)
+        hello = f"PC_HELLO,1,{self.port},{self.video_port}\n".encode("ascii")
+        next_hello = 0.0
+        self.status_changed.emit(f"Combined sensor listening {self.bind_host}:{self.port}")
+
+        try:
+            while self.running:
+                now = time.monotonic()
+                if self.phone_ip and now >= next_hello:
+                    try:
+                        sock.sendto(hello, (self.phone_ip, self.registration_port))
+                    except OSError:
+                        pass
+                    next_hello = now + 2.0
+                try:
+                    datagram, address = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+                receive_wall = time.time()
+                receive_mono = time.monotonic()
+                try:
+                    packet = decode_apm1_packet(datagram)
+                except APM1DecodeError:
+                    continue
+
+                latency = self.clock.observe(
+                    packet.phone_send_unix,
+                    receive_wall,
+                    receive_mono,
+                    is_pose_reference=True,
+                )
+                self.packet_times.append(receive_mono)
+                while self.packet_times and receive_mono - self.packet_times[0] > 1.0:
+                    self.packet_times.popleft()
+                offset = self.clock.offset_seconds
+                latest_magnetic = packet.magnetic_samples[-1] if packet.magnetic_samples else None
+                metrics = {
+                    "status": f"Combined from {address[0]}:{address[1]}",
+                    "session_id": str(packet.session_id),
+                    "packet_sequence": packet.packet_sequence,
+                    "sender_timestamp": packet.phone_send_unix,
+                    "receive_wall_time": receive_wall,
+                    "raw_latency_ms": (receive_wall - packet.phone_send_unix) * 1000.0,
+                    "latency_ms": latency,
+                    "clock_offset_ms": offset * 1000.0 if offset is not None else None,
+                    "fps": float(len(self.packet_times)),
+                    "magnetic_count": len(packet.magnetic_samples),
+                    "chips": latest_magnetic.sensors() if latest_magnetic else (),
+                    "magnetic_sequence": latest_magnetic.sequence if latest_magnetic else None,
+                }
+                self.metrics_ready.emit(metrics)
+        finally:
+            sock.close()
+            self.status_changed.emit("Combined sensor stopped")
+
+
+class ReceiverDiagnosticsRecorder:
+    def __init__(self, root: Path) -> None:
+        self.root = root.expanduser().resolve()
+        self.pre_roll: deque[tuple[float, dict[str, object]]] = deque()
+        self.active: dict[str, dict[str, object]] = {}
+
+    def set_root(self, root: Path) -> None:
+        self.root = root.expanduser().resolve()
+
+    def record(self, row: dict[str, object]) -> None:
+        now = time.monotonic()
+        normalized = {field: row.get(field, "") for field in RECEIVER_FIELDS}
+        self.pre_roll.append((now, normalized))
+        while self.pre_roll and now - self.pre_roll[0][0] > 5.0:
+            self.pre_roll.popleft()
+        for session in self.active.values():
+            self._write_row(session, normalized)
+
+    def handle_control(self, event: dict) -> None:
+        experiment_id = str(event.get("experiment_id", ""))
+        if not experiment_id:
+            return
+        if event.get("event") == "start":
+            self._start(
+                experiment_id,
+                float(event.get("event_unix_time", 0.0)),
+                Path(str(event.get("directory", self.root / experiment_id))),
+            )
+        elif event.get("event") == "stop":
+            self._stop(experiment_id, float(event.get("event_unix_time", 0.0)))
+
+    def _start(self, experiment_id: str, start_unix: float, directory: Path) -> None:
+        if experiment_id in self.active:
+            return
+        directory.mkdir(parents=True, exist_ok=True)
+        part_path = directory / "receiver_transport.part.csv"
+        handle = part_path.open("w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(handle, fieldnames=RECEIVER_FIELDS)
+        writer.writeheader()
+        session: dict[str, object] = {
+            "directory": directory,
+            "part_path": part_path,
+            "handle": handle,
+            "writer": writer,
+            "start_unix": start_unix,
+        }
+        self.active[experiment_id] = session
+        for _, row in self.pre_roll:
+            sender_time = _safe_float(row.get("sender_time"))
+            if sender_time >= start_unix:
+                self._write_row(session, row)
+
+    def _stop(self, experiment_id: str, stop_unix: float) -> None:
+        session = self.active.pop(experiment_id, None)
+        if session is None:
+            return
+        handle = session["handle"]
+        handle.close()
+        part_path = Path(session["part_path"])
+        target_path = Path(session["directory"]) / "receiver_transport.csv"
+        start_unix = float(session["start_unix"])
+        with part_path.open("r", newline="", encoding="utf-8") as source, target_path.open(
+            "w", newline="", encoding="utf-8"
+        ) as target:
+            reader = csv.DictReader(source)
+            writer = csv.DictWriter(target, fieldnames=RECEIVER_FIELDS)
+            writer.writeheader()
+            for row in reader:
+                sender_time = _safe_float(row.get("sender_time"))
+                if start_unix <= sender_time <= stop_unix:
+                    row["experiment_time"] = f"{sender_time - start_unix:.9f}"
+                    writer.writerow(row)
+        part_path.unlink(missing_ok=True)
+        self._register_component(Path(session["directory"]), target_path.name)
+
+    @staticmethod
+    def _write_row(session: dict[str, object], row: dict[str, object]) -> None:
+        writer = session["writer"]
+        writer.writerow(row)
+        session["handle"].flush()
+
+    @staticmethod
+    def _register_component(directory: Path, filename: str) -> None:
+        state_path = directory / "upload_state.json"
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        components = state.get("components") if isinstance(state.get("components"), dict) else {}
+        components["receiver_transport"] = filename
+        state["components"] = components
+        temp = state_path.with_suffix(".json.part")
+        temp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        temp.replace(state_path)
+
+    def close(self) -> None:
+        for experiment_id in list(self.active):
+            self._stop(experiment_id, time.time())
+
+
+class VideoFilePlayback:
+    def __init__(self) -> None:
+        self.container = None
+        self.stream = None
+        self.iterator = None
+        self.current: tuple[float, QImage] | None = None
+        self.next_frame: tuple[float, QImage] | None = None
+        self.last_target = -1.0
+
+    def open(self, path: Path | None) -> None:
+        self.close()
+        if av is None or path is None or not path.is_file():
+            return
+        self.container = av.open(str(path))
+        self.stream = self.container.streams.video[0]
+        self.iterator = iter(self.container.decode(self.stream))
+        self.next_frame = self._decode_next()
+
+    def close(self) -> None:
+        if self.container is not None:
+            self.container.close()
+        self.container = None
+        self.stream = None
+        self.iterator = None
+        self.current = None
+        self.next_frame = None
+        self.last_target = -1.0
+
+    def frame_at(self, target: float) -> QImage | None:
+        if self.container is None or self.stream is None or target < 0:
+            return None
+        if target + 0.05 < self.last_target or target - self.last_target > 1.5:
+            timestamp = max(0, int(target / float(self.stream.time_base)))
+            self.container.seek(timestamp, stream=self.stream, backward=True, any_frame=False)
+            self.iterator = iter(self.container.decode(self.stream))
+            self.current = None
+            self.next_frame = self._decode_next()
+        self.last_target = target
+        while self.next_frame is not None and self.next_frame[0] <= target:
+            self.current = self.next_frame
+            self.next_frame = self._decode_next()
+        return self.current[1] if self.current is not None else (self.next_frame[1] if self.next_frame else None)
+
+    def _decode_next(self) -> tuple[float, QImage] | None:
+        if self.iterator is None:
+            return None
+        try:
+            frame = next(self.iterator)
+        except StopIteration:
+            return None
+        frame_time = float(frame.time or 0.0)
+        rgb = frame.to_ndarray(format="rgb24")
+        height, width, channels = rgb.shape
+        image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+        return frame_time, image
+
+
+class ExperimentMonitorWindow(QMainWindow):
+    def __init__(self, args: argparse.Namespace) -> None:
+        super().__init__()
+        self.setWindowTitle("ARPose Experiment Monitor & Replay")
+        self.resize(1550, 980)
+        self.args = args
+        self.video_worker: VideoReceiverThread | None = None
+        self.combined_worker: CombinedReceiverThread | None = None
+        self.upload_bridge = UploadServerBridge()
+        self.upload_bridge.event_received.connect(self.on_server_event)
+        self.upload_bridge.status_changed.connect(self.set_service_status)
+        self.diagnostics = ReceiverDiagnosticsRecorder(Path(args.experiments))
+        self.datasets: list[ExperimentDataset] = []
+        self.dataset: ExperimentDataset | None = None
+        self.playback = VideoFilePlayback()
+        self.playing = False
+        self.play_time = 0.0
+        self.last_tick = time.monotonic()
+        self.last_video_id = -1
+        self.last_pose_id = -1
+        self.last_combined_id = -1
+        self.plot_cursors = []
+        self._build_ui()
+        self.timer = QTimer(self)
+        self.timer.setInterval(33)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start()
+        self.refresh_experiments()
+        QTimer.singleShot(0, self.start_services)
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+
+        service_box = QGroupBox("Monitoring Services")
+        service_grid = QGridLayout(service_box)
+        self.bind_edit = QLineEdit(self.args.bind)
+        self.video_port_edit = QLineEdit(str(self.args.video_port))
+        self.pose_port_edit = QLineEdit(str(self.args.pose_port))
+        self.combined_port_edit = QLineEdit(str(self.args.combined_port))
+        self.upload_port_edit = QLineEdit(str(self.args.upload_port))
+        self.phone_ip_edit = QLineEdit(self.args.phone_ip)
+        self.root_edit = QLineEdit(str(Path(self.args.experiments).resolve()))
+        for column, (label, widget) in enumerate(
+            [
+                ("Bind", self.bind_edit),
+                ("Video", self.video_port_edit),
+                ("Pose", self.pose_port_edit),
+                ("Combined", self.combined_port_edit),
+                ("Upload", self.upload_port_edit),
+                ("Phone IP", self.phone_ip_edit),
+            ]
+        ):
+            service_grid.addWidget(QLabel(label), 0, column)
+            service_grid.addWidget(widget, 1, column)
+        service_grid.addWidget(QLabel("Experiment Library"), 2, 0)
+        service_grid.addWidget(self.root_edit, 2, 1, 1, 4)
+        self.services_button = QPushButton("Start Monitor")
+        self.services_button.clicked.connect(self.toggle_services)
+        service_grid.addWidget(self.services_button, 2, 5)
+        self.service_status = QLabel("Stopped")
+        service_grid.addWidget(self.service_status, 3, 0, 1, 6)
+        root.addWidget(service_box)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_live_tab(), "Live Monitor")
+        self.tabs.addTab(self._build_replay_tab(), "Experiment Replay")
+        root.addWidget(self.tabs, 1)
+
+    def _build_live_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        self.live_video = QLabel("Waiting for live video")
+        self.live_video.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.live_video.setMinimumSize(850, 520)
+        self.live_video.setStyleSheet("background:#111; color:#aaa;")
+        layout.addWidget(self.live_video, 3)
+
+        side = QVBoxLayout()
+        video_box = QGroupBox("Video / Pose Transport")
+        video_form = QFormLayout(video_box)
+        self.live_video_state = QLabel("Idle")
+        self.live_video_latency = QLabel("--")
+        self.live_pose_latency = QLabel("--")
+        self.live_video_fps = QLabel("--")
+        self.live_bitrate = QLabel("--")
+        self.live_clock_offset = QLabel("--")
+        for label, value in [
+            ("State", self.live_video_state),
+            ("Video latency", self.live_video_latency),
+            ("Pose latency", self.live_pose_latency),
+            ("Decoded FPS", self.live_video_fps),
+            ("Bitrate", self.live_bitrate),
+            ("Clock offset", self.live_clock_offset),
+        ]:
+            video_form.addRow(label, value)
+        side.addWidget(video_box)
+
+        sensor_box = QGroupBox("Combined Sensor")
+        sensor_layout = QVBoxLayout(sensor_box)
+        self.live_sensor_status = QLabel("Idle")
+        self.live_sensor_latency = QLabel("--")
+        sensor_layout.addWidget(self.live_sensor_status)
+        sensor_layout.addWidget(self.live_sensor_latency)
+        self.live_sensor_table = self._make_sensor_table()
+        sensor_layout.addWidget(self.live_sensor_table)
+        side.addWidget(sensor_box, 1)
+        layout.addLayout(side, 1)
+        return tab
+
+    def _build_replay_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        splitter = QSplitter()
+        layout.addWidget(splitter)
+
+        library = QWidget()
+        library_layout = QVBoxLayout(library)
+        refresh = QPushButton("Refresh Experiments")
+        refresh.clicked.connect(self.refresh_experiments)
+        library_layout.addWidget(refresh)
+        self.experiment_list = QListWidget()
+        self.experiment_list.currentRowChanged.connect(self.load_experiment)
+        library_layout.addWidget(self.experiment_list)
+        splitter.addWidget(library)
+
+        replay = QWidget()
+        replay_layout = QVBoxLayout(replay)
+        top = QHBoxLayout()
+        self.replay_video = QLabel("Select an experiment")
+        self.replay_video.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.replay_video.setMinimumSize(720, 400)
+        self.replay_video.setStyleSheet("background:#111; color:#aaa;")
+        top.addWidget(self.replay_video, 3)
+
+        values = QVBoxLayout()
+        pose_box = QGroupBox("Pose at Cursor")
+        pose_form = QFormLayout(pose_box)
+        self.pose_values = {name: QLabel("--") for name in ("sequence", "position", "quaternion")}
+        pose_form.addRow("Sequence", self.pose_values["sequence"])
+        pose_form.addRow("Position", self.pose_values["position"])
+        pose_form.addRow("Quaternion", self.pose_values["quaternion"])
+        values.addWidget(pose_box)
+
+        transport_box = QGroupBox("Propagation at Cursor")
+        transport_form = QFormLayout(transport_box)
+        self.transport_values = {
+            name: QLabel("--")
+            for name in ("video_latency", "pose_latency", "raw_latency", "clock_offset", "fps", "bitrate", "drops")
+        }
+        for label, key in [
+            ("Video corrected", "video_latency"),
+            ("Pose corrected", "pose_latency"),
+            ("Raw clock delta", "raw_latency"),
+            ("Clock offset", "clock_offset"),
+            ("FPS", "fps"),
+            ("Bitrate", "bitrate"),
+            ("Drops", "drops"),
+        ]:
+            transport_form.addRow(label, self.transport_values[key])
+        values.addWidget(transport_box)
+        values.addWidget(QLabel("Magnetic sensor values"))
+        self.replay_sensor_table = self._make_sensor_table()
+        values.addWidget(self.replay_sensor_table, 1)
+        top.addLayout(values, 2)
+        replay_layout.addLayout(top, 3)
+
+        controls = QHBoxLayout()
+        self.play_button = QPushButton("Play")
+        self.play_button.clicked.connect(self.toggle_playback)
+        controls.addWidget(self.play_button)
+        self.timeline = QSlider(Qt.Orientation.Horizontal)
+        self.timeline.setRange(0, 1)
+        self.timeline.valueChanged.connect(self.seek_from_slider)
+        controls.addWidget(self.timeline, 1)
+        self.time_label = QLabel("0.000 / 0.000 s")
+        controls.addWidget(self.time_label)
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["0.25x", "0.5x", "1.0x", "2.0x"])
+        self.speed_combo.setCurrentText("1.0x")
+        controls.addWidget(self.speed_combo)
+        replay_layout.addLayout(controls)
+
+        options = QHBoxLayout()
+        self.show_corrected = QCheckBox("Corrected latency")
+        self.show_corrected.setChecked(True)
+        self.show_raw = QCheckBox("Raw clock delta")
+        self.show_bitrate = QCheckBox("Bitrate")
+        self.show_bitrate.setChecked(True)
+        self.show_fps = QCheckBox("FPS")
+        self.show_fps.setChecked(True)
+        for checkbox in (self.show_corrected, self.show_raw, self.show_bitrate, self.show_fps):
+            checkbox.toggled.connect(self.rebuild_transport_plot)
+            options.addWidget(checkbox)
+        options.addStretch(1)
+        replay_layout.addLayout(options)
+
+        self.plot_tabs = QTabWidget()
+        self.pose_plot = self._make_plot("Position", "m")
+        self.magnetic_plot = self._make_plot("Magnetic magnitude", "")
+        self.transport_plot = self._make_plot("Transport", "")
+        self.plot_tabs.addTab(self.pose_plot, "Pose")
+        self.plot_tabs.addTab(self.magnetic_plot, "Sensor")
+        self.plot_tabs.addTab(self.transport_plot, "Propagation")
+        replay_layout.addWidget(self.plot_tabs, 2)
+        splitter.addWidget(replay)
+        splitter.setSizes([300, 1200])
+        return tab
+
+    @staticmethod
+    def _make_sensor_table() -> QTableWidget:
+        table = QTableWidget(5, 6)
+        table.setHorizontalHeaderLabels(["Chip", "T", "X", "Y", "Z", "|B|"])
+        table.setVerticalHeaderLabels(["" for _ in range(5)])
+        for row in range(5):
+            table.setItem(row, 0, QTableWidgetItem(f"S{row}"))
+        return table
+
+    @staticmethod
+    def _make_plot(title: str, units: str):
+        if pg is None:
+            label = QLabel("pyqtgraph is required for plots")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            return label
+        plot = pg.PlotWidget(title=title)
+        plot.showGrid(x=True, y=True, alpha=0.2)
+        plot.setLabel("bottom", "Experiment time", units="s")
+        if units:
+            plot.setLabel("left", units=units)
+        plot.addLegend()
+        return plot
+
+    def toggle_services(self) -> None:
+        if self.video_worker is None:
+            self.start_services()
+        else:
+            self.stop_services()
+
+    def start_services(self) -> None:
+        if self.video_worker is not None:
+            return
+        try:
+            bind = self.bind_edit.text().strip() or "0.0.0.0"
+            video_port = int(self.video_port_edit.text())
+            pose_port = int(self.pose_port_edit.text())
+            combined_port = int(self.combined_port_edit.text())
+            upload_port = int(self.upload_port_edit.text())
+        except ValueError:
+            self.set_service_status("Ports must be integers")
+            return
+        root = Path(self.root_edit.text()).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        self.diagnostics.set_root(root)
+        self.upload_bridge.start(bind, upload_port, root)
+
+        self.video_worker = VideoReceiverThread(bind, video_port, pose_port)
+        self.video_worker.frame_ready.connect(self.update_live_video)
+        self.video_worker.video_metrics.connect(self.update_live_video_metrics)
+        self.video_worker.pose_metrics.connect(self.update_live_pose_metrics)
+        self.video_worker.start()
+
+        self.combined_worker = CombinedReceiverThread(
+            bind,
+            combined_port,
+            self.phone_ip_edit.text().strip(),
+            5559,
+            video_port,
+        )
+        self.combined_worker.metrics_ready.connect(self.update_live_combined_metrics)
+        self.combined_worker.status_changed.connect(self.live_sensor_status.setText)
+        self.combined_worker.start()
+        self.services_button.setText("Stop Monitor")
+        self.set_service_status("Live video, pose, sensor, upload, and diagnostics started")
+
+    def stop_services(self) -> None:
+        if self.video_worker is not None:
+            self.video_worker.stop()
+            self.video_worker.wait(1500)
+            self.video_worker = None
+        if self.combined_worker is not None:
+            self.combined_worker.stop()
+            self.combined_worker.wait(1500)
+            self.combined_worker = None
+        self.upload_bridge.stop()
+        self.services_button.setText("Start Monitor")
+
+    def set_service_status(self, message: str) -> None:
+        self.service_status.setText(message)
+
+    def update_live_video(self, image: QImage) -> None:
+        self.live_video.setPixmap(
+            QPixmap.fromImage(image).scaled(
+                self.live_video.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def update_live_video_metrics(self, metrics: dict) -> None:
+        self.live_video_state.setText(str(metrics.get("status", "--")))
+        self.live_video_latency.setText(metric_text(metrics.get("latency_ms"), " ms"))
+        self.live_video_fps.setText(metric_text(metrics.get("fps")))
+        self.live_bitrate.setText(metric_text(metrics.get("bitrate_mbps"), " Mbps", 2))
+        self.live_clock_offset.setText(metric_text(metrics.get("clock_offset_ms"), " ms"))
+        identifier = int(metrics.get("frame_id", 0))
+        if identifier > self.last_video_id and metrics.get("capture_timestamp") is not None:
+            self.last_video_id = identifier
+            self.diagnostics.record(self._diagnostic_row("video", identifier, metrics))
+
+    def update_live_pose_metrics(self, metrics: dict) -> None:
+        self.live_pose_latency.setText(metric_text(metrics.get("latency_ms"), " ms"))
+        identifier = int(metrics.get("sequence", 0))
+        if identifier > self.last_pose_id and metrics.get("sender_timestamp") is not None:
+            self.last_pose_id = identifier
+            self.diagnostics.record(self._diagnostic_row("pose", identifier, metrics))
+
+    def update_live_combined_metrics(self, metrics: dict) -> None:
+        self.live_sensor_status.setText(str(metrics.get("status", "--")))
+        self.live_sensor_latency.setText(
+            f"Latency {metric_text(metrics.get('latency_ms'), ' ms')}  Rate {metric_text(metrics.get('fps'), ' Hz')}"
+        )
+        self._update_sensor_table(self.live_sensor_table, metrics.get("chips") or ())
+        identifier = int(metrics.get("packet_sequence", 0))
+        if identifier > self.last_combined_id:
+            self.last_combined_id = identifier
+            self.diagnostics.record(self._diagnostic_row("combined", identifier, metrics))
+
+    @staticmethod
+    def _diagnostic_row(kind: str, identifier: int, metrics: dict) -> dict[str, object]:
+        sender_time = metrics.get("capture_timestamp", metrics.get("sender_timestamp", ""))
+        receive_time = metrics.get("first_receive_wall_time", metrics.get("receive_wall_time", ""))
+        return {
+            "kind": kind,
+            "identifier": identifier,
+            "sender_time": sender_time,
+            "pc_receive_time": receive_time,
+            "pc_decode_time": metrics.get("decode_wall_time", ""),
+            "experiment_time": "",
+            "raw_latency_ms": metrics.get("raw_latency_ms", ""),
+            "corrected_latency_ms": metrics.get("latency_ms", ""),
+            "clock_offset_ms": metrics.get("clock_offset_ms", ""),
+            "fps": metrics.get("fps", ""),
+            "bitrate_mbps": metrics.get("bitrate_mbps", ""),
+            "dropped_frames": metrics.get("dropped_frames", ""),
+            "packets": metrics.get("packets", ""),
+            "bytes": metrics.get("bytes", ""),
+        }
+
+    def on_server_event(self, event: dict) -> None:
+        if event.get("type") == "experiment_control":
+            self.diagnostics.handle_control(event)
+            self.set_service_status(f"Experiment {event.get('event')}: {event.get('experiment_id')}")
+        if event.get("type") == "upload":
+            self.set_service_status(f"Received {event.get('component')} for {event.get('capture_id')}")
+        self.refresh_experiments()
+
+    def refresh_experiments(self) -> None:
+        current_id = self.dataset.experiment_id if self.dataset else None
+        self.datasets = discover_experiments(Path(self.root_edit.text()))
+        self.experiment_list.blockSignals(True)
+        self.experiment_list.clear()
+        selected_row = -1
+        for index, dataset in enumerate(self.datasets):
+            item = QListWidgetItem(dataset.display_name)
+            item.setToolTip(str(dataset.directory))
+            self.experiment_list.addItem(item)
+            if dataset.experiment_id == current_id:
+                selected_row = index
+        self.experiment_list.blockSignals(False)
+        if selected_row >= 0:
+            self.experiment_list.setCurrentRow(selected_row)
+
+    def load_experiment(self, row: int) -> None:
+        if row < 0 or row >= len(self.datasets):
+            return
+        self.dataset = ExperimentDataset.load(self.datasets[row].directory)
+        self.playback.open(self.dataset.video_path)
+        self.playing = False
+        self.play_button.setText("Play")
+        self.play_time = 0.0
+        self.timeline.setRange(0, max(1, int(self.dataset.duration_seconds * 1000)))
+        self._build_data_plots()
+        self.update_replay_cursor()
+
+    def toggle_playback(self) -> None:
+        if self.dataset is None:
+            return
+        if self.play_time >= self.dataset.duration_seconds:
+            self.play_time = 0.0
+        self.playing = not self.playing
+        self.last_tick = time.monotonic()
+        self.play_button.setText("Pause" if self.playing else "Play")
+
+    def seek_from_slider(self, value: int) -> None:
+        if self.dataset is None:
+            return
+        self.play_time = value / 1000.0
+        self.update_replay_cursor()
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self.last_tick
+        self.last_tick = now
+        if not self.playing or self.dataset is None:
+            return
+        speed = float(self.speed_combo.currentText().removesuffix("x"))
+        self.play_time = min(self.dataset.duration_seconds, self.play_time + elapsed * speed)
+        self.timeline.blockSignals(True)
+        self.timeline.setValue(int(self.play_time * 1000))
+        self.timeline.blockSignals(False)
+        self.update_replay_cursor()
+        if self.play_time >= self.dataset.duration_seconds:
+            self.playing = False
+            self.play_button.setText("Play")
+
+    def update_replay_cursor(self) -> None:
+        dataset = self.dataset
+        if dataset is None:
+            return
+        self.time_label.setText(f"{self.play_time:.3f} / {dataset.duration_seconds:.3f} s")
+        image = self.playback.frame_at(self.play_time - dataset.video_start_offset_seconds)
+        if image is not None:
+            self.replay_video.setPixmap(
+                QPixmap.fromImage(image).scaled(
+                    self.replay_video.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+        pose = dataset.pose.nearest(self.play_time)
+        if pose:
+            self.pose_values["sequence"].setText(str(pose.get("sequence", "--")))
+            self.pose_values["position"].setText(
+                f"({pose.get('x', '--')}, {pose.get('y', '--')}, {pose.get('z', '--')})"
+            )
+            self.pose_values["quaternion"].setText(
+                f"({pose.get('qx', '--')}, {pose.get('qy', '--')}, {pose.get('qz', '--')}, {pose.get('qw', '--')})"
+            )
+
+        magnetic = dataset.magnetic.nearest(self.play_time)
+        if magnetic:
+            chips = [
+                tuple(_safe_float(magnetic.get(f"s{index}_{axis}")) for axis in ("t", "x", "y", "z"))
+                for index in range(5)
+            ]
+            self._update_sensor_table(self.replay_sensor_table, chips)
+
+        video_transport = self._nearest_kind(dataset.receiver_transport, self.play_time, "video")
+        pose_transport = self._nearest_kind(dataset.receiver_transport, self.play_time, "pose")
+        sender_transport = dataset.sender_transport.nearest(self.play_time)
+        self.transport_values["video_latency"].setText(
+            metric_text((video_transport or {}).get("corrected_latency_ms"), " ms")
+        )
+        self.transport_values["pose_latency"].setText(
+            metric_text((pose_transport or {}).get("corrected_latency_ms"), " ms")
+        )
+        selected_transport = video_transport or pose_transport or {}
+        self.transport_values["raw_latency"].setText(metric_text(selected_transport.get("raw_latency_ms"), " ms"))
+        self.transport_values["clock_offset"].setText(metric_text(selected_transport.get("clock_offset_ms"), " ms"))
+        self.transport_values["fps"].setText(
+            metric_text(selected_transport.get("fps", (sender_transport or {}).get("sent_fps")))
+        )
+        self.transport_values["bitrate"].setText(
+            metric_text(selected_transport.get("bitrate_mbps", (sender_transport or {}).get("bitrate_mbps")), " Mbps", 2)
+        )
+        self.transport_values["drops"].setText(
+            str(selected_transport.get("dropped_frames", (sender_transport or {}).get("dropped_frames", "--")))
+        )
+        for cursor in self.plot_cursors:
+            cursor.setValue(self.play_time)
+
+    @staticmethod
+    def _nearest_kind(table: TimedRows, target: float, kind: str) -> dict[str, str] | None:
+        candidates = [
+            (abs(sample_time - target), row)
+            for sample_time, row in zip(table.times, table.rows)
+            if row.get("kind") == kind
+        ]
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+    @staticmethod
+    def _update_sensor_table(table: QTableWidget, chips) -> None:
+        for row in range(5):
+            values = chips[row] if row < len(chips) else (math.nan,) * 4
+            magnitude = math.sqrt(sum(float(value) ** 2 for value in values[1:4])) if all(
+                math.isfinite(float(value)) for value in values[1:4]
+            ) else math.nan
+            for column, value in enumerate((*values, magnitude), start=1):
+                table.setItem(row, column, QTableWidgetItem(metric_text(value, precision=4)))
+
+    def _build_data_plots(self) -> None:
+        if pg is None or self.dataset is None:
+            return
+        dataset = self.dataset
+        self.plot_cursors = []
+        for plot in (self.pose_plot, self.magnetic_plot, self.transport_plot):
+            plot.clear()
+            plot.addLegend()
+        colors = ["#ff5c5c", "#56d364", "#58a6ff", "#d2a8ff", "#f2cc60"]
+        for index, axis in enumerate(("x", "y", "z")):
+            self.pose_plot.plot(
+                dataset.pose.times,
+                [_safe_float(row.get(axis)) for row in dataset.pose.rows],
+                pen=pg.mkPen(colors[index], width=2),
+                name=axis.upper(),
+            )
+        for chip in range(5):
+            magnitudes = []
+            for row in dataset.magnetic.rows:
+                x = _safe_float(row.get(f"s{chip}_x"))
+                y = _safe_float(row.get(f"s{chip}_y"))
+                z = _safe_float(row.get(f"s{chip}_z"))
+                magnitudes.append(math.sqrt(x * x + y * y + z * z))
+            self.magnetic_plot.plot(
+                dataset.magnetic.times,
+                magnitudes,
+                pen=pg.mkPen(colors[chip], width=1.5),
+                name=f"S{chip}",
+            )
+        for plot in (self.pose_plot, self.magnetic_plot):
+            cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff", width=1))
+            plot.addItem(cursor)
+            self.plot_cursors.append(cursor)
+        self.rebuild_transport_plot()
+
+    def rebuild_transport_plot(self) -> None:
+        if pg is None or self.dataset is None:
+            return
+        plot = self.transport_plot
+        plot.clear()
+        plot.addLegend()
+        rows = self.dataset.receiver_transport.rows
+        times = self.dataset.receiver_transport.times
+        if self.show_corrected.isChecked():
+            for kind, color in (("video", "#58a6ff"), ("pose", "#f2cc60"), ("combined", "#56d364")):
+                x = [sample_time for sample_time, row in zip(times, rows) if row.get("kind") == kind]
+                y = [_safe_float(row.get("corrected_latency_ms")) for row in rows if row.get("kind") == kind]
+                plot.plot(x, y, pen=pg.mkPen(color, width=2), name=f"{kind} latency ms")
+        if self.show_raw.isChecked():
+            x = [sample_time for sample_time, row in zip(times, rows) if row.get("kind") == "video"]
+            y = [_safe_float(row.get("raw_latency_ms")) for row in rows if row.get("kind") == "video"]
+            plot.plot(x, y, pen=pg.mkPen("#ff7b72", width=1), name="video raw ms")
+        if self.show_bitrate.isChecked():
+            plot.plot(
+                self.dataset.sender_transport.times,
+                [_safe_float(row.get("bitrate_mbps")) for row in self.dataset.sender_transport.rows],
+                pen=pg.mkPen("#d2a8ff", width=1.5),
+                name="sender Mbps",
+            )
+        if self.show_fps.isChecked():
+            plot.plot(
+                self.dataset.sender_transport.times,
+                [_safe_float(row.get("sent_fps")) for row in self.dataset.sender_transport.rows],
+                pen=pg.mkPen("#ffa657", width=1.5),
+                name="sender FPS",
+            )
+        cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff", width=1))
+        plot.addItem(cursor)
+        if len(self.plot_cursors) >= 3:
+            self.plot_cursors[2] = cursor
+        else:
+            self.plot_cursors.append(cursor)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.playback.close()
+        self.stop_services()
+        self.diagnostics.close()
+        super().closeEvent(event)
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Monitor and replay synchronized ARPose experiments.")
+    parser.add_argument("--bind", default="0.0.0.0")
+    parser.add_argument("--video-port", type=int, default=5560)
+    parser.add_argument("--pose-port", type=int, default=5555)
+    parser.add_argument("--combined-port", type=int, default=5558)
+    parser.add_argument("--upload-port", type=int, default=8000)
+    parser.add_argument("--phone-ip", default="172.20.10.1")
+    parser.add_argument("--experiments", default=str(get_default_upload_dir()))
+    return parser.parse_args()
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("ARPose Experiment Monitor & Replay")
+    window = ExperimentMonitorWindow(parse_args())
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

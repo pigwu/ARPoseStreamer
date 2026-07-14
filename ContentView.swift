@@ -267,10 +267,10 @@ private struct RecordButton: View {
         }
 
         if viewModel.canStopRecording {
-            return "Stop & Save"
+            return "Stop & Save Experiment"
         }
 
-        return "Start Recording"
+        return "Start Experiment"
     }
 
     private var systemImage: String {

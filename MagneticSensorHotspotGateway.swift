@@ -77,10 +77,10 @@ final class MagneticSensorHotspotGateway {
         }
     }
 
-    func resetStreamSession() {
+    func resetStreamSession(sessionID: UUID = UUID()) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.sessionID = UUID()
+            self.sessionID = sessionID
             self.combinedPacketSequence = 0
             self.pendingMagneticSamples.removeAll(keepingCapacity: true)
         }

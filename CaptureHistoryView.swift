@@ -9,7 +9,7 @@ struct CaptureHistoryView: View {
                 ContentUnavailableView(
                     "No Captures Yet",
                     systemImage: "tray",
-                    description: Text("Start a streaming or recording session to create reusable capture history.")
+                    description: Text("Start an experiment to save synchronized pose, sensor, video, and transport data.")
                 )
             } else {
                 ForEach(viewModel.captureRecords) { record in
@@ -20,11 +20,8 @@ struct CaptureHistoryView: View {
                         onRename: { newName in
                             viewModel.renameCapture(record, to: newName)
                         },
-                        onUploadVideo: {
-                            viewModel.requestVideoUpload(for: record)
-                        },
-                        onUploadPose: {
-                            viewModel.requestPoseUpload(for: record)
+                        onUploadExperiment: {
+                            viewModel.requestExperimentUpload(for: record)
                         }
                     )
                     .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
@@ -54,8 +51,7 @@ private struct CaptureRecordCard: View {
     let isUploading: Bool
     let uploadDetails: UploadStatusViewState
     let onRename: (String) -> Void
-    let onUploadVideo: () -> Void
-    let onUploadPose: () -> Void
+    let onUploadExperiment: () -> Void
 
     @State private var draftName: String
 
@@ -64,15 +60,13 @@ private struct CaptureRecordCard: View {
         isUploading: Bool,
         uploadDetails: UploadStatusViewState,
         onRename: @escaping (String) -> Void,
-        onUploadVideo: @escaping () -> Void,
-        onUploadPose: @escaping () -> Void
+        onUploadExperiment: @escaping () -> Void
     ) {
         self.record = record
         self.isUploading = isUploading
         self.uploadDetails = uploadDetails
         self.onRename = onRename
-        self.onUploadVideo = onUploadVideo
-        self.onUploadPose = onUploadPose
+        self.onUploadExperiment = onUploadExperiment
         _draftName = State(initialValue: record.displayName)
     }
 
@@ -93,29 +87,15 @@ private struct CaptureRecordCard: View {
                     .foregroundStyle(.secondary)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text(uploadStatusText(for: .video))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+            Text(experimentUploadStatusText)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
 
-                Text(uploadStatusText(for: .pose))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+            Button("Upload Complete Experiment") {
+                onUploadExperiment()
             }
-
-            HStack(spacing: 12) {
-                Button("Upload Video") {
-                    onUploadVideo()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!videoFileState.canUpload || isUploading)
-
-                Button("Upload Data") {
-                    onUploadPose()
-                }
-                .buttonStyle(.bordered)
-                .disabled(isUploading)
-            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isUploading)
 
             if isUploading {
                 VStack(alignment: .leading, spacing: 6) {
@@ -140,21 +120,17 @@ private struct CaptureRecordCard: View {
         }
     }
 
-    private func uploadStatusText(for kind: CaptureUploadKind) -> String {
-        switch kind {
-        case .video:
-            if let date = record.videoUploadedAt {
-                return "Video uploaded before: \(date.formatted(date: .abbreviated, time: .shortened))"
-            }
-            return videoFileState.statusText
-        case .pose:
-            if let date = record.poseUploadedAt {
-                return "Capture data uploaded before: \(date.formatted(date: .abbreviated, time: .shortened))"
-            }
-            return record.magneticCSVFileName == nil
-                ? "Pose data: not uploaded yet"
-                : "Pose + magnetic data: not uploaded yet"
+    private var experimentUploadStatusText: String {
+        if let date = record.experimentUploadedAt {
+            return "Complete experiment uploaded: \(date.formatted(date: .abbreviated, time: .shortened))"
         }
+        let modalities = [
+            "pose",
+            record.magneticCSVFileName == nil ? nil : "sensor",
+            videoFileState.canUpload ? "video" : nil,
+            record.senderTransportCSVFileName == nil ? nil : "transport"
+        ].compactMap { $0 }
+        return "Ready to upload: \(modalities.joined(separator: " + "))"
     }
 
     private var videoFileState: CaptureVideoFileState {

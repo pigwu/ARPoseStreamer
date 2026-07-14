@@ -123,6 +123,13 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             self?.onVideoStateChange?(state)
         }
         videoSender.onStatsChange = { [weak self] stats in
+            self?.arQueue.async {
+                guard let self, self.isRecordingEnabled else { return }
+                self.poseSessionRecorder.appendSenderTransport(
+                    stats: stats,
+                    sampleUnixTime: Date().timeIntervalSince1970
+                )
+            }
             self?.onVideoStatsChange?(stats)
         }
         videoSender.onError = { [weak self] error in
@@ -192,7 +199,6 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             self.isStreamingEnabled = false
             self.videoSender.stopStreaming()
             if !self.isRecordingEnabled {
-                self.finishPoseSessionIfNeeded()
                 self.pauseSessionIfNeeded()
             }
         }
@@ -248,13 +254,17 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
 
     func appendMagneticSample(_ sample: MagneticSensorSample) {
         arQueue.async { [weak self] in
-            guard let self, self.isStreamingEnabled || self.isRecordingEnabled else { return }
+            guard let self, self.isRecordingEnabled else { return }
             self.ensurePoseSession()
             self.poseSessionRecorder.append(magneticSample: sample)
         }
     }
 
-    func startRecording() {
+    func startRecording(
+        experimentID: UUID,
+        startUnixTime: TimeInterval,
+        startMonotonicTime: TimeInterval
+    ) {
         arQueue.async { [weak self] in
             guard let self else { return }
             guard !self.isRecordingEnabled else { return }
@@ -267,6 +277,11 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
                 self.finishPoseSessionIfNeeded()
             }
 
+            self.poseSessionRecorder.startSession(
+                experimentID: experimentID,
+                startUnixTime: startUnixTime,
+                startMonotonicTime: startMonotonicTime
+            )
             self.ensurePoseSession()
             self.videoRecorder.startRecording()
             self.startSessionIfNeeded()
@@ -274,11 +289,15 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         }
     }
 
-    func stopRecording() {
+    func stopRecording(stopUnixTime: TimeInterval, stopMonotonicTime: TimeInterval) {
         arQueue.async { [weak self] in
             guard let self else { return }
             self.isRecordingEnabled = false
             self.recordingAttemptID = UUID()
+            self.poseSessionRecorder.markExperimentStopped(
+                unixTime: stopUnixTime,
+                monotonicTime: stopMonotonicTime
+            )
             self.videoRecorder.stopRecording { [weak self] _ in
                 guard let self else { return }
 
@@ -440,13 +459,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             shouldResetOriginOnNextFrame = false
         }
 
-        // Keep ARKit's gravity-aligned world axes; only shift the origin position.
-        var relativeTransform = transform
-        if let originTransform {
-            relativeTransform.columns.3.x -= originTransform.columns.3.x
-            relativeTransform.columns.3.y -= originTransform.columns.3.y
-            relativeTransform.columns.3.z -= originTransform.columns.3.z
-        }
+        let relativeTransform = originTransform.map {
+            simd_mul(simd_inverse($0), transform)
+        } ?? transform
 
         let sample = makePoseSample(from: relativeTransform, frameTimestamp: frameTimestamp)
         let presentationTime = CMTime(seconds: frameTimestamp, preferredTimescale: 600)
@@ -457,7 +472,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             self?.onSampleUpdated?(sample)
         }
 
-        if isStreamingEnabled || isRecordingEnabled {
+        if isRecordingEnabled {
             ensurePoseSession()
             poseSessionRecorder.append(
                 sample: PoseSampleRecord(

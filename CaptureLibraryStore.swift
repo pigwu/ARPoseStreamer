@@ -3,6 +3,7 @@ import Foundation
 enum CaptureUploadKind {
     case video
     case pose
+    case experiment
 }
 
 enum CaptureVideoFileState {
@@ -53,10 +54,12 @@ struct CaptureRecord: Identifiable, Codable, Hashable {
     let sessionDirectoryName: String
     let poseCSVFileName: String
     let magneticCSVFileName: String?
+    let senderTransportCSVFileName: String?
     let manifestFileName: String
     let videoFileName: String?
     var videoUploadedAt: Date?
     var poseUploadedAt: Date?
+    var experimentUploadedAt: Date?
 
     var defaultDisplayName: String {
         sessionDirectoryName
@@ -90,16 +93,18 @@ final class CaptureLibraryStore {
         var records = loadRecords()
 
         let record = CaptureRecord(
-            id: UUID(),
+            id: artifact.experimentID,
             createdAt: Date(),
             displayName: artifact.sessionDirectoryURL.lastPathComponent,
             sessionDirectoryName: artifact.sessionDirectoryURL.lastPathComponent,
             poseCSVFileName: artifact.poseCSVURL.lastPathComponent,
             magneticCSVFileName: artifact.magneticCSVURL?.lastPathComponent,
+            senderTransportCSVFileName: artifact.senderTransportCSVURL?.lastPathComponent,
             manifestFileName: artifact.manifestURL.lastPathComponent,
             videoFileName: artifact.videoURL?.lastPathComponent,
             videoUploadedAt: nil,
-            poseUploadedAt: nil
+            poseUploadedAt: nil,
+            experimentUploadedAt: nil
         )
 
         records.insert(record, at: 0)
@@ -127,6 +132,10 @@ final class CaptureLibraryStore {
                 records[index].videoUploadedAt = date
             case .pose:
                 records[index].poseUploadedAt = date
+            case .experiment:
+                records[index].videoUploadedAt = date
+                records[index].poseUploadedAt = date
+                records[index].experimentUploadedAt = date
             }
             save(records: records)
         }
@@ -145,6 +154,11 @@ final class CaptureLibraryStore {
     func urlForMagneticCSV(record: CaptureRecord) -> URL? {
         guard let magneticCSVFileName = record.magneticCSVFileName else { return nil }
         return Self.captureDirectory(for: record).appendingPathComponent(magneticCSVFileName)
+    }
+
+    func urlForSenderTransportCSV(record: CaptureRecord) -> URL? {
+        guard let fileName = record.senderTransportCSVFileName else { return nil }
+        return Self.captureDirectory(for: record).appendingPathComponent(fileName)
     }
 
     func urlForVideo(record: CaptureRecord) -> URL? {

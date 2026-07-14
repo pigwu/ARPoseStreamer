@@ -76,13 +76,9 @@ final class ARPositionTracker: NSObject, ARSessionDelegate {
             originTransform = cameraTransform
         }
 
-        // Keep ARKit's gravity-aligned world axes; only shift the origin position.
-        var relativeTransform = cameraTransform
-        if let originTransform {
-            relativeTransform.columns.3.x -= originTransform.columns.3.x
-            relativeTransform.columns.3.y -= originTransform.columns.3.y
-            relativeTransform.columns.3.z -= originTransform.columns.3.z
-        }
+        let relativeTransform = originTransform.map {
+            simd_mul(simd_inverse($0), cameraTransform)
+        } ?? cameraTransform
 
         let sample = makePoseSample(from: relativeTransform, timestamp: frame.timestamp)
 

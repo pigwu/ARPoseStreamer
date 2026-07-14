@@ -148,7 +148,7 @@ Packet header layout:
 3. `flags` as `UInt8`
 4. `reserved` as `UInt16`
 5. `frame_id` as `UInt32`
-6. `capture_timestamp` as `Float64`
+6. `capture_timestamp` as Unix time in a `Float64`
 7. `nalu_index` as `UInt16`
 8. `nalu_count` as `UInt16`
 9. `fragment_index` as `UInt16`
@@ -168,10 +168,37 @@ Flags:
 
 Sender behavior:
 
+- selectable capture targets are 480p (`640x480`), 720p (`1280x720`), and 1080p (`1920x1080`), subject to the closest format supported by the device
 - target packet size is `<= 1200` bytes to avoid IP fragmentation
 - H.264 is encoded with `VideoToolbox` in real-time mode with frame reordering disabled
 - SPS/PPS is repeated on each key frame so receivers can recover quickly after packet loss
 - dropped packets are not retransmitted; the receiver should prefer dropping an incomplete frame over building up latency
+- one-way latency must account for sender/receiver wall-clock offset; the debug receiver estimates that offset from the lowest-delay pose packets (or video arrival as a fallback)
+
+## Unified Experiment Capture
+
+Live pose, sensor, and low-latency video monitoring can remain active independently of experiment recording. A recording button creates one experiment UUID and one phone monotonic-clock origin. Only samples between the experiment start and stop events are persisted.
+
+The app sends JSON control events to `POST /experiment/control` on the upload server:
+
+```json
+{
+  "event": "start",
+  "experimentID": "UUID",
+  "eventUnixTime": 1700000000.0,
+  "eventMonotonicTime": 12345.0
+}
+```
+
+`stop` uses the same shape and UUID. After the MP4 is finalized, the app uploads all available components with `X-Upload-Kind: experiment` and the shared UUID as `X-Capture-ID`. The computer stores one directory per UUID containing:
+
+- `pose.csv`
+- `magnetic.csv` when sensor samples were available
+- `video.mp4` when video recording succeeded
+- `sender_transport.csv`
+- `receiver_transport.csv` when the integrated monitor observed the live session
+- `capture_manifest.json`
+- `upload_state.json` and `experiment_state.json`
 
 ## Wired Sensor Mirror
 

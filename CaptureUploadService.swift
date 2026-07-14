@@ -53,6 +53,13 @@ struct UploadProgressSnapshot {
     let savedTo: String?
 }
 
+struct ExperimentControlPayload: Encodable {
+    let event: String
+    let experimentID: String
+    let eventUnixTime: TimeInterval
+    let eventMonotonicTime: TimeInterval
+}
+
 final class CaptureUploadService {
     private let session: URLSession
 
@@ -78,7 +85,9 @@ final class CaptureUploadService {
                 descriptor: descriptor,
                 captureID: captureID,
                 serverBaseURL: serverBaseURL,
-                kind: kind
+                kind: kind,
+                fileIndex: index + 1,
+                totalFiles: descriptors.count
             )
 
             responses.append(response)
@@ -103,7 +112,9 @@ final class CaptureUploadService {
         descriptor: UploadDescriptor,
         captureID: String,
         serverBaseURL: URL,
-        kind: CaptureUploadKind
+        kind: CaptureUploadKind,
+        fileIndex: Int,
+        totalFiles: Int
     ) async throws -> UploadResponse {
         let fileSize = try validateUploadFile(descriptor)
 
@@ -111,13 +122,15 @@ final class CaptureUploadService {
 
         var request = URLRequest(url: uploadURL)
         request.httpMethod = "POST"
-        request.timeoutInterval = kind == .video ? 600 : 120
+        request.timeoutInterval = (kind == .video || kind == .experiment) ? 600 : 120
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue(captureID, forHTTPHeaderField: "X-Capture-ID")
         request.setValue(descriptor.component, forHTTPHeaderField: "X-Capture-Component")
-        request.setValue(kind == .video ? "video" : "pose", forHTTPHeaderField: "X-Upload-Kind")
+        request.setValue(Self.uploadKindName(kind), forHTTPHeaderField: "X-Upload-Kind")
         request.setValue(descriptor.fileURL.lastPathComponent, forHTTPHeaderField: "X-Original-Filename")
         request.setValue(String(fileSize), forHTTPHeaderField: "X-Upload-File-Size")
+        request.setValue(String(fileIndex), forHTTPHeaderField: "X-Experiment-File-Index")
+        request.setValue(String(totalFiles), forHTTPHeaderField: "X-Experiment-File-Count")
 
         let (data, response) = try await session.upload(for: request, fromFile: descriptor.fileURL)
 
@@ -136,6 +149,47 @@ final class CaptureUploadService {
         }
 
         return uploadResponse
+    }
+
+    func sendExperimentEvent(
+        experimentID: UUID,
+        event: String,
+        eventUnixTime: TimeInterval,
+        eventMonotonicTime: TimeInterval,
+        serverBaseURL: URL
+    ) async throws {
+        let url = serverBaseURL.appending(path: "experiment/control")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            ExperimentControlPayload(
+                event: event,
+                experimentID: experimentID.uuidString,
+                eventUnixTime: eventUnixTime,
+                eventMonotonicTime: eventMonotonicTime
+            )
+        )
+
+        let (_, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CaptureUploadError.invalidResponse
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw CaptureUploadError.httpStatus(httpResponse.statusCode, nil)
+        }
+    }
+
+    private static func uploadKindName(_ kind: CaptureUploadKind) -> String {
+        switch kind {
+        case .video:
+            return "video"
+        case .pose:
+            return "pose"
+        case .experiment:
+            return "experiment"
+        }
     }
 
     private func validateUploadFile(_ descriptor: UploadDescriptor) throws -> Int {
