@@ -4,6 +4,15 @@ import CoreVideo
 import Network
 import VideoToolbox
 
+struct VideoCameraCalibration: Equatable {
+    let fx: Float
+    let fy: Float
+    let cx: Float
+    let cy: Float
+    let imageWidth: UInt16
+    let imageHeight: UInt16
+}
+
 enum VideoStreamResolution: String, CaseIterable, Identifiable {
     case sd480p
     case hd720p
@@ -191,7 +200,8 @@ final class ARLowLatencyVideoSender {
     func appendFrame(
         pixelBuffer: CVPixelBuffer,
         presentationTimeStamp: CMTime,
-        captureTimestamp: TimeInterval
+        captureTimestamp: TimeInterval,
+        cameraCalibration: VideoCameraCalibration
     ) {
         workQueue.async { [weak self] in
             guard let self else { return }
@@ -216,7 +226,8 @@ final class ARLowLatencyVideoSender {
 
             let metadata = EncodedFrameMetadata(
                 frameID: frameID,
-                captureTimestamp: captureTimestamp
+                captureTimestamp: captureTimestamp,
+                cameraCalibration: cameraCalibration
             )
 
             let frameProperties: CFDictionary?
@@ -459,6 +470,7 @@ final class ARLowLatencyVideoSender {
                 let bytesSent = try self.sendFrameLocked(
                     frameID: metadata.frameID,
                     captureTimestamp: metadata.captureTimestamp,
+                    cameraCalibration: metadata.cameraCalibration,
                     nalUnits: allNALUnits,
                     parameterSetCount: parameterSets.count,
                     isKeyFrame: isKeyFrame
@@ -488,6 +500,7 @@ final class ARLowLatencyVideoSender {
     private func sendFrameLocked(
         frameID: UInt32,
         captureTimestamp: TimeInterval,
+        cameraCalibration: VideoCameraCalibration,
         nalUnits: [Data],
         parameterSetCount: Int,
         isKeyFrame: Bool
@@ -514,6 +527,7 @@ final class ARLowLatencyVideoSender {
                     ),
                     frameID: frameID,
                     captureTimestamp: captureTimestamp,
+                    cameraCalibration: cameraCalibration,
                     naluIndex: UInt16(naluIndex),
                     naluCount: UInt16(nalUnits.count),
                     fragmentIndex: UInt16(fragmentIndex),
@@ -727,10 +741,16 @@ final class ARLowLatencyVideoSender {
 private final class EncodedFrameMetadata {
     let frameID: UInt32
     let captureTimestamp: TimeInterval
+    let cameraCalibration: VideoCameraCalibration
 
-    init(frameID: UInt32, captureTimestamp: TimeInterval) {
+    init(
+        frameID: UInt32,
+        captureTimestamp: TimeInterval,
+        cameraCalibration: VideoCameraCalibration
+    ) {
         self.frameID = frameID
         self.captureTimestamp = captureTimestamp
+        self.cameraCalibration = cameraCalibration
     }
 }
 
@@ -751,13 +771,14 @@ private struct VideoPacketFlags {
 }
 
 private struct VideoPacketHeader {
-    static let magic = "APV1"
-    static let version: UInt8 = 1
-    static let size = 28
+    static let magic = "APV2"
+    static let version: UInt8 = 2
+    static let size = 48
 
     let flags: VideoPacketFlags
     let frameID: UInt32
     let captureTimestamp: TimeInterval
+    let cameraCalibration: VideoCameraCalibration
     let naluIndex: UInt16
     let naluCount: UInt16
     let fragmentIndex: UInt16
@@ -776,6 +797,12 @@ private struct VideoPacketHeader {
         var naluCountLE = naluCount.littleEndian
         var fragmentIndexLE = fragmentIndex.littleEndian
         var fragmentCountLE = fragmentCount.littleEndian
+        var fxLE = cameraCalibration.fx.bitPattern.littleEndian
+        var fyLE = cameraCalibration.fy.bitPattern.littleEndian
+        var cxLE = cameraCalibration.cx.bitPattern.littleEndian
+        var cyLE = cameraCalibration.cy.bitPattern.littleEndian
+        var imageWidthLE = cameraCalibration.imageWidth.littleEndian
+        var imageHeightLE = cameraCalibration.imageHeight.littleEndian
 
         withUnsafeBytes(of: &reserved) { data.append(contentsOf: $0) }
         withUnsafeBytes(of: &frameIDLE) { data.append(contentsOf: $0) }
@@ -784,6 +811,12 @@ private struct VideoPacketHeader {
         withUnsafeBytes(of: &naluCountLE) { data.append(contentsOf: $0) }
         withUnsafeBytes(of: &fragmentIndexLE) { data.append(contentsOf: $0) }
         withUnsafeBytes(of: &fragmentCountLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &fxLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &fyLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &cxLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &cyLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &imageWidthLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &imageHeightLE) { data.append(contentsOf: $0) }
 
         return data
     }

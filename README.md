@@ -389,6 +389,7 @@ What you usually want to see:
 
 Detailed docs:
 
+- [UMI gripper ArUco ID 0/1 integration (Chinese)](docs/ARUCO_GRIPPER_INTEGRATION.zh-CN.md)
 - [Install the iPhone app](INSTALL_IPHONE_APP.md)
 - [Setup guide](docs/SETUP.md)
 - [Architecture overview](docs/ARCHITECTURE.md)

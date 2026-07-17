@@ -52,7 +52,8 @@ from PyQt6.QtWidgets import (
 from capture_upload_server import create_upload_server, get_default_upload_dir
 from experiment_data import ExperimentDataset, TimedRows, discover_experiments
 from pose_magnetic_receiver import APM1DecodeError, decode_apm1_packet
-from udp_video_debug_ui import LatencyClockCompensator, VideoReceiverThread
+from udp_video_debug_ui import LatencyClockCompensator, VideoReceiverThread, get_app_base_dir
+from aruco_config_ui import ArucoConfigWidget
 
 
 RECEIVER_FIELDS = [
@@ -447,6 +448,9 @@ class ExperimentMonitorWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_live_tab(), "Live Monitor")
+        self.aruco_panel = ArucoConfigWidget(Path(self.args.aruco_config))
+        self.aruco_panel.apply_requested.connect(self.apply_aruco_configuration)
+        self.tabs.addTab(self.aruco_panel, "ArUco Gripper")
         self.tabs.addTab(self._build_replay_tab(), "Experiment Replay")
         root.addWidget(self.tabs, 1)
 
@@ -478,6 +482,24 @@ class ExperimentMonitorWindow(QMainWindow):
         ]:
             video_form.addRow(label, value)
         side.addWidget(video_box)
+
+        aruco_box = QGroupBox("ArUco 夹爪逐帧测距")
+        aruco_form = QFormLayout(aruco_box)
+        self.live_aruco_state = QLabel("Disabled / waiting")
+        self.live_aruco_ids = QLabel("--")
+        self.live_aruco_raw_distance = QLabel("--")
+        self.live_aruco_calibrated_distance = QLabel("--")
+        self.live_aruco_filtered_distance = QLabel("--")
+        for label, value in [
+            ("状态", self.live_aruco_state),
+            ("检测 ID", self.live_aruco_ids),
+            ("标记中心原始距离", self.live_aruco_raw_distance),
+            ("校准后夹爪开口", self.live_aruco_calibrated_distance),
+            ("滤波后夹爪开口", self.live_aruco_filtered_distance),
+        ]:
+            value.setWordWrap(True)
+            aruco_form.addRow(label, value)
+        side.addWidget(aruco_box)
 
         sensor_box = QGroupBox("Combined Sensor")
         sensor_layout = QVBoxLayout(sensor_box)
@@ -677,10 +699,23 @@ class ExperimentMonitorWindow(QMainWindow):
         self.upload_bridge.start(bind, upload_port, root)
         self.refresh_experiments()
 
-        self.video_worker = VideoReceiverThread(bind, video_port, pose_port)
+        try:
+            aruco_config = self.aruco_panel.current_config()
+        except Exception as exc:
+            aruco_config = None
+            self.aruco_panel.config_status.setText(f"配置无效，ArUco 未启动：{exc}")
+            self.aruco_panel.config_status.setStyleSheet("color:#c62828;")
+
+        self.video_worker = VideoReceiverThread(
+            bind,
+            video_port,
+            pose_port,
+            aruco_config=aruco_config,
+        )
         self.video_worker.frame_ready.connect(self.update_live_video)
         self.video_worker.video_metrics.connect(self.update_live_video_metrics)
         self.video_worker.pose_metrics.connect(self.update_live_pose_metrics)
+        self.video_worker.aruco_metrics.connect(self.update_live_aruco_metrics)
         self.video_worker.start()
 
         self.combined_worker = CombinedReceiverThread(
@@ -707,6 +742,16 @@ class ExperimentMonitorWindow(QMainWindow):
             self.combined_worker = None
         self.upload_bridge.stop()
         self.services_button.setText("Start Monitor")
+
+    def apply_aruco_configuration(self, _config: object) -> None:
+        was_running = self.video_worker is not None
+        if was_running:
+            self.stop_services()
+            self.start_services()
+        self.aruco_panel.config_status.setText(
+            "配置已保存并应用；监控服务已重启" if was_running else "配置已保存；启动监控后生效"
+        )
+        self.aruco_panel.config_status.setStyleSheet("color:#2e7d32;")
 
     def set_service_status(self, message: str) -> None:
         self.service_status.setText(message)
@@ -737,6 +782,40 @@ class ExperimentMonitorWindow(QMainWindow):
         if identifier > self.last_pose_id and metrics.get("sender_timestamp") is not None:
             self.last_pose_id = identifier
             self.diagnostics.record(self._diagnostic_row("pose", identifier, metrics))
+
+    def update_live_aruco_metrics(self, metrics: dict) -> None:
+        self.aruco_panel.update_live_result(metrics)
+        status = str(metrics.get("status", "--"))
+        self.live_aruco_state.setText(status)
+        self.live_aruco_state.setStyleSheet(
+            "color:#2e7d32; font-weight:600;"
+            if status == "tracking_gripper_distance"
+            else "color:#ef6c00;"
+        )
+        ids = metrics.get("detected_ids") or []
+        self.live_aruco_ids.setText(", ".join(str(value) for value in ids) if ids else "--")
+        distance = metrics.get("gripper_distance") or {}
+        raw_m = distance.get("raw_marker_center_m")
+        calibrated_mm = distance.get("calibrated_mm")
+        filtered_mm = distance.get("filtered_mm")
+        calibration_complete = distance.get("calibration_complete") is True
+        self.live_aruco_raw_distance.setText(
+            f"{float(raw_m) * 1000.0:.4f} mm" if isinstance(raw_m, (int, float)) else "--"
+        )
+        self.live_aruco_calibrated_distance.setText(
+            f"{float(calibrated_mm):.4f} mm"
+            if calibration_complete and isinstance(calibrated_mm, (int, float))
+            else "未完成两点标定"
+            if distance
+            else "--"
+        )
+        self.live_aruco_filtered_distance.setText(
+            f"{float(filtered_mm):.4f} mm"
+            if calibration_complete and isinstance(filtered_mm, (int, float))
+            else "未完成两点标定"
+            if distance
+            else "--"
+        )
 
     def update_live_combined_metrics(self, metrics: dict) -> None:
         self.live_sensor_status.setText(str(metrics.get("status", "--")))
@@ -1148,6 +1227,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upload-port", type=int, default=8000)
     parser.add_argument("--phone-ip", default="172.20.10.1")
     parser.add_argument("--experiments", default=str(get_default_upload_dir()))
+    parser.add_argument(
+        "--aruco-config",
+        default=str(get_app_base_dir() / "config" / "umi_gripper_aruco.json"),
+    )
     return parser.parse_args()
 
 

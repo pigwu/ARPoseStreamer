@@ -65,7 +65,10 @@ Build-DesktopTool -Name "ARPose Packet Loss Monitor" -EntryPoint "udp_packet_los
 Build-DesktopTool -Name "ARPose Zarr Exporter" -EntryPoint "zarr_exporter_ui.py"
 Build-DesktopTool -Name "AnySkin UDP Monitor" -EntryPoint "anyskin_udp_monitor.py"
 Build-DesktopTool -Name "ARPose Video Debugger" -EntryPoint "udp_video_debug_ui.py" -ExtraArgs @("--collect-all", "av")
-Build-DesktopTool -Name "ARPose Experiment Monitor" -EntryPoint "experiment_replay_ui.py" -ExtraArgs @("--collect-all", "av")
+Build-DesktopTool -Name "ARPose Experiment Monitor" -EntryPoint "experiment_replay_ui.py" -ExtraArgs @(
+    "--collect-all", "av",
+    "--add-data", "config/umi_gripper_aruco.json;config"
+)
 
 Write-Host "`nBuild complete!"
 Write-Host "Executable locations:"

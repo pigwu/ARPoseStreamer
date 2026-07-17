@@ -1,6 +1,7 @@
+import struct
 import unittest
 
-from udp_video_debug_ui import LatencyClockCompensator
+from udp_video_debug_ui import CameraIntrinsics, LatencyClockCompensator, decode_video_packet
 
 
 class LatencyClockCompensatorTests(unittest.TestCase):
@@ -51,6 +52,35 @@ class LatencyClockCompensatorTests(unittest.TestCase):
 
         self.assertIsNone(latency)
         self.assertIsNone(clock.offset_seconds)
+
+
+class VideoProtocolTests(unittest.TestCase):
+    def test_apv2_packet_is_decoded_with_intrinsics(self) -> None:
+        packet = struct.pack(
+            "<4sBBHIdHHHHffffHH",
+            b"APV2",
+            2,
+            1,
+            0,
+            99,
+            1000.25,
+            0,
+            1,
+            0,
+            1,
+            800.0,
+            801.0,
+            640.0,
+            360.0,
+            1280,
+            720,
+        ) + b"payload"
+
+        decoded = decode_video_packet(packet)
+
+        self.assertEqual(decoded.frame_id, 99)
+        self.assertEqual(decoded.payload, b"payload")
+        self.assertEqual(decoded.camera_intrinsics, CameraIntrinsics(800.0, 801.0, 640.0, 360.0, 1280, 720))
 
 
 if __name__ == "__main__":

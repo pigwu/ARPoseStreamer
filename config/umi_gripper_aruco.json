@@ -1,0 +1,25 @@
+{
+  "dictionary": "DICT_4X4_50",
+  "marker_size_m": 0.016,
+  "marker_ids": [0, 1],
+  "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "camera_intrinsics": null,
+  "max_reprojection_error_px": 2.5,
+  "min_marker_perimeter_px": 80.0,
+  "tracking_enabled": true,
+  "output_host": "127.0.0.1",
+  "output_port": 5570,
+  "distance_scale": 1.0,
+  "distance_offset_m": 0.0,
+  "distance_smoothing_alpha": 1.0,
+  "distance_calibration": {
+    "minimum": {
+      "raw_marker_center_m": null,
+      "actual_gap_m": 0.0
+    },
+    "maximum": {
+      "raw_marker_center_m": null,
+      "actual_gap_m": 0.0
+    }
+  }
+}

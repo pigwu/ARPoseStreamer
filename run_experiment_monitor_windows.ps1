@@ -4,8 +4,11 @@ param(
     [int]$PosePort = 5555,
     [int]$CombinedPort = 5558,
     [int]$UploadPort = 8000,
-    [string]$PhoneIP = "172.20.10.1"
+    [string]$PhoneIP = "172.20.10.1",
+    [string]$ArucoConfig = "config\umi_gripper_aruco.json"
 )
+
+Set-Location $PSScriptRoot
 
 $arguments = @(
     "experiment_replay_ui.py",
@@ -14,7 +17,8 @@ $arguments = @(
     "--pose-port", $PosePort,
     "--combined-port", $CombinedPort,
     "--upload-port", $UploadPort,
-    "--phone-ip", $PhoneIP
+    "--phone-ip", $PhoneIP,
+    "--aruco-config", $ArucoConfig
 )
 
 if (Get-Command py -ErrorAction SilentlyContinue) {

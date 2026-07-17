@@ -139,11 +139,11 @@ continues on the phone.
 
 ## Low-Latency Video Stream
 
-The optional low-latency video stream uses a second UDP port, default `5560`, and carries H.264 NAL units without MP4/RTSP/WebRTC container overhead.
+The optional low-latency video stream uses a second UDP port, default `5560`, and carries H.264 NAL units without MP4/RTSP/WebRTC container overhead. New senders use `APV2`; receivers remain backward compatible with `APV1`.
 
-Packet header layout:
+Common packet header layout:
 
-1. `magic` as ASCII `APV1`
+1. `magic` as ASCII `APV1` or `APV2`
 2. `version` as `UInt8`
 3. `flags` as `UInt8`
 4. `reserved` as `UInt16`
@@ -153,13 +153,26 @@ Packet header layout:
 8. `nalu_count` as `UInt16`
 9. `fragment_index` as `UInt16`
 10. `fragment_count` as `UInt16`
-11. `payload` as raw H.264 NAL bytes
 
-Header size:
+The legacy `APV1` header ends here and is 28 bytes. `APV2` appends the camera calibration used by the captured image:
+
+11. `fx` as `Float32`
+12. `fy` as `Float32`
+13. `cx` as `Float32`
+14. `cy` as `Float32`
+15. calibration image width as `UInt16`
+16. calibration image height as `UInt16`
+
+The raw H.264 NAL payload starts immediately after the applicable 28-byte or 48-byte header.
+
+Header sizes:
 
 ```text
-28 bytes
+APV1: 28 bytes, magic="APV1", version=1
+APV2: 48 bytes, magic="APV2", version=2
 ```
+
+All numeric fields are little-endian. A receiver scales `fx`, `fy`, `cx`, and `cy` by decoded-resolution/calibration-resolution before using them. The APV2 intrinsics make metric fiducial pose estimation possible without guessing the iPhone field of view.
 
 Flags:
 
@@ -174,6 +187,27 @@ Sender behavior:
 - SPS/PPS is repeated on each key frame so receivers can recover quickly after packet loss
 - dropped packets are not retransmitted; the receiver should prefer dropping an incomplete frame over building up latency
 - one-way latency must account for sender/receiver wall-clock offset; the debug receiver estimates that offset from the lowest-delay pose packets (or video arrival as a fallback)
+
+## ArUco Gripper Distance Output (AGP1)
+
+The integrated monitor can detect two configured ArUco markers from each APV2 video frame and send one UTF-8 JSON datagram per processed frame, normally to UDP port `5570`. This path uses the APV2 camera intrinsics but does not use the AR pose stream or any robot base/TCP transform.
+
+For a valid frame, `status` is `tracking_gripper_distance` and `gripper_distance` contains:
+
+- `raw_marker_center_m`: Euclidean distance between the two estimated 3D marker centers
+- `calibrated_m` / `calibrated_mm`: jaw gap after two-point scale and offset calibration
+- `filtered_m` / `filtered_mm`: optional EMA-filtered jaw gap
+- `scale` and `offset_m`: active linear calibration
+- `calibration_complete`: true only after both calibration endpoints are available
+- `calibrated_range_mm`: minimum and maximum jaw gaps used for calibration
+
+The calibration is:
+
+```text
+actual_gap = scale * raw_marker_center_distance + offset
+```
+
+If either configured marker is missing, `status` is `insufficient_markers_for_distance` and `gripper_distance` is `null`. Consumers must use a distance only when the status is `tracking_gripper_distance` and `calibration_complete` is true. Before calibration, `raw_marker_center_m` remains available so the UI can capture the two endpoint observations.
 
 ## Unified Experiment Capture
 

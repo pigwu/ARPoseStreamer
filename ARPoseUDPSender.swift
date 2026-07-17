@@ -313,14 +313,25 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard case .normal = frame.camera.trackingState else { return }
         let cameraTransform = frame.camera.transform
+        let cameraIntrinsics = frame.camera.intrinsics
+        let imageResolution = frame.camera.imageResolution
         let frameTimestamp = frame.timestamp
         let capturedImage = frame.capturedImage
+        let videoCalibration = VideoCameraCalibration(
+            fx: cameraIntrinsics.columns.0.x,
+            fy: cameraIntrinsics.columns.1.y,
+            cx: cameraIntrinsics.columns.2.x,
+            cy: cameraIntrinsics.columns.2.y,
+            imageWidth: UInt16(clamping: Int(imageResolution.width.rounded())),
+            imageHeight: UInt16(clamping: Int(imageResolution.height.rounded()))
+        )
 
         arQueue.async { [weak self] in
             self?.processFrame(
                 transform: cameraTransform,
                 pixelBuffer: capturedImage,
-                frameTimestamp: frameTimestamp
+                frameTimestamp: frameTimestamp,
+                videoCalibration: videoCalibration
             )
         }
     }
@@ -453,7 +464,12 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         }
     }
 
-    private func processFrame(transform: simd_float4x4, pixelBuffer: CVPixelBuffer, frameTimestamp: TimeInterval) {
+    private func processFrame(
+        transform: simd_float4x4,
+        pixelBuffer: CVPixelBuffer,
+        frameTimestamp: TimeInterval,
+        videoCalibration: VideoCameraCalibration
+    ) {
         if shouldResetOriginOnNextFrame || originTransform == nil {
             originTransform = transform
             shouldResetOriginOnNextFrame = false
@@ -494,7 +510,8 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             videoSender.appendFrame(
                 pixelBuffer: pixelBuffer,
                 presentationTimeStamp: presentationTime,
-                captureTimestamp: sample.timestamp
+                captureTimestamp: sample.timestamp,
+                cameraCalibration: videoCalibration
             )
         }
 
