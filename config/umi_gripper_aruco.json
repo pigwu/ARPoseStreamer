@@ -12,13 +12,17 @@
   "distance_scale": 1.0,
   "distance_offset_m": 0.0,
   "distance_smoothing_alpha": 1.0,
+  "distance_measurement_mode": "camera_x",
+  "nominal_marker_depth_m": 0.072,
+  "marker_depth_tolerance_m": 0.008,
   "distance_calibration": {
+    "minimum_cycles": 5,
     "minimum": {
-      "raw_marker_center_m": null,
+      "raw_marker_x_distance_m": null,
       "actual_gap_m": 0.0
     },
     "maximum": {
-      "raw_marker_center_m": null,
+      "raw_marker_x_distance_m": null,
       "actual_gap_m": 0.0
     }
   }

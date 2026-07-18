@@ -28,8 +28,10 @@ from PyQt6.QtWidgets import (
 from aruco_gripper_tracker import (
     ArucoEstimator,
     CameraIntrinsics,
+    CyclicCalibrationSummary,
     TrackerConfig,
     calculate_distance_calibration,
+    summarize_cyclic_calibration,
 )
 
 
@@ -48,6 +50,9 @@ class ArucoConfigWidget(QWidget):
         self.last_raw_distance_m: float | None = None
         self.distance_scale = 1.0
         self.distance_offset_m = 0.0
+        self.calibration_collecting = False
+        self.calibration_samples_m: list[float] = []
+        self.calibration_collection_summary: CyclicCalibrationSummary | None = None
         self._ensure_initial_config(config_path)
         self._build_ui(config_path)
         self.load_configuration(show_dialog=False)
@@ -82,7 +87,7 @@ class ArucoConfigWidget(QWidget):
         spin = self._double_spin(-1.0, 5000.0, 4, 0.1, " mm")
         spin.setSpecialValueText("未记录")
         spin.setValue(-1.0)
-        spin.setToolTip("可点击“记录当前”，也可以直接填写已记录的原始标记中心距离")
+        spin.setToolTip("连续开合采集后自动填写，也可以手工修改原始 X 轴宽度")
         return spin
 
     def _build_ui(self, config_path: Path) -> None:
@@ -95,8 +100,8 @@ class ArucoConfigWidget(QWidget):
         layout = QVBoxLayout(content)
 
         summary = QLabel(
-            "用途：逐帧测量夹爪开口。把 ID 0、ID 1 分别贴在两个活动夹爪上，"
-            "然后记录最小点和最大点即可。无需机械臂型号、TCP 或 base/world 外参。"
+            "用途：按 UMI-FT 方法逐帧测量夹爪开口。ID 0、ID 1 分别贴在两个活动夹爪上，"
+            "原始宽度取两个标记相机 X 坐标之差；连续完整开合至少 5 次后自动标定。"
         )
         summary.setWordWrap(True)
         summary.setStyleSheet(
@@ -114,7 +119,7 @@ class ArucoConfigWidget(QWidget):
         self.filtered_gap_label = QLabel("--")
         for column, (title, value) in enumerate(
             [
-                ("标记中心原始距离", self.current_raw_label),
+                ("相机 X 轴原始宽度", self.current_raw_label),
                 ("校准后开口", self.current_gap_label),
                 ("滤波后开口", self.filtered_gap_label),
             ]
@@ -135,58 +140,85 @@ class ArucoConfigWidget(QWidget):
         self.dictionary_combo.addItems(["DICT_4X4_50", "DICT_5X5_50", "DICT_6X6_50"])
         self.marker_size_mm = self._double_spin(0.1, 500.0, 3, 0.1, " mm")
         self.marker_ids_edit = QLineEdit("0,1")
+        self.nominal_depth_mm_spin = self._double_spin(1.0, 1000.0, 3, 0.5, " mm")
+        self.nominal_depth_mm_spin.setValue(72.0)
+        self.depth_tolerance_mm_spin = self._double_spin(0.1, 200.0, 3, 0.5, " mm")
+        self.depth_tolerance_mm_spin.setValue(8.0)
         for column, (label, widget, tip) in enumerate(
             [
                 ("字典", self.dictionary_combo, "随附 PDF 使用 DICT_4X4_50"),
                 ("黑色外边长", self.marker_size_mm, "打印后实测应为 16.000 mm"),
-                ("两个标记 ID", self.marker_ids_edit, "默认 0,1；顺序不影响欧氏距离"),
+                ("两个标记 ID", self.marker_ids_edit, "默认 0,1；必须同时检测到两个标记"),
             ]
         ):
             marker_layout.addWidget(QLabel(label), 0, column)
             marker_layout.addWidget(widget, 1, column)
             widget.setToolTip(tip)
+        marker_layout.addWidget(QLabel("标记标称深度"), 2, 0)
+        marker_layout.addWidget(self.nominal_depth_mm_spin, 3, 0)
+        marker_layout.addWidget(QLabel("允许深度偏差"), 2, 1)
+        marker_layout.addWidget(self.depth_tolerance_mm_spin, 3, 1)
+        depth_hint = QLabel("UMI-FT 默认 72 ± 8 mm；若安装结构不同，请按实际相机到标记深度修改")
+        depth_hint.setWordWrap(True)
+        depth_hint.setStyleSheet("color:#546e7a;")
+        marker_layout.addWidget(depth_hint, 2, 2, 2, 1)
         layout.addWidget(marker_box)
 
-        calibration_box = QGroupBox("2. 最小/最大两点标定")
+        calibration_box = QGroupBox("2. 连续开合标定")
         calibration = QGridLayout(calibration_box)
         calibration.addWidget(QLabel("位置"), 0, 0)
         calibration.addWidget(QLabel("实际夹爪开口（卡尺测量）"), 0, 1)
-        calibration.addWidget(QLabel("原始标记中心距离"), 0, 2)
+        calibration.addWidget(QLabel("自动统计的 X 轴宽度"), 0, 2)
 
         self.minimum_gap_mm_spin = self._double_spin(0.0, 2000.0, 3, 0.1, " mm")
         self.maximum_gap_mm_spin = self._double_spin(0.0, 2000.0, 3, 0.1, " mm")
         self.minimum_raw_mm_spin = self._raw_point_spin()
         self.maximum_raw_mm_spin = self._raw_point_spin()
-        minimum_button = QPushButton("记录当前")
-        maximum_button = QPushButton("记录当前")
-        minimum_button.clicked.connect(lambda: self.record_current_point("minimum"))
-        maximum_button.clicked.connect(lambda: self.record_current_point("maximum"))
+        self.calibration_min_cycles_spin = QSpinBox()
+        self.calibration_min_cycles_spin.setRange(2, 20)
+        self.calibration_min_cycles_spin.setValue(5)
 
         calibration.addWidget(QLabel("最小开口"), 1, 0)
         calibration.addWidget(self.minimum_gap_mm_spin, 1, 1)
         calibration.addWidget(self.minimum_raw_mm_spin, 1, 2)
-        calibration.addWidget(minimum_button, 1, 3)
         calibration.addWidget(QLabel("最大开口"), 2, 0)
         calibration.addWidget(self.maximum_gap_mm_spin, 2, 1)
         calibration.addWidget(self.maximum_raw_mm_spin, 2, 2)
-        calibration.addWidget(maximum_button, 2, 3)
 
-        calculate_button = QPushButton("计算/更新两点标定")
+        calibration.addWidget(QLabel("最少完整开合周期"), 3, 0)
+        calibration.addWidget(self.calibration_min_cycles_spin, 3, 1)
+        self.start_collection_button = QPushButton("开始采集")
+        self.finish_collection_button = QPushButton("结束采集并计算")
+        self.finish_collection_button.setEnabled(False)
+        self.clear_collection_button = QPushButton("清空本次采集")
+        self.start_collection_button.clicked.connect(self.start_calibration_collection)
+        self.finish_collection_button.clicked.connect(self.finish_calibration_collection)
+        self.clear_collection_button.clicked.connect(self.clear_calibration_collection)
+        controls = QHBoxLayout()
+        controls.addWidget(self.start_collection_button)
+        controls.addWidget(self.finish_collection_button)
+        controls.addWidget(self.clear_collection_button)
+        calibration.addLayout(controls, 4, 0, 1, 3)
+        self.collection_status_label = QLabel("尚未开始采集")
+        self.collection_status_label.setWordWrap(True)
+        calibration.addWidget(self.collection_status_label, 5, 0, 1, 3)
+
+        calculate_button = QPushButton("使用上方端点重新计算")
         calculate_button.clicked.connect(self.calculate_two_point_calibration)
-        calibration.addWidget(calculate_button, 3, 0, 1, 4)
+        calibration.addWidget(calculate_button, 6, 0, 1, 3)
         self.calibration_result_label = QLabel("尚未完成两点标定")
         self.calibration_result_label.setWordWrap(True)
         self.calibration_result_label.setStyleSheet(
             "padding:7px; background:#eceff1; border-radius:4px;"
         )
-        calibration.addWidget(self.calibration_result_label, 4, 0, 1, 4)
+        calibration.addWidget(self.calibration_result_label, 7, 0, 1, 3)
         formula = QLabel(
-            "计算公式：实际开口 = scale × 原始标记距离 + offset。"
-            "两组实际开口和原始距离都会写入 JSON，之后仍可填写、修改和重新计算。"
+            "操作：开始采集 → 连续从全闭到全开再回到全闭至少 5 次 → 结束采集并计算。"
+            "程序用端点帧的稳健统计值计算 scale/offset；所有数据仍可手工修改。"
         )
         formula.setWordWrap(True)
         formula.setStyleSheet("color:#546e7a;")
-        calibration.addWidget(formula, 5, 0, 1, 4)
+        calibration.addWidget(formula, 8, 0, 1, 3)
         layout.addWidget(calibration_box)
 
         output_box = QGroupBox("3. 输出与保存")
@@ -374,10 +406,14 @@ class ArucoConfigWidget(QWidget):
             distance_scale=self.distance_scale,
             distance_offset_m=self.distance_offset_m,
             distance_smoothing_alpha=self.smoothing_alpha_spin.value(),
+            distance_measurement_mode="camera_x",
+            nominal_marker_depth_m=self.nominal_depth_mm_spin.value() / 1000.0,
+            marker_depth_tolerance_m=self.depth_tolerance_mm_spin.value() / 1000.0,
             calibration_min_raw_m=minimum_raw_m,
             calibration_min_gap_m=minimum_gap_m,
             calibration_max_raw_m=maximum_raw_m,
             calibration_max_gap_m=maximum_gap_m,
+            calibration_min_cycles=self.calibration_min_cycles_spin.value(),
         )
         if not config.output_host:
             raise ValueError("UDP 接收 IP 不能为空")
@@ -393,6 +429,9 @@ class ArucoConfigWidget(QWidget):
         self.output_host_edit.setText(config.output_host)
         self.output_port_spin.setValue(config.output_port)
         self.smoothing_alpha_spin.setValue(config.distance_smoothing_alpha)
+        self.nominal_depth_mm_spin.setValue(config.nominal_marker_depth_m * 1000.0)
+        self.depth_tolerance_mm_spin.setValue(config.marker_depth_tolerance_m * 1000.0)
+        self.calibration_min_cycles_spin.setValue(config.calibration_min_cycles)
         self.distance_scale = config.distance_scale
         self.distance_offset_m = config.distance_offset_m
         self.minimum_gap_mm_spin.setValue(config.calibration_min_gap_m * 1000.0)
@@ -459,26 +498,77 @@ class ArucoConfigWidget(QWidget):
             self.config_status.setStyleSheet("color:#c62828;")
             QMessageBox.critical(self, "无法保存 ArUco 测距配置", str(exc))
 
-    def record_current_point(self, point: str) -> None:
-        if self.last_raw_distance_m is None:
-            QMessageBox.warning(self, "当前帧不可用", "必须在当前帧同时检测到两个标记后才能记录。")
+    def start_calibration_collection(self, _checked: bool = False) -> None:
+        if self.maximum_gap_mm_spin.value() <= self.minimum_gap_mm_spin.value():
+            QMessageBox.warning(self, "实际开口无效", "最大实际开口必须大于最小实际开口。")
             return
-        target = self.minimum_raw_mm_spin if point == "minimum" else self.maximum_raw_mm_spin
-        target.setValue(self.last_raw_distance_m * 1000.0)
-        name = "最小点" if point == "minimum" else "最大点"
-        self.config_status.setText(
-            f"已记录{name}原始距离 {self.last_raw_distance_m * 1000.0:.4f} mm；"
-            "完成两个点后点击“计算/更新两点标定”"
+        self.calibration_samples_m.clear()
+        self.calibration_collection_summary = None
+        self.calibration_collecting = True
+        self.start_collection_button.setEnabled(False)
+        self.finish_collection_button.setEnabled(True)
+        self.collection_status_label.setText(
+            f"正在采集：请连续完成至少 {self.calibration_min_cycles_spin.value()} 次全闭→全开→全闭"
         )
-        self.config_status.setStyleSheet("color:#1565c0;")
-        if (
-            self._raw_spin_m(self.minimum_raw_mm_spin) is not None
-            and self._raw_spin_m(self.maximum_raw_mm_spin) is not None
-            and self.maximum_gap_mm_spin.value() > self.minimum_gap_mm_spin.value()
-        ):
-            self.calculate_two_point_calibration(show_dialog=False)
-        else:
-            self._refresh_calibration_result()
+        self.collection_status_label.setStyleSheet("color:#1565c0; font-weight:600;")
+
+    def clear_calibration_collection(self, _checked: bool = False) -> None:
+        self.calibration_collecting = False
+        self.calibration_samples_m.clear()
+        self.calibration_collection_summary = None
+        self.start_collection_button.setEnabled(True)
+        self.finish_collection_button.setEnabled(False)
+        self.collection_status_label.setText("本次采集已清空；已保存的标定端点未改变")
+        self.collection_status_label.setStyleSheet("color:#546e7a;")
+
+    def _update_collection_summary(self) -> None:
+        if len(self.calibration_samples_m) < 10:
+            self.collection_status_label.setText(
+                f"正在采集：{len(self.calibration_samples_m)} 个有效帧；等待形成完整开合范围"
+            )
+            return
+        try:
+            summary = summarize_cyclic_calibration(self.calibration_samples_m)
+        except ValueError as exc:
+            self.calibration_collection_summary = None
+            self.collection_status_label.setText(
+                f"正在采集：{len(self.calibration_samples_m)} 个有效帧；{exc}"
+            )
+            return
+        self.calibration_collection_summary = summary
+        self.collection_status_label.setText(
+            f"正在采集：{summary.sample_count} 帧，检测到约 {summary.cycle_count} 个完整周期；"
+            f"稳健端点 {summary.minimum_raw_m * 1000.0:.3f}–"
+            f"{summary.maximum_raw_m * 1000.0:.3f} mm"
+        )
+
+    def finish_calibration_collection(self, _checked: bool = False) -> None:
+        self._update_collection_summary()
+        summary = self.calibration_collection_summary
+        required_cycles = self.calibration_min_cycles_spin.value()
+        if summary is None or summary.cycle_count < required_cycles:
+            measured_cycles = 0 if summary is None else summary.cycle_count
+            message = (
+                f"目前只检测到约 {measured_cycles} 个完整周期，需要至少 {required_cycles} 个。"
+                "请继续完整开合后再次点击结束。"
+            )
+            QMessageBox.warning(self, "标定周期不足", message)
+            self.collection_status_label.setText(message)
+            self.collection_status_label.setStyleSheet("color:#ef6c00; font-weight:600;")
+            return
+
+        self.calibration_collecting = False
+        self.start_collection_button.setEnabled(True)
+        self.finish_collection_button.setEnabled(False)
+        self.minimum_raw_mm_spin.setValue(summary.minimum_raw_m * 1000.0)
+        self.maximum_raw_mm_spin.setValue(summary.maximum_raw_m * 1000.0)
+        if not self.calculate_two_point_calibration(show_dialog=True):
+            return
+        self.collection_status_label.setText(
+            f"采集完成：{summary.sample_count} 帧、{summary.cycle_count} 个完整周期；"
+            "已写入稳健最小/最大 X 轴宽度"
+        )
+        self.collection_status_label.setStyleSheet("color:#2e7d32; font-weight:600;")
 
     def calculate_two_point_calibration(
         self,
@@ -488,7 +578,7 @@ class ArucoConfigWidget(QWidget):
         minimum_raw_m = self._raw_spin_m(self.minimum_raw_mm_spin)
         maximum_raw_m = self._raw_spin_m(self.maximum_raw_mm_spin)
         if minimum_raw_m is None or maximum_raw_m is None:
-            message = "请先在最小开口和最大开口位置分别点击“记录当前”，或手工填写两个原始距离。"
+            message = "请先完成连续开合采集，或手工填写两个原始 X 轴宽度。"
             if show_dialog:
                 QMessageBox.warning(self, "标定点不完整", message)
             self.config_status.setText(message)
@@ -517,13 +607,14 @@ class ArucoConfigWidget(QWidget):
         translations = {
             "tracking_gripper_distance": "正在逐帧测量",
             "insufficient_markers_for_distance": "必须同时看到两个标记",
+            "marker_depth_out_of_range": "标记深度超出允许范围",
             "missing_intrinsics": "缺少相机内参；请使用 APV2",
             "no_markers": "未检测到配置的两个 ID",
             "processor_error": "处理错误",
         }
         self.live_status_label.setText(f"{translations.get(status, status)}（{status}）")
         color = "#2e7d32" if status == "tracking_gripper_distance" else "#ef6c00"
-        if status in {"processor_error", "missing_intrinsics"}:
+        if status in {"processor_error", "missing_intrinsics", "marker_depth_out_of_range"}:
             color = "#c62828"
         self.live_status_label.setStyleSheet(f"color:{color}; font-weight:600;")
 
@@ -540,16 +631,26 @@ class ArucoConfigWidget(QWidget):
             if output_error
             else f"{self.output_host_edit.text().strip()}:{self.output_port_spin.value()}"
         )
+        measurement = result.get("measurement") or {}
+        depths = measurement.get("marker_depth_m") or {}
+        depth_text = ", ".join(
+            f"ID {marker_id}={float(value) * 1000.0:.2f} mm"
+            for marker_id, value in depths.items()
+            if isinstance(value, (int, float))
+        )
         self.live_detail_label.setText(
             f"检测 ID：{', '.join(str(value) for value in ids) if ids else '--'}　"
-            f"重投影误差：{error_text}　UDP：{output_text}"
+            f"深度：{depth_text or '--'}　重投影误差：{error_text}　UDP：{output_text}"
         )
 
         distance = result.get("gripper_distance") or {}
-        raw_m = distance.get("raw_marker_center_m")
+        raw_m = distance.get("raw_marker_x_distance_m")
         if status == "tracking_gripper_distance" and isinstance(raw_m, (int, float)):
             self.last_raw_distance_m = float(raw_m)
             self.current_raw_label.setText(f"{self.last_raw_distance_m * 1000.0:.4f} mm")
+            if self.calibration_collecting:
+                self.calibration_samples_m.append(self.last_raw_distance_m)
+                self._update_collection_summary()
         else:
             self.last_raw_distance_m = None
             self.current_raw_label.setText("--")

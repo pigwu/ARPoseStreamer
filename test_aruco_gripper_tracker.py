@@ -15,9 +15,11 @@ from aruco_gripper_tracker import (
     CameraIntrinsics,
     FrameAssembly,
     GripperDistanceProcessor,
+    MarkerEstimate,
     TrackerConfig,
     calculate_distance_calibration,
     decode_video_fragment,
+    summarize_cyclic_calibration,
 )
 from aruco_robot_pose_receiver import extract_safe_gripper_distance
 
@@ -37,10 +39,14 @@ def make_config(**overrides) -> TrackerConfig:
         "distance_scale": 1.0,
         "distance_offset_m": 0.0,
         "distance_smoothing_alpha": 1.0,
+        "distance_measurement_mode": "camera_x",
+        "nominal_marker_depth_m": 0.072,
+        "marker_depth_tolerance_m": 0.008,
         "calibration_min_raw_m": None,
         "calibration_min_gap_m": 0.0,
         "calibration_max_raw_m": None,
         "calibration_max_gap_m": 0.0,
+        "calibration_min_cycles": 5,
     }
     values.update(overrides)
     return TrackerConfig(**values)
@@ -138,6 +144,22 @@ class CalibrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "原始标记距离"):
             calculate_distance_calibration(0.090, 0.0, 0.050, 0.080)
 
+    def test_five_cycle_collection_returns_robust_endpoints(self) -> None:
+        opening = np.linspace(0.040, 0.120, 31)
+        closing = np.linspace(0.120, 0.040, 31)[1:]
+        samples = np.tile(np.concatenate([opening, closing]), 5)
+        samples += np.sin(np.arange(samples.size)) * 0.0001
+
+        summary = summarize_cyclic_calibration(samples)
+
+        self.assertGreaterEqual(summary.cycle_count, 5)
+        self.assertAlmostEqual(summary.minimum_raw_m, 0.040, delta=0.002)
+        self.assertAlmostEqual(summary.maximum_raw_m, 0.120, delta=0.002)
+
+    def test_cycle_collection_rejects_too_little_motion(self) -> None:
+        with self.assertRaisesRegex(ValueError, "范围不足"):
+            summarize_cyclic_calibration(np.linspace(0.0500, 0.0505, 30))
+
     def test_config_save_and_load_preserves_calibration_points(self) -> None:
         config = make_config(
             fallback_intrinsics=CameraIntrinsics(900.0, 901.0, 640.0, 360.0, 1280, 720),
@@ -146,10 +168,13 @@ class CalibrationTests(unittest.TestCase):
             distance_scale=2.0,
             distance_offset_m=-0.098,
             distance_smoothing_alpha=0.35,
+            nominal_marker_depth_m=0.074,
+            marker_depth_tolerance_m=0.009,
             calibration_min_raw_m=0.050,
             calibration_min_gap_m=0.002,
             calibration_max_raw_m=0.090,
             calibration_max_gap_m=0.082,
+            calibration_min_cycles=6,
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "aruco.json"
@@ -201,12 +226,45 @@ class CalibrationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "tracking_gripper_distance")
         self.assertEqual(set(result["detected_ids"]), {0, 1})
-        raw_m = result["gripper_distance"]["raw_marker_center_m"]
+        raw_m = result["gripper_distance"]["raw_marker_x_distance_m"]
         calibrated_m = result["gripper_distance"]["calibrated_m"]
-        self.assertAlmostEqual(raw_m, 0.0384, delta=0.001)
+        self.assertAlmostEqual(raw_m, 0.03754, delta=0.001)
         self.assertAlmostEqual(calibrated_m, 1.5 * raw_m - 0.010, places=6)
+        self.assertEqual(result["gripper_distance"]["measurement_mode"], "camera_x")
+        self.assertGreaterEqual(
+            result["gripper_distance"]["marker_center_distance_3d_m"],
+            raw_m,
+        )
         self.assertTrue(result["gripper_distance"]["calibration_complete"])
         self.assertNotIn("tool", result)
+
+    @unittest.skipUnless(cv2 is not None and hasattr(cv2, "aruco"), "OpenCV ArUco is unavailable")
+    def test_processor_rejects_marker_outside_nominal_depth(self) -> None:
+        config = make_config()
+        processor = GripperDistanceProcessor(config)
+        first = np.eye(4)
+        first[:3, 3] = [-0.02, 0.0, 0.072]
+        second = np.eye(4)
+        second[:3, 3] = [0.02, 0.0, 0.100]
+
+        class FakeEstimator:
+            def detect(self, _image, _intrinsics):
+                return [
+                    MarkerEstimate(0, first, 0.1, 200.0),
+                    MarkerEstimate(1, second, 0.1, 200.0),
+                ]
+
+        processor.estimator = FakeEstimator()
+        result = processor.process(
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            frame_id=1,
+            capture_timestamp=1.0,
+            camera_intrinsics=CameraIntrinsics(100.0, 100.0, 50.0, 50.0, 100, 100),
+        )
+
+        self.assertEqual(result["status"], "marker_depth_out_of_range")
+        self.assertEqual(result["measurement"]["invalid_depth_ids"], [1])
+        self.assertIsNone(result["gripper_distance"])
 
 
 class DistanceGateTests(unittest.TestCase):

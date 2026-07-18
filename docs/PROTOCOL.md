@@ -194,7 +194,8 @@ The integrated monitor can detect two configured ArUco markers from each APV2 vi
 
 For a valid frame, `status` is `tracking_gripper_distance` and `gripper_distance` contains:
 
-- `raw_marker_center_m`: Euclidean distance between the two estimated 3D marker centers
+- `raw_marker_x_distance_m`: absolute difference between the two marker-center X coordinates in the camera frame; this is the value used for calibration
+- `marker_center_distance_3d_m`: Euclidean center distance for diagnostics only
 - `calibrated_m` / `calibrated_mm`: jaw gap after two-point scale and offset calibration
 - `filtered_m` / `filtered_mm`: optional EMA-filtered jaw gap
 - `scale` and `offset_m`: active linear calibration
@@ -204,10 +205,10 @@ For a valid frame, `status` is `tracking_gripper_distance` and `gripper_distance
 The calibration is:
 
 ```text
-actual_gap = scale * raw_marker_center_distance + offset
+actual_gap = scale * raw_marker_x_distance + offset
 ```
 
-If either configured marker is missing, `status` is `insufficient_markers_for_distance` and `gripper_distance` is `null`. Consumers must use a distance only when the status is `tracking_gripper_distance` and `calibration_complete` is true. Before calibration, `raw_marker_center_m` remains available so the UI can capture the two endpoint observations.
+Both markers are required in every valid frame. Their depths must also fall inside the configured nominal-depth window (UMI default: `0.072 ± 0.008 m`); otherwise the status is `marker_depth_out_of_range`. Consumers must use a distance only when the status is `tracking_gripper_distance` and `calibration_complete` is true. Before calibration, `raw_marker_x_distance_m` remains available so the UI can collect repeated open-close cycles.
 
 ## Unified Experiment Capture
 

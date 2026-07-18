@@ -493,7 +493,7 @@ class ExperimentMonitorWindow(QMainWindow):
         for label, value in [
             ("状态", self.live_aruco_state),
             ("检测 ID", self.live_aruco_ids),
-            ("标记中心原始距离", self.live_aruco_raw_distance),
+            ("相机 X 轴原始宽度", self.live_aruco_raw_distance),
             ("校准后夹爪开口", self.live_aruco_calibrated_distance),
             ("滤波后夹爪开口", self.live_aruco_filtered_distance),
         ]:
@@ -795,7 +795,7 @@ class ExperimentMonitorWindow(QMainWindow):
         ids = metrics.get("detected_ids") or []
         self.live_aruco_ids.setText(", ".join(str(value) for value in ids) if ids else "--")
         distance = metrics.get("gripper_distance") or {}
-        raw_m = distance.get("raw_marker_center_m")
+        raw_m = distance.get("raw_marker_x_distance_m")
         calibrated_mm = distance.get("calibrated_mm")
         filtered_mm = distance.get("filtered_mm")
         calibration_complete = distance.get("calibration_complete") is True

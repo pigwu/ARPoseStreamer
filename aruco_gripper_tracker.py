@@ -145,6 +145,14 @@ class MarkerEstimate:
     perimeter_px: float
 
 
+@dataclass(frozen=True)
+class CyclicCalibrationSummary:
+    sample_count: int
+    cycle_count: int
+    minimum_raw_m: float
+    maximum_raw_m: float
+
+
 @dataclass
 class TrackerConfig:
     dictionary_name: str
@@ -160,10 +168,14 @@ class TrackerConfig:
     distance_scale: float = 1.0
     distance_offset_m: float = 0.0
     distance_smoothing_alpha: float = 1.0
+    distance_measurement_mode: str = "camera_x"
+    nominal_marker_depth_m: float = 0.072
+    marker_depth_tolerance_m: float = 0.008
     calibration_min_raw_m: float | None = None
     calibration_min_gap_m: float = 0.0
     calibration_max_raw_m: float | None = None
     calibration_max_gap_m: float = 0.0
+    calibration_min_cycles: int = 5
 
     @property
     def calibration_complete(self) -> bool:
@@ -185,6 +197,14 @@ class TrackerConfig:
             raise ValueError("distance_offset_m must be finite")
         if not 0.0 < self.distance_smoothing_alpha <= 1.0:
             raise ValueError("distance_smoothing_alpha must be in (0, 1]")
+        if self.distance_measurement_mode != "camera_x":
+            raise ValueError("distance_measurement_mode must be camera_x")
+        if not math.isfinite(self.nominal_marker_depth_m) or self.nominal_marker_depth_m <= 0.0:
+            raise ValueError("nominal_marker_depth_m must be positive and finite")
+        if not math.isfinite(self.marker_depth_tolerance_m) or self.marker_depth_tolerance_m <= 0.0:
+            raise ValueError("marker_depth_tolerance_m must be positive and finite")
+        if self.calibration_min_cycles < 1:
+            raise ValueError("calibration_min_cycles must be positive")
         if not 1 <= self.output_port <= 65535:
             raise ValueError("output_port must be between 1 and 65535")
         for name, value in (
@@ -221,13 +241,17 @@ class TrackerConfig:
             "distance_scale": self.distance_scale,
             "distance_offset_m": self.distance_offset_m,
             "distance_smoothing_alpha": self.distance_smoothing_alpha,
+            "distance_measurement_mode": self.distance_measurement_mode,
+            "nominal_marker_depth_m": self.nominal_marker_depth_m,
+            "marker_depth_tolerance_m": self.marker_depth_tolerance_m,
             "distance_calibration": {
+                "minimum_cycles": self.calibration_min_cycles,
                 "minimum": {
-                    "raw_marker_center_m": self.calibration_min_raw_m,
+                    "raw_marker_x_distance_m": self.calibration_min_raw_m,
                     "actual_gap_m": self.calibration_min_gap_m,
                 },
                 "maximum": {
-                    "raw_marker_center_m": self.calibration_max_raw_m,
+                    "raw_marker_x_distance_m": self.calibration_max_raw_m,
                     "actual_gap_m": self.calibration_max_gap_m,
                 },
             },
@@ -287,10 +311,18 @@ class TrackerConfig:
             distance_scale=float(raw.get("distance_scale", 1.0)),
             distance_offset_m=float(raw.get("distance_offset_m", 0.0)),
             distance_smoothing_alpha=float(raw.get("distance_smoothing_alpha", 1.0)),
-            calibration_min_raw_m=optional_float(minimum.get("raw_marker_center_m")),
+            distance_measurement_mode=str(raw.get("distance_measurement_mode", "camera_x")),
+            nominal_marker_depth_m=float(raw.get("nominal_marker_depth_m", 0.072)),
+            marker_depth_tolerance_m=float(raw.get("marker_depth_tolerance_m", 0.008)),
+            calibration_min_raw_m=optional_float(
+                minimum.get("raw_marker_x_distance_m", minimum.get("raw_marker_center_m"))
+            ),
             calibration_min_gap_m=float(minimum.get("actual_gap_m", 0.0)),
-            calibration_max_raw_m=optional_float(maximum.get("raw_marker_center_m")),
+            calibration_max_raw_m=optional_float(
+                maximum.get("raw_marker_x_distance_m", maximum.get("raw_marker_center_m"))
+            ),
             calibration_max_gap_m=float(maximum.get("actual_gap_m", 0.0)),
+            calibration_min_cycles=int(calibration.get("minimum_cycles", 5)),
         )
 
 
@@ -313,6 +345,51 @@ def calculate_distance_calibration(
     if not math.isfinite(scale) or not math.isfinite(offset_m) or scale <= 0.0:
         raise ValueError("Two-point calibration produced an invalid mapping")
     return scale, offset_m
+
+
+def summarize_cyclic_calibration(samples_m: list[float] | np.ndarray) -> CyclicCalibrationSummary:
+    """Estimate robust endpoints and completed open-close cycles from raw X widths."""
+    samples = np.asarray(samples_m, dtype=np.float64).reshape(-1)
+    samples = samples[np.isfinite(samples)]
+    if samples.size < 10:
+        raise ValueError("至少需要 10 个有效采样帧")
+    if np.any(samples < 0.0):
+        raise ValueError("标定采样距离不能为负数")
+
+    lower = float(np.percentile(samples, 5.0))
+    upper = float(np.percentile(samples, 95.0))
+    span = upper - lower
+    if not math.isfinite(span) or span < 0.001:
+        raise ValueError("采集到的开合范围不足 1 mm")
+
+    low_state_cut = lower + span * 0.25
+    high_state_cut = upper - span * 0.25
+    extreme_events: list[tuple[int, float]] = []
+    for value in samples:
+        state = -1 if value <= low_state_cut else 1 if value >= high_state_cut else 0
+        if not state:
+            continue
+        if not extreme_events or extreme_events[-1][0] != state:
+            extreme_events.append((state, float(value)))
+        else:
+            previous = extreme_events[-1][1]
+            extreme_events[-1] = (
+                state,
+                min(previous, float(value)) if state < 0 else max(previous, float(value)),
+            )
+    low_extrema = [value for state, value in extreme_events if state < 0]
+    high_extrema = [value for state, value in extreme_events if state > 0]
+    if not low_extrema or not high_extrema:
+        raise ValueError("未同时采集到全闭和全开端点")
+    minimum_raw_m = float(np.median(low_extrema))
+    maximum_raw_m = float(np.median(high_extrema))
+    cycle_count = max(0, (len(extreme_events) - 1) // 2)
+    return CyclicCalibrationSummary(
+        sample_count=int(samples.size),
+        cycle_count=cycle_count,
+        minimum_raw_m=minimum_raw_m,
+        maximum_raw_m=maximum_raw_m,
+    )
 
 
 def decode_video_fragment(packet: bytes) -> VideoFragment:
@@ -464,7 +541,8 @@ class ResultPublisher:
                     "frame_id",
                     "status",
                     "marker_ids",
-                    "raw_marker_center_mm",
+                    "raw_marker_x_distance_mm",
+                    "marker_center_distance_3d_mm",
                     "calibrated_distance_mm",
                     "filtered_distance_mm",
                 ]
@@ -483,8 +561,13 @@ class ResultPublisher:
                 result["status"],
                 " ".join(str(value) for value in result.get("detected_ids", [])),
                 (
-                    float(distance["raw_marker_center_m"]) * 1000.0
-                    if distance.get("raw_marker_center_m") is not None
+                    float(distance["raw_marker_x_distance_m"]) * 1000.0
+                    if distance.get("raw_marker_x_distance_m") is not None
+                    else ""
+                ),
+                (
+                    float(distance["marker_center_distance_3d_m"]) * 1000.0
+                    if distance.get("marker_center_distance_3d_m") is not None
                     else ""
                 ),
                 distance.get("calibrated_mm", ""),
@@ -523,6 +606,11 @@ class GripperDistanceProcessor:
             "detected_ids": [],
             "markers": {},
             "gripper_distance": None,
+            "measurement": {
+                "mode": self.config.distance_measurement_mode,
+                "nominal_marker_depth_m": self.config.nominal_marker_depth_m,
+                "marker_depth_tolerance_m": self.config.marker_depth_tolerance_m,
+            },
         }
         if intrinsics is None:
             return result
@@ -550,7 +638,24 @@ class GripperDistanceProcessor:
         else:
             first = estimates_by_id[distance_ids[0]].transform_camera_marker[:3, 3]
             second = estimates_by_id[distance_ids[1]].transform_camera_marker[:3, 3]
-            raw_distance_m = float(np.linalg.norm(second - first))
+            minimum_depth = self.config.nominal_marker_depth_m - self.config.marker_depth_tolerance_m
+            maximum_depth = self.config.nominal_marker_depth_m + self.config.marker_depth_tolerance_m
+            invalid_depth_ids = [
+                marker_id
+                for marker_id, position in zip(distance_ids, (first, second))
+                if not minimum_depth < float(position[2]) < maximum_depth
+            ]
+            result["measurement"]["marker_depth_m"] = {
+                str(marker_id): round(float(position[2]), 7)
+                for marker_id, position in zip(distance_ids, (first, second))
+            }
+            if invalid_depth_ids:
+                result["measurement"]["invalid_depth_ids"] = invalid_depth_ids
+                result["status"] = "marker_depth_out_of_range"
+                return result
+
+            raw_distance_m = abs(float(second[0] - first[0]))
+            center_distance_3d_m = float(np.linalg.norm(second - first))
             calibrated_distance_m = (
                 self.config.distance_scale * raw_distance_m + self.config.distance_offset_m
             )
@@ -563,7 +668,9 @@ class GripperDistanceProcessor:
                 )
             result["gripper_distance"] = {
                 "marker_ids": list(distance_ids),
-                "raw_marker_center_m": round(raw_distance_m, 8),
+                "measurement_mode": self.config.distance_measurement_mode,
+                "raw_marker_x_distance_m": round(raw_distance_m, 8),
+                "marker_center_distance_3d_m": round(center_distance_3d_m, 8),
                 "calibrated_m": round(calibrated_distance_m, 8),
                 "filtered_m": round(self.filtered_distance_m, 8),
                 "calibrated_mm": round(calibrated_distance_m * 1000.0, 4),
