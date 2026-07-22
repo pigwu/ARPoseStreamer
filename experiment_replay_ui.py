@@ -4,10 +4,12 @@ import argparse
 import csv
 import json
 import math
+import os
 import socket
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 
@@ -16,10 +18,13 @@ try:
 except Exception:
     av = None
 
+os.environ.setdefault("QT_API", "pyqt6")
+PYQTGRAPH_IMPORT_ERROR = ""
 try:
     import pyqtgraph as pg
-except Exception:
+except Exception as exc:
     pg = None
+    PYQTGRAPH_IMPORT_ERROR = str(exc)
 
 from PyQt6.QtCore import QObject, QThread, QTimer, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QImage, QPixmap
@@ -38,7 +43,9 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSizePolicy,
     QSplitter,
@@ -51,6 +58,13 @@ from PyQt6.QtWidgets import (
 
 from capture_upload_server import create_upload_server, get_default_upload_dir
 from experiment_data import ExperimentDataset, TimedRows, discover_experiments
+from offline_gripper_processor import (
+    INTRINSICS_NAME,
+    STATE_NAME as GRIPPER_STATE_NAME,
+    OfflineGripperProcessor,
+    intrinsics_to_dict,
+    save_ultrawide_intrinsics,
+)
 from pose_magnetic_receiver import APM1DecodeError, decode_apm1_packet
 from udp_video_debug_ui import LatencyClockCompensator, VideoReceiverThread, get_app_base_dir
 from aruco_config_ui import ArucoConfigWidget
@@ -78,7 +92,35 @@ PC_GENERATED_EXPERIMENT_FILES = {
     "receiver_transport.csv",
     "upload_state.json",
     "zarr_state.json",
+    GRIPPER_STATE_NAME,
 }
+
+
+def acquire_single_instance_mutex() -> tuple[bool, object | None]:
+    """Prevent hidden/duplicate Windows monitors from sharing the UDP ports."""
+    if sys.platform != "win32":
+        return True, None
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+    handle = kernel32.CreateMutexW(None, False, "Local\\ARPoseExperimentMonitor")
+    if not handle:
+        return True, None
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return False, None
+    return True, (kernel32, handle)
+
+
+def release_single_instance_mutex(mutex: object | None) -> None:
+    if mutex is None:
+        return
+    kernel32, handle = mutex
+    kernel32.CloseHandle(handle)
 
 
 def metric_text(value: object, suffix: str = "", precision: int = 1) -> str:
@@ -108,18 +150,31 @@ class UploadServerBridge(QObject):
         super().__init__()
         self.server = None
         self.thread: threading.Thread | None = None
+        self.last_error = ""
 
-    def start(self, host: str, port: int, root: Path) -> None:
+    def start(self, host: str, port: int, root: Path) -> bool:
         if self.server is not None:
-            return
+            return True
+        self.last_error = ""
         try:
             self.server = create_upload_server(host, port, root, self.event_received.emit)
-        except OSError as exc:
+        except Exception as exc:
+            self.server = None
+            error_log = root / "upload_server_error.log"
+            try:
+                error_log.write_text(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n{traceback.format_exc()}",
+                    encoding="utf-8",
+                )
+                self.last_error = f"{exc} (details: {error_log})"
+            except OSError:
+                self.last_error = str(exc)
             self.status_changed.emit(f"Upload bind failed: {exc}")
-            return
+            return False
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.status_changed.emit(f"Upload server {host}:{port}")
+        return True
 
     def stop(self) -> None:
         server = self.server
@@ -158,7 +213,8 @@ class CombinedReceiverThread(QThread):
 
     def run(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((self.bind_host, self.port))
         except OSError as exc:
@@ -394,6 +450,10 @@ class ExperimentMonitorWindow(QMainWindow):
         self.upload_bridge.event_received.connect(self.on_server_event)
         self.upload_bridge.status_changed.connect(self.set_service_status)
         self.diagnostics = ReceiverDiagnosticsRecorder(Path(args.experiments))
+        self.offline_gripper_processor = OfflineGripperProcessor()
+        self.ultrawide_intrinsics_path = Path(args.aruco_config).resolve().parent / INTRINSICS_NAME
+        self.last_ultrawide_intrinsics_values: dict | None = None
+        self.offline_backfill_started = False
         self.datasets: list[ExperimentDataset] = []
         self.dataset: ExperimentDataset | None = None
         self.playback = VideoFilePlayback()
@@ -401,15 +461,17 @@ class ExperimentMonitorWindow(QMainWindow):
         self.play_time = 0.0
         self.last_tick = time.monotonic()
         self.last_video_id = -1
+        self.last_ultrawide_video_id = -1
         self.last_pose_id = -1
         self.last_combined_id = -1
+        self.live_video_frames: dict[str, QImage] = {}
+        self.live_video_metrics_by_camera: dict[str, dict] = {}
         self.plot_cursors = []
         self._build_ui()
         self.timer = QTimer(self)
         self.timer.setInterval(33)
         self.timer.timeout.connect(self.tick)
         self.timer.start()
-        self.refresh_experiments()
         QTimer.singleShot(0, self.start_services)
 
     def _build_ui(self) -> None:
@@ -445,8 +507,13 @@ class ExperimentMonitorWindow(QMainWindow):
         self.services_button = QPushButton("Start Monitor")
         self.services_button.clicked.connect(self.toggle_services)
         service_grid.addWidget(self.services_button, 2, 6)
+        self.upload_health = QLabel("Upload storage: not started")
+        self.upload_health.setWordWrap(True)
+        self.upload_health.setStyleSheet("color:#616161; font-weight:700;")
+        service_grid.addWidget(self.upload_health, 3, 0, 1, 7)
         self.service_status = QLabel("Stopped")
-        service_grid.addWidget(self.service_status, 3, 0, 1, 7)
+        self.service_status.setWordWrap(True)
+        service_grid.addWidget(self.service_status, 4, 0, 1, 7)
         root.addWidget(service_box)
 
         self.tabs = QTabWidget()
@@ -460,11 +527,22 @@ class ExperimentMonitorWindow(QMainWindow):
     def _build_live_tab(self) -> QWidget:
         tab = QWidget()
         layout = QHBoxLayout(tab)
+        camera_view = QVBoxLayout()
+        camera_selector = QHBoxLayout()
+        camera_selector.addWidget(QLabel("Camera view"))
+        self.live_camera_combo = QComboBox()
+        self.live_camera_combo.addItem("1× Main (ARKit)", "main")
+        self.live_camera_combo.addItem("0.5× Ultra-wide (ArUco)", "ultrawide")
+        self.live_camera_combo.currentIndexChanged.connect(self.change_live_camera)
+        camera_selector.addWidget(self.live_camera_combo)
+        camera_selector.addStretch(1)
+        camera_view.addLayout(camera_selector)
         self.live_video = QLabel("Waiting for live video")
         self.live_video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.live_video.setMinimumSize(850, 520)
         self.live_video.setStyleSheet("background:#111; color:#aaa;")
-        layout.addWidget(self.live_video, 3)
+        camera_view.addWidget(self.live_video, 1)
+        layout.addLayout(camera_view, 3)
 
         side = QVBoxLayout()
         video_box = QGroupBox("Video / Pose Transport")
@@ -490,12 +568,14 @@ class ExperimentMonitorWindow(QMainWindow):
         aruco_form = QFormLayout(aruco_box)
         self.live_aruco_state = QLabel("Disabled / waiting")
         self.live_aruco_ids = QLabel("--")
+        self.live_aruco_depth = QLabel("--")
         self.live_aruco_raw_distance = QLabel("--")
         self.live_aruco_calibrated_distance = QLabel("--")
         self.live_aruco_filtered_distance = QLabel("--")
         for label, value in [
             ("状态", self.live_aruco_state),
             ("检测 ID", self.live_aruco_ids),
+            ("标记深度", self.live_aruco_depth),
             ("相机 X 轴原始宽度", self.live_aruco_raw_distance),
             ("校准后夹爪开口", self.live_aruco_calibrated_distance),
             ("滤波后夹爪开口", self.live_aruco_filtered_distance),
@@ -555,19 +635,39 @@ class ExperimentMonitorWindow(QMainWindow):
         self.open_experiment_folder_button.setEnabled(False)
         self.open_experiment_folder_button.clicked.connect(self.open_selected_experiment_folder)
         uploads_layout.addWidget(self.open_experiment_folder_button)
+        self.offline_gripper_status = QLabel("Offline gripper: select an experiment")
+        self.offline_gripper_status.setWordWrap(True)
+        uploads_layout.addWidget(self.offline_gripper_status)
+        self.process_gripper_button = QPushButton("Process / Reprocess 0.5× Gripper Distance")
+        self.process_gripper_button.setEnabled(False)
+        self.process_gripper_button.clicked.connect(self.process_selected_gripper_video)
+        uploads_layout.addWidget(self.process_gripper_button)
         library_layout.addWidget(uploads_box)
         splitter.addWidget(library)
 
         replay = QWidget()
         replay_layout = QVBoxLayout(replay)
         top = QHBoxLayout()
+        replay_camera_view = QVBoxLayout()
+        replay_camera_selector = QHBoxLayout()
+        replay_camera_selector.addWidget(QLabel("Recorded camera"))
+        self.replay_camera_combo = QComboBox()
+        self.replay_camera_combo.addItem("1× Main (ARKit)", "main")
+        self.replay_camera_combo.addItem("0.5× Ultra-wide (ArUco)", "ultrawide")
+        self.replay_camera_combo.currentIndexChanged.connect(self.change_replay_camera)
+        replay_camera_selector.addWidget(self.replay_camera_combo)
+        replay_camera_selector.addStretch(1)
+        replay_camera_view.addLayout(replay_camera_selector)
         self.replay_video = QLabel("Select an experiment")
         self.replay_video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.replay_video.setMinimumSize(720, 400)
         self.replay_video.setStyleSheet("background:#111; color:#aaa;")
-        top.addWidget(self.replay_video, 3)
+        replay_camera_view.addWidget(self.replay_video, 1)
+        top.addLayout(replay_camera_view, 3)
 
-        values = QVBoxLayout()
+        values_widget = QWidget()
+        values = QVBoxLayout(values_widget)
+        values.setContentsMargins(0, 0, 0, 0)
         values.setSpacing(5)
         pose_box = QGroupBox("Pose at Cursor")
         pose_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
@@ -598,10 +698,29 @@ class ExperimentMonitorWindow(QMainWindow):
         ]:
             transport_form.addRow(label, self.transport_values[key])
         values.addWidget(transport_box)
+
+        gripper_box = QGroupBox("Offline Gripper at Cursor")
+        gripper_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        gripper_form = QFormLayout(gripper_box)
+        gripper_form.setVerticalSpacing(3)
+        self.gripper_values = {
+            name: QLabel("--")
+            for name in ("status", "raw", "calibrated", "smoothed")
+        }
+        gripper_form.addRow("Status", self.gripper_values["status"])
+        gripper_form.addRow("Raw X width", self.gripper_values["raw"])
+        gripper_form.addRow("Calibrated", self.gripper_values["calibrated"])
+        gripper_form.addRow("Offline stable", self.gripper_values["smoothed"])
+        values.addWidget(gripper_box)
         values.addWidget(QLabel("Magnetic sensor values"))
         self.replay_sensor_table = self._make_sensor_table()
         values.addWidget(self.replay_sensor_table)
-        top.addLayout(values, 2)
+        values.addStretch(1)
+        values_scroll = QScrollArea()
+        values_scroll.setWidgetResizable(True)
+        values_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        values_scroll.setWidget(values_widget)
+        top.addWidget(values_scroll, 2)
         replay_layout.addLayout(top, 3)
 
         controls = QHBoxLayout()
@@ -636,12 +755,16 @@ class ExperimentMonitorWindow(QMainWindow):
 
         self.plot_tabs = QTabWidget()
         self.pose_plot = self._make_plot("Position", "m")
-        self.magnetic_plot = self._make_plot("Magnetic magnitude", "")
+        self.magnetic_plot = self._make_plot("Magnetic magnitude change", "Δ|B|")
         self.transport_plot = self._make_plot("Transport", "")
+        self.gripper_plot = self._make_plot("Offline gripper distance", "mm")
         self.plot_tabs.addTab(self.pose_plot, "Pose")
         self.plot_tabs.addTab(self.magnetic_plot, "Sensor")
         self.plot_tabs.addTab(self.transport_plot, "Propagation")
-        replay_layout.addWidget(self.plot_tabs, 2)
+        self.plot_tabs.addTab(self.gripper_plot, "Gripper")
+        self.plot_tabs.setMinimumHeight(270)
+        self.gripper_plot.setMinimumHeight(235)
+        replay_layout.addWidget(self.plot_tabs, 3)
         splitter.addWidget(replay)
         splitter.setSizes([360, 1140])
         return tab
@@ -667,7 +790,8 @@ class ExperimentMonitorWindow(QMainWindow):
     @staticmethod
     def _make_plot(title: str, units: str):
         if pg is None:
-            label = QLabel("pyqtgraph is required for plots")
+            detail = f": {PYQTGRAPH_IMPORT_ERROR}" if PYQTGRAPH_IMPORT_ERROR else ""
+            label = QLabel(f"Plot module failed to load{detail}")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             return label
         plot = pg.PlotWidget(title=title)
@@ -700,7 +824,7 @@ class ExperimentMonitorWindow(QMainWindow):
         root = Path(self.root_edit.text()).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         self.diagnostics.set_root(root)
-        self.upload_bridge.start(bind, upload_port, root)
+        upload_ready = self.upload_bridge.start(bind, upload_port, root)
         self.refresh_experiments()
 
         try:
@@ -727,6 +851,8 @@ class ExperimentMonitorWindow(QMainWindow):
             None,
             aruco_config=aruco_config,
         )
+        self.aruco_video_worker.frame_ready.connect(self.update_live_ultrawide_video)
+        self.aruco_video_worker.video_metrics.connect(self.update_live_ultrawide_video_metrics)
         self.aruco_video_worker.aruco_metrics.connect(self.update_live_aruco_metrics)
         self.aruco_video_worker.start()
 
@@ -741,7 +867,24 @@ class ExperimentMonitorWindow(QMainWindow):
         self.combined_worker.status_changed.connect(self.live_sensor_status.setText)
         self.combined_worker.start()
         self.services_button.setText("Stop Monitor")
-        self.set_service_status("1x video plus 0.5x ArUco video, pose, sensor, upload, and diagnostics started")
+        if upload_ready:
+            self.upload_health.setText(f"Upload storage: READY · listening on {bind}:{upload_port}")
+            self.upload_health.setStyleSheet("color:#1b5e20; font-weight:800;")
+            self.set_service_status(
+                "1x video plus 0.5x ArUco video, pose, sensor, upload, and diagnostics started"
+            )
+        else:
+            self.upload_health.setText(
+                "UPLOAD STORAGE OFFLINE · "
+                f"{self.upload_bridge.last_error or 'unknown startup error'}"
+            )
+            self.upload_health.setStyleSheet("color:#c62828; font-weight:800;")
+            self.set_service_status(
+                "UPLOAD NOT RUNNING: "
+                f"{self.upload_bridge.last_error or 'unknown startup error'}. "
+                "Phone recordings are not being saved to this PC."
+            )
+        QTimer.singleShot(3000, self._schedule_offline_gripper_backfill)
 
     def stop_services(self) -> None:
         if self.video_worker is not None:
@@ -757,6 +900,8 @@ class ExperimentMonitorWindow(QMainWindow):
             self.combined_worker.wait(1500)
             self.combined_worker = None
         self.upload_bridge.stop()
+        self.upload_health.setText("Upload storage: stopped")
+        self.upload_health.setStyleSheet("color:#616161; font-weight:700;")
         self.services_button.setText("Start Monitor")
 
     def apply_aruco_configuration(self, _config: object) -> None:
@@ -771,8 +916,62 @@ class ExperimentMonitorWindow(QMainWindow):
 
     def set_service_status(self, message: str) -> None:
         self.service_status.setText(message)
+        lowered = message.lower()
+        is_error = any(token in lowered for token in ("failed", "error", "not running"))
+        self.service_status.setStyleSheet(
+            "color:#c62828; font-weight:700;" if is_error else "color:#1b5e20; font-weight:600;"
+        )
+
+    def _schedule_offline_gripper_backfill(self) -> None:
+        if self.offline_backfill_started:
+            return
+        try:
+            if not self.aruco_panel.current_config().calibration_complete:
+                return
+        except Exception:
+            return
+        self.offline_backfill_started = True
+        self.offline_gripper_processor.backfill(
+            Path(self.root_edit.text()),
+            self.aruco_panel.resolved_config_path(),
+            self.ultrawide_intrinsics_path,
+            self.upload_bridge.event_received.emit,
+        )
+
+    def _schedule_offline_gripper_directory(self, directory: Path, *, force: bool = False) -> bool:
+        try:
+            if not self.aruco_panel.current_config().calibration_complete:
+                return False
+        except Exception:
+            return False
+        return self.offline_gripper_processor.schedule(
+            directory,
+            self.aruco_panel.resolved_config_path(),
+            self.ultrawide_intrinsics_path,
+            self.upload_bridge.event_received.emit,
+            force=force,
+        )
+
+    def _reprocess_estimated_gripper_results(self) -> None:
+        for dataset in discover_experiments(Path(self.root_edit.text())):
+            if (
+                dataset.ultrawide_video_path is not None
+                and dataset.gripper_state.get("status") == "complete"
+                and str(dataset.gripper_state.get("intrinsics_source", "")).startswith("estimated")
+            ):
+                self._schedule_offline_gripper_directory(dataset.directory, force=True)
 
     def update_live_video(self, image: QImage) -> None:
+        self.live_video_frames["main"] = image
+        if self.live_camera_combo.currentData() == "main":
+            self._show_live_image(image)
+
+    def update_live_ultrawide_video(self, image: QImage) -> None:
+        self.live_video_frames["ultrawide"] = image
+        if self.live_camera_combo.currentData() == "ultrawide":
+            self._show_live_image(image)
+
+    def _show_live_image(self, image: QImage) -> None:
         self.live_video.setPixmap(
             QPixmap.fromImage(image).scaled(
                 self.live_video.size(),
@@ -781,16 +980,54 @@ class ExperimentMonitorWindow(QMainWindow):
             )
         )
 
+    def change_live_camera(self, _index: int = -1) -> None:
+        camera = str(self.live_camera_combo.currentData() or "main")
+        image = self.live_video_frames.get(camera)
+        if image is None:
+            self.live_video.clear()
+            label = "1×" if camera == "main" else "0.5×"
+            self.live_video.setText(f"Waiting for live {label} video")
+        else:
+            self._show_live_image(image)
+        self._show_selected_live_video_metrics()
+
     def update_live_video_metrics(self, metrics: dict) -> None:
+        self.live_video_metrics_by_camera["main"] = metrics
+        if self.live_camera_combo.currentData() == "main":
+            self._show_selected_live_video_metrics()
+        identifier = int(metrics.get("frame_id", 0))
+        if identifier > self.last_video_id and metrics.get("capture_timestamp") is not None:
+            self.last_video_id = identifier
+            self.diagnostics.record(self._diagnostic_row("video", identifier, metrics))
+
+    def update_live_ultrawide_video_metrics(self, metrics: dict) -> None:
+        self.live_video_metrics_by_camera["ultrawide"] = metrics
+        camera_intrinsics = metrics.get("camera_intrinsics")
+        if camera_intrinsics is not None:
+            try:
+                values = intrinsics_to_dict(camera_intrinsics)
+                if values != self.last_ultrawide_intrinsics_values:
+                    save_ultrawide_intrinsics(self.ultrawide_intrinsics_path, camera_intrinsics)
+                    self.last_ultrawide_intrinsics_values = values
+                    self._schedule_offline_gripper_backfill()
+                    self._reprocess_estimated_gripper_results()
+            except (AttributeError, TypeError, ValueError, OSError):
+                pass
+        if self.live_camera_combo.currentData() == "ultrawide":
+            self._show_selected_live_video_metrics()
+        identifier = int(metrics.get("frame_id", 0))
+        if identifier > self.last_ultrawide_video_id and metrics.get("capture_timestamp") is not None:
+            self.last_ultrawide_video_id = identifier
+            self.diagnostics.record(self._diagnostic_row("ultrawide_video", identifier, metrics))
+
+    def _show_selected_live_video_metrics(self) -> None:
+        camera = str(self.live_camera_combo.currentData() or "main")
+        metrics = self.live_video_metrics_by_camera.get(camera, {})
         self.live_video_state.setText(str(metrics.get("status", "--")))
         self.live_video_latency.setText(metric_text(metrics.get("latency_ms"), " ms"))
         self.live_video_fps.setText(metric_text(metrics.get("fps")))
         self.live_bitrate.setText(metric_text(metrics.get("bitrate_mbps"), " Mbps", 2))
         self.live_clock_offset.setText(metric_text(metrics.get("clock_offset_ms"), " ms"))
-        identifier = int(metrics.get("frame_id", 0))
-        if identifier > self.last_video_id and metrics.get("capture_timestamp") is not None:
-            self.last_video_id = identifier
-            self.diagnostics.record(self._diagnostic_row("video", identifier, metrics))
 
     def update_live_pose_metrics(self, metrics: dict) -> None:
         self.live_pose_latency.setText(metric_text(metrics.get("latency_ms"), " ms"))
@@ -802,7 +1039,25 @@ class ExperimentMonitorWindow(QMainWindow):
     def update_live_aruco_metrics(self, metrics: dict) -> None:
         self.aruco_panel.update_live_result(metrics)
         status = str(metrics.get("status", "--"))
-        self.live_aruco_state.setText(status)
+        measurement = metrics.get("measurement") or {}
+        depths = measurement.get("marker_depth_m") or {}
+        depth_values = [
+            f"ID {marker_id}: {float(value) * 1000.0:.1f} mm"
+            for marker_id, value in depths.items()
+            if isinstance(value, (int, float))
+        ]
+        nominal_depth = measurement.get("nominal_marker_depth_m")
+        depth_tolerance = measurement.get("marker_depth_tolerance_m")
+        allowed_text = ""
+        if isinstance(nominal_depth, (int, float)) and isinstance(depth_tolerance, (int, float)):
+            minimum_depth = (float(nominal_depth) - float(depth_tolerance)) * 1000.0
+            maximum_depth = (float(nominal_depth) + float(depth_tolerance)) * 1000.0
+            allowed_text = f"；允许 {minimum_depth:.1f}–{maximum_depth:.1f} mm"
+        self.live_aruco_depth.setText(", ".join(depth_values) + allowed_text if depth_values else "--")
+        if status == "marker_depth_out_of_range":
+            self.live_aruco_state.setText("深度超限；到 ArUco Gripper 点击“使用当前深度并应用”")
+        else:
+            self.live_aruco_state.setText(status)
         self.live_aruco_state.setStyleSheet(
             "color:#2e7d32; font-weight:600;"
             if status == "tracking_gripper_distance"
@@ -874,6 +1129,19 @@ class ExperimentMonitorWindow(QMainWindow):
         if event.get("type") == "zarr":
             status = event.get("status", "--")
             self.set_service_status(f"Zarr {status}: {event.get('capture_id')}")
+        if event.get("type") == "offline_gripper":
+            status = str(event.get("status", "--"))
+            if status == "complete":
+                rate = float(event.get("detection_rate", 0.0)) * 100.0
+                self.set_service_status(f"Offline gripper complete: {rate:.1f}% valid frames")
+            elif status == "failed":
+                self.set_service_status(f"Offline gripper failed: {event.get('error', 'unknown error')}")
+            else:
+                self.set_service_status(f"Offline gripper: {status}")
+        if event.get("type") == "upload" and event.get("complete"):
+            uploaded_path = Path(str(event.get("path", "")))
+            if uploaded_path.is_file():
+                self._schedule_offline_gripper_directory(uploaded_path.parent)
         self.refresh_experiments()
 
     def refresh_experiments(self) -> None:
@@ -896,13 +1164,15 @@ class ExperimentMonitorWindow(QMainWindow):
         else:
             self.dataset = None
             self._update_phone_upload_files(None)
+            self._update_offline_gripper_status(None)
 
     def load_experiment(self, row: int) -> None:
         if row < 0 or row >= len(self.datasets):
             return
         self.dataset = ExperimentDataset.load(self.datasets[row].directory)
         self._update_phone_upload_files(self.dataset.directory)
-        self.playback.open(self.dataset.video_path)
+        self._update_offline_gripper_status(self.dataset)
+        self.playback.open(self._selected_replay_video_path())
         self.playing = False
         self.play_button.setText("Play")
         self.play_time = 0.0
@@ -910,6 +1180,63 @@ class ExperimentMonitorWindow(QMainWindow):
         self.timeline.setRange(0, max(1, int(self.dataset.duration_seconds * 1000)))
         self._build_data_plots()
         self.update_replay_cursor()
+
+    def process_selected_gripper_video(self) -> None:
+        if self.dataset is None or self.dataset.ultrawide_video_path is None:
+            return
+        if self._schedule_offline_gripper_directory(self.dataset.directory, force=True):
+            self.offline_gripper_status.setText("Offline gripper: queued...")
+            self.process_gripper_button.setEnabled(False)
+        else:
+            self.offline_gripper_status.setText(
+                "Offline gripper: two-point calibration must be saved before processing"
+            )
+
+    def _update_offline_gripper_status(self, dataset: ExperimentDataset | None) -> None:
+        if dataset is None:
+            self.offline_gripper_status.setText("Offline gripper: select an experiment")
+            self.process_gripper_button.setEnabled(False)
+            return
+        has_video = dataset.ultrawide_video_path is not None
+        state = dataset.gripper_state
+        status = str(state.get("status", "not processed"))
+        if status == "complete":
+            rate = float(state.get("detection_rate", 0.0)) * 100.0
+            source = str(state.get("intrinsics_source", "--"))
+            text = f"Offline gripper: complete · {rate:.1f}% valid · intrinsics: {source}"
+        elif status == "failed":
+            text = f"Offline gripper: failed · {state.get('error', 'unknown error')}"
+        elif not has_video:
+            text = "Offline gripper: no saved 0.5× video"
+        else:
+            text = f"Offline gripper: {status}"
+        self.offline_gripper_status.setText(text)
+        self.process_gripper_button.setEnabled(has_video and status not in {"queued", "running"})
+
+    def change_replay_camera(self, _index: int = -1) -> None:
+        if self.dataset is None:
+            return
+        video_path = self._selected_replay_video_path()
+        self.playback.open(video_path)
+        self.replay_video.clear()
+        if video_path is None:
+            label = "1×" if self.replay_camera_combo.currentData() == "main" else "0.5×"
+            self.replay_video.setText(f"No saved {label} video in this experiment")
+        self.update_replay_cursor()
+
+    def _selected_replay_video_path(self) -> Path | None:
+        if self.dataset is None:
+            return None
+        if self.replay_camera_combo.currentData() == "ultrawide":
+            return self.dataset.ultrawide_video_path
+        return self.dataset.video_path
+
+    def _selected_replay_video_offset(self) -> float:
+        if self.dataset is None:
+            return 0.0
+        if self.replay_camera_combo.currentData() == "ultrawide":
+            return self.dataset.ultrawide_video_start_offset_seconds
+        return self.dataset.video_start_offset_seconds
 
     def open_selected_experiment_folder(self) -> None:
         if self.dataset is None:
@@ -1010,6 +1337,10 @@ class ExperimentMonitorWindow(QMainWindow):
             return "magnetic_csv"
         if lowered.startswith("sender_transport"):
             return "sender_transport"
+        if lowered.startswith("ultrawide_video"):
+            return "ultrawide_video"
+        if lowered.startswith("aruco_gripper"):
+            return "aruco_gripper"
         if lowered.startswith("video"):
             return "video"
         if "manifest" in lowered:
@@ -1023,6 +1354,8 @@ class ExperimentMonitorWindow(QMainWindow):
             "magnetic_csv": "Magnetic",
             "sender_transport": "Sender stats",
             "video": "Video",
+            "ultrawide_video": "0.5× video",
+            "aruco_gripper": "Offline gripper",
             "manifest": "Manifest",
         }.get(component, "File")
 
@@ -1031,11 +1364,13 @@ class ExperimentMonitorWindow(QMainWindow):
         inferred = component or ExperimentMonitorWindow._infer_phone_component(filename)
         return {
             "video": 0,
-            "pose_csv": 1,
-            "magnetic_csv": 2,
-            "sender_transport": 3,
-            "manifest": 4,
-        }.get(inferred, 5)
+            "ultrawide_video": 1,
+            "aruco_gripper": 2,
+            "pose_csv": 3,
+            "magnetic_csv": 4,
+            "sender_transport": 5,
+            "manifest": 6,
+        }.get(inferred, 7)
 
     def toggle_playback(self) -> None:
         if self.dataset is None:
@@ -1073,7 +1408,7 @@ class ExperimentMonitorWindow(QMainWindow):
         if dataset is None:
             return
         self.time_label.setText(f"{self.play_time:.3f} / {dataset.duration_seconds:.3f} s")
-        image = self.playback.frame_at(self.play_time - dataset.video_start_offset_seconds)
+        image = self.playback.frame_at(self.play_time - self._selected_replay_video_offset())
         if image is not None:
             self.replay_video.setPixmap(
                 QPixmap.fromImage(image).scaled(
@@ -1082,6 +1417,10 @@ class ExperimentMonitorWindow(QMainWindow):
                     Qt.TransformationMode.SmoothTransformation,
                 )
             )
+        elif self._selected_replay_video_path() is None:
+            self.replay_video.clear()
+            label = "1×" if self.replay_camera_combo.currentData() == "main" else "0.5×"
+            self.replay_video.setText(f"No saved {label} video in this experiment")
 
         pose = dataset.pose.nearest(self.play_time)
         if pose:
@@ -1124,6 +1463,26 @@ class ExperimentMonitorWindow(QMainWindow):
         self.transport_values["drops"].setText(
             str(selected_transport.get("dropped_frames", (sender_transport or {}).get("dropped_frames", "--")))
         )
+
+        gripper = dataset.gripper.nearest(self.play_time)
+        if gripper:
+            status = str(gripper.get("status", "--"))
+            if str(gripper.get("interpolated", "0")) == "1":
+                status += " (short-gap interpolation)"
+            self.gripper_values["status"].setText(status)
+            raw_m = _optional_float(gripper.get("raw_marker_x_distance_m"))
+            self.gripper_values["raw"].setText(
+                f"{raw_m * 1000.0:.4f} mm" if raw_m is not None else "--"
+            )
+            self.gripper_values["calibrated"].setText(
+                metric_text(gripper.get("calibrated_mm"), " mm", 4)
+            )
+            self.gripper_values["smoothed"].setText(
+                metric_text(gripper.get("offline_smoothed_mm"), " mm", 4)
+            )
+        else:
+            for value in self.gripper_values.values():
+                value.setText("--")
         for cursor in self.plot_cursors:
             cursor.setValue(self.play_time)
 
@@ -1151,7 +1510,7 @@ class ExperimentMonitorWindow(QMainWindow):
             return
         dataset = self.dataset
         self.plot_cursors = []
-        for plot in (self.pose_plot, self.magnetic_plot, self.transport_plot):
+        for plot in (self.pose_plot, self.magnetic_plot, self.transport_plot, self.gripper_plot):
             plot.clear()
             plot.addLegend()
         colors = ["#ff5c5c", "#56d364", "#58a6ff", "#d2a8ff", "#f2cc60"]
@@ -1163,15 +1522,9 @@ class ExperimentMonitorWindow(QMainWindow):
                 name=axis.upper(),
             )
         for chip in range(5):
-            magnitudes = []
-            for row in dataset.magnetic.rows:
-                x = _safe_float(row.get(f"s{chip}_x"))
-                y = _safe_float(row.get(f"s{chip}_y"))
-                z = _safe_float(row.get(f"s{chip}_z"))
-                magnitudes.append(math.sqrt(x * x + y * y + z * z))
             self.magnetic_plot.plot(
                 dataset.magnetic.times,
-                magnitudes,
+                _relative_magnetic_magnitudes(dataset.magnetic.rows, chip),
                 pen=pg.mkPen(colors[chip], width=1.5),
                 name=f"S{chip}",
             )
@@ -1180,6 +1533,29 @@ class ExperimentMonitorWindow(QMainWindow):
             plot.addItem(cursor)
             self.plot_cursors.append(cursor)
         self.rebuild_transport_plot()
+        calibrated = [
+            value if (value := _optional_float(row.get("calibrated_mm"))) is not None else math.nan
+            for row in dataset.gripper.rows
+        ]
+        stable = [
+            value if (value := _optional_float(row.get("offline_smoothed_mm"))) is not None else math.nan
+            for row in dataset.gripper.rows
+        ]
+        self.gripper_plot.plot(
+            dataset.gripper.times,
+            calibrated,
+            pen=pg.mkPen("#8c8c8c", width=1),
+            name="per-frame calibrated",
+        )
+        self.gripper_plot.plot(
+            dataset.gripper.times,
+            stable,
+            pen=pg.mkPen("#56d364", width=2.5),
+            name="offline stable",
+        )
+        gripper_cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff", width=1))
+        self.gripper_plot.addItem(gripper_cursor)
+        self.plot_cursors.append(gripper_cursor)
 
     def rebuild_transport_plot(self) -> None:
         if pg is None or self.dataset is None:
@@ -1234,6 +1610,36 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     return number if math.isfinite(number) else default
 
 
+def _optional_float(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _relative_magnetic_magnitudes(rows: list[dict], chip: int) -> list[float]:
+    """Return each chip's magnitude relative to its first complete sample."""
+    magnitudes: list[float] = []
+    baseline: float | None = None
+    for row in rows:
+        components = (
+            _optional_float(row.get(f"s{chip}_x")),
+            _optional_float(row.get(f"s{chip}_y")),
+            _optional_float(row.get(f"s{chip}_z")),
+        )
+        if any(value is None for value in components):
+            magnitudes.append(math.nan)
+            continue
+
+        x, y, z = components
+        magnitude = math.sqrt(x * x + y * y + z * z)
+        if baseline is None:
+            baseline = magnitude
+        magnitudes.append(magnitude - baseline)
+    return magnitudes
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Monitor and replay synchronized ARPose experiments.")
     parser.add_argument("--bind", default="0.0.0.0")
@@ -1254,9 +1660,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("ARPose Experiment Monitor & Replay")
-    window = ExperimentMonitorWindow(parse_args())
-    window.show()
-    return app.exec()
+    acquired, mutex = acquire_single_instance_mutex()
+    if not acquired:
+        QMessageBox.warning(
+            None,
+            "监控程序已经在运行",
+            "检测到另一个 ARPose Experiment Monitor。请使用已有窗口，或先完全关闭它再重试。",
+        )
+        return 2
+    try:
+        window = ExperimentMonitorWindow(parse_args())
+        window.show()
+        return app.exec()
+    finally:
+        release_single_instance_mutex(mutex)
 
 
 if __name__ == "__main__":

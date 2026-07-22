@@ -39,4 +39,6 @@ release_payload.json
 # PyInstaller
 dist/
 build/
+dist_*/
+build_*/
 *.spec

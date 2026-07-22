@@ -563,6 +563,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             self.videoRecorder.cancelRecording(reason: "AR session failed: \(error.localizedDescription)")
             self.ultraWideVideoRecorder.cancelRecording(reason: "AR session failed: \(error.localizedDescription)")
             self.reportTrackingStatus("AR failed: \(error.localizedDescription)")
+            self.recoverStreamingAfterSessionFailure()
         }
     }
 
@@ -591,6 +592,15 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             } else {
                 self.reportTrackingStatus("AR interruption ended")
             }
+        }
+    }
+
+    private func recoverStreamingAfterSessionFailure() {
+        arQueue.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+            guard let self, self.isStreamingEnabled, !self.isSessionRunning else { return }
+            self.videoSender.startStreaming()
+            self.ultraWideVideoSender.startStreaming()
+            self.startSessionIfNeeded()
         }
     }
 

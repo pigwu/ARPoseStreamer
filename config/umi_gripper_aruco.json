@@ -9,21 +9,21 @@
   "tracking_enabled": true,
   "output_host": "127.0.0.1",
   "output_port": 5570,
-  "distance_scale": 1.0,
-  "distance_offset_m": 0.0,
+  "distance_scale": 0.8413230600966157,
+  "distance_offset_m": -0.03930162909704434,
   "distance_smoothing_alpha": 1.0,
   "distance_measurement_mode": "camera_x",
-  "nominal_marker_depth_m": 0.072,
-  "marker_depth_tolerance_m": 0.008,
+  "nominal_marker_depth_m": 0.1101,
+  "marker_depth_tolerance_m": 0.02,
   "distance_calibration": {
     "minimum_cycles": 5,
     "minimum": {
-      "raw_marker_x_distance_m": null,
-      "actual_gap_m": 0.0
+      "raw_marker_x_distance_m": 0.0538457,
+      "actual_gap_m": 0.006
     },
     "maximum": {
-      "raw_marker_x_distance_m": null,
-      "actual_gap_m": 0.0
+      "raw_marker_x_distance_m": 0.1418024,
+      "actual_gap_m": 0.08
     }
   }
 }

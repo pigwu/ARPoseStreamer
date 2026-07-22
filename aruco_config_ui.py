@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections import deque
 import shutil
 import sys
 from pathlib import Path
@@ -48,6 +50,8 @@ class ArucoConfigWidget(QWidget):
             else Path(__file__).resolve().parent
         )
         self.last_raw_distance_m: float | None = None
+        self.last_marker_depths_m: dict[str, float] = {}
+        self.recent_raw_samples: deque[tuple[float, float]] = deque(maxlen=30)
         self.distance_scale = 1.0
         self.distance_offset_m = 0.0
         self.calibration_collecting = False
@@ -101,7 +105,8 @@ class ArucoConfigWidget(QWidget):
 
         summary = QLabel(
             "用途：按 UMI-FT 方法逐帧测量夹爪开口。ID 0、ID 1 分别贴在两个活动夹爪上，"
-            "原始宽度取两个标记相机 X 坐标之差；连续完整开合至少 5 次后自动标定。"
+            "原始宽度取两个标记相机 X 坐标之差。快捷流程：使用当前深度 → 合拢记录最小点 → "
+            "张开记录最大点 → 保存并应用。"
         )
         summary.setWordWrap(True)
         summary.setStyleSheet(
@@ -161,14 +166,21 @@ class ArucoConfigWidget(QWidget):
         depth_hint = QLabel("UMI-FT 默认 72 ± 8 mm；若安装结构不同，请按实际相机到标记深度修改")
         depth_hint.setWordWrap(True)
         depth_hint.setStyleSheet("color:#546e7a;")
-        marker_layout.addWidget(depth_hint, 2, 2, 2, 1)
+        marker_layout.addWidget(depth_hint, 2, 2)
+        self.use_current_depth_button = QPushButton("使用当前深度并应用")
+        self.use_current_depth_button.setToolTip(
+            "用当前两个标记深度的中点作为标称值，并自动留出至少 ±20 mm 余量"
+        )
+        self.use_current_depth_button.clicked.connect(self.use_current_marker_depth)
+        marker_layout.addWidget(self.use_current_depth_button, 3, 2)
         layout.addWidget(marker_box)
 
-        calibration_box = QGroupBox("2. 连续开合标定")
+        calibration_box = QGroupBox("2. 两点快捷标定")
         calibration = QGridLayout(calibration_box)
         calibration.addWidget(QLabel("位置"), 0, 0)
         calibration.addWidget(QLabel("实际夹爪开口（卡尺测量）"), 0, 1)
-        calibration.addWidget(QLabel("自动统计的 X 轴宽度"), 0, 2)
+        calibration.addWidget(QLabel("记录的 X 轴宽度"), 0, 2)
+        calibration.addWidget(QLabel("保持不动约 1 秒后点击"), 0, 3)
 
         self.minimum_gap_mm_spin = self._double_spin(0.0, 2000.0, 3, 0.1, " mm")
         self.maximum_gap_mm_spin = self._double_spin(0.0, 2000.0, 3, 0.1, " mm")
@@ -181,12 +193,35 @@ class ArucoConfigWidget(QWidget):
         calibration.addWidget(QLabel("最小开口"), 1, 0)
         calibration.addWidget(self.minimum_gap_mm_spin, 1, 1)
         calibration.addWidget(self.minimum_raw_mm_spin, 1, 2)
+        self.capture_minimum_button = QPushButton("记录当前最小点")
+        self.capture_minimum_button.clicked.connect(self.capture_minimum_point)
+        calibration.addWidget(self.capture_minimum_button, 1, 3)
         calibration.addWidget(QLabel("最大开口"), 2, 0)
         calibration.addWidget(self.maximum_gap_mm_spin, 2, 1)
         calibration.addWidget(self.maximum_raw_mm_spin, 2, 2)
+        self.capture_maximum_button = QPushButton("记录当前最大点")
+        self.capture_maximum_button.clicked.connect(self.capture_maximum_point)
+        calibration.addWidget(self.capture_maximum_button, 2, 3)
 
-        calibration.addWidget(QLabel("最少完整开合周期"), 3, 0)
-        calibration.addWidget(self.calibration_min_cycles_spin, 3, 1)
+        self.quick_calibration_status_label = QLabel(
+            "先填写卡尺测得的最小/最大实际开口，再分别保持在两个端点并点击记录。"
+        )
+        self.quick_calibration_status_label.setWordWrap(True)
+        self.quick_calibration_status_label.setStyleSheet("color:#1565c0;")
+        calibration.addWidget(self.quick_calibration_status_label, 3, 0, 1, 4)
+
+        quick_apply_button = QPushButton("完成：保存并应用标定")
+        quick_apply_button.setStyleSheet("font-weight:600; padding:6px 16px;")
+        quick_apply_button.clicked.connect(self.finish_quick_calibration)
+        calibration.addWidget(quick_apply_button, 4, 0, 1, 4)
+
+        self.show_cyclic_calibration_checkbox = QCheckBox("可选：显示连续开合稳健采集")
+        calibration.addWidget(self.show_cyclic_calibration_checkbox, 5, 0, 1, 4)
+        self.cyclic_calibration_widget = QWidget()
+        cyclic = QGridLayout(self.cyclic_calibration_widget)
+        cyclic.setContentsMargins(0, 0, 0, 0)
+        cyclic.addWidget(QLabel("最少完整开合周期"), 0, 0)
+        cyclic.addWidget(self.calibration_min_cycles_spin, 0, 1)
         self.start_collection_button = QPushButton("开始采集")
         self.finish_collection_button = QPushButton("结束采集并计算")
         self.finish_collection_button.setEnabled(False)
@@ -198,27 +233,31 @@ class ArucoConfigWidget(QWidget):
         controls.addWidget(self.start_collection_button)
         controls.addWidget(self.finish_collection_button)
         controls.addWidget(self.clear_collection_button)
-        calibration.addLayout(controls, 4, 0, 1, 3)
+        cyclic.addLayout(controls, 1, 0, 1, 3)
         self.collection_status_label = QLabel("尚未开始采集")
         self.collection_status_label.setWordWrap(True)
-        calibration.addWidget(self.collection_status_label, 5, 0, 1, 3)
+        cyclic.addWidget(self.collection_status_label, 2, 0, 1, 3)
 
         calculate_button = QPushButton("使用上方端点重新计算")
         calculate_button.clicked.connect(self.calculate_two_point_calibration)
-        calibration.addWidget(calculate_button, 6, 0, 1, 3)
+        cyclic.addWidget(calculate_button, 3, 0, 1, 3)
+        self.cyclic_calibration_widget.setVisible(False)
+        self.show_cyclic_calibration_checkbox.toggled.connect(
+            self.cyclic_calibration_widget.setVisible
+        )
+        calibration.addWidget(self.cyclic_calibration_widget, 6, 0, 1, 4)
         self.calibration_result_label = QLabel("尚未完成两点标定")
         self.calibration_result_label.setWordWrap(True)
         self.calibration_result_label.setStyleSheet(
             "padding:7px; background:#eceff1; border-radius:4px;"
         )
-        calibration.addWidget(self.calibration_result_label, 7, 0, 1, 3)
+        calibration.addWidget(self.calibration_result_label, 7, 0, 1, 4)
         formula = QLabel(
-            "操作：开始采集 → 连续从全闭到全开再回到全闭至少 5 次 → 结束采集并计算。"
-            "程序用端点帧的稳健统计值计算 scale/offset；所有数据仍可手工修改。"
+            "快捷记录使用最近约 1 秒稳定帧的中位数，减少单帧抖动。连续开合采集仅在需要更高稳健性时使用。"
         )
         formula.setWordWrap(True)
         formula.setStyleSheet("color:#546e7a;")
-        calibration.addWidget(formula, 8, 0, 1, 3)
+        calibration.addWidget(formula, 8, 0, 1, 4)
         layout.addWidget(calibration_box)
 
         output_box = QGroupBox("3. 输出与保存")
@@ -498,6 +537,82 @@ class ArucoConfigWidget(QWidget):
             self.config_status.setStyleSheet("color:#c62828;")
             QMessageBox.critical(self, "无法保存 ArUco 测距配置", str(exc))
 
+    def use_current_marker_depth(self, _checked: bool = False) -> None:
+        depths_mm = [
+            value * 1000.0
+            for value in self.last_marker_depths_m.values()
+            if np.isfinite(value) and value > 0.0
+        ]
+        if len(depths_mm) < 2:
+            QMessageBox.warning(
+                self,
+                "没有可用深度",
+                "请先让 0.5× 画面同时看到两个标记，再点击“使用当前深度并应用”。",
+            )
+            return
+        nominal_mm = float(np.median(depths_mm))
+        maximum_deviation_mm = max(abs(value - nominal_mm) for value in depths_mm)
+        tolerance_mm = max(20.0, maximum_deviation_mm + 10.0)
+        self.nominal_depth_mm_spin.setValue(nominal_mm)
+        self.depth_tolerance_mm_spin.setValue(tolerance_mm)
+        self.quick_calibration_status_label.setText(
+            f"已按当前深度设置为 {nominal_mm:.1f} ± {tolerance_mm:.1f} mm；正在保存并应用。"
+        )
+        self.quick_calibration_status_label.setStyleSheet("color:#2e7d32; font-weight:600;")
+        self.save_configuration(apply=True)
+
+    def _stable_recent_raw_point(self) -> tuple[float, int, float] | None:
+        cutoff = time.monotonic() - 1.25
+        values = np.asarray(
+            [value for timestamp, value in self.recent_raw_samples if timestamp >= cutoff],
+            dtype=np.float64,
+        )
+        if values.size < 4:
+            QMessageBox.warning(
+                self,
+                "稳定帧不足",
+                "请确认状态为“正在逐帧测量”，把夹爪保持不动约 1 秒后再点击。",
+            )
+            return None
+        point_m = float(np.median(values))
+        spread_m = float(np.percentile(values, 90.0) - np.percentile(values, 10.0))
+        if spread_m > 0.0015:
+            QMessageBox.warning(
+                self,
+                "端点仍在移动",
+                f"最近帧波动约 {spread_m * 1000.0:.2f} mm。请保持不动约 1 秒后重试。",
+            )
+            return None
+        return point_m, int(values.size), spread_m
+
+    def capture_minimum_point(self, _checked: bool = False) -> None:
+        self._capture_quick_point(self.minimum_raw_mm_spin, "最小")
+
+    def capture_maximum_point(self, _checked: bool = False) -> None:
+        self._capture_quick_point(self.maximum_raw_mm_spin, "最大")
+
+    def _capture_quick_point(self, target: QDoubleSpinBox, label: str) -> None:
+        stable = self._stable_recent_raw_point()
+        if stable is None:
+            return
+        point_m, sample_count, spread_m = stable
+        target.setValue(point_m * 1000.0)
+        self.quick_calibration_status_label.setText(
+            f"已记录{label}点 {point_m * 1000.0:.3f} mm（{sample_count} 帧，波动 "
+            f"{spread_m * 1000.0:.3f} mm）。"
+        )
+        self.quick_calibration_status_label.setStyleSheet("color:#2e7d32; font-weight:600;")
+        if (
+            self._raw_spin_m(self.minimum_raw_mm_spin) is not None
+            and self._raw_spin_m(self.maximum_raw_mm_spin) is not None
+            and self.maximum_gap_mm_spin.value() > self.minimum_gap_mm_spin.value()
+        ):
+            self.calculate_two_point_calibration(show_dialog=False)
+
+    def finish_quick_calibration(self, _checked: bool = False) -> None:
+        if self.calculate_two_point_calibration(show_dialog=True):
+            self.save_configuration(apply=True)
+
     def start_calibration_collection(self, _checked: bool = False) -> None:
         if self.maximum_gap_mm_spin.value() <= self.minimum_gap_mm_spin.value():
             QMessageBox.warning(self, "实际开口无效", "最大实际开口必须大于最小实际开口。")
@@ -578,7 +693,7 @@ class ArucoConfigWidget(QWidget):
         minimum_raw_m = self._raw_spin_m(self.minimum_raw_mm_spin)
         maximum_raw_m = self._raw_spin_m(self.maximum_raw_mm_spin)
         if minimum_raw_m is None or maximum_raw_m is None:
-            message = "请先完成连续开合采集，或手工填写两个原始 X 轴宽度。"
+            message = "请先分别点击“记录当前最小点”和“记录当前最大点”，或手工填写两个原始 X 轴宽度。"
             if show_dialog:
                 QMessageBox.warning(self, "标定点不完整", message)
             self.config_status.setText(message)
@@ -604,6 +719,22 @@ class ArucoConfigWidget(QWidget):
 
     def update_live_result(self, result: dict) -> None:
         status = str(result.get("status", "--"))
+        measurement = result.get("measurement") or {}
+        depths = measurement.get("marker_depth_m") or {}
+        self.last_marker_depths_m = {
+            str(marker_id): float(value)
+            for marker_id, value in depths.items()
+            if isinstance(value, (int, float)) and np.isfinite(value) and value > 0.0
+        }
+        nominal_depth_m = measurement.get("nominal_marker_depth_m")
+        depth_tolerance_m = measurement.get("marker_depth_tolerance_m")
+        allowed_depth_text = ""
+        if isinstance(nominal_depth_m, (int, float)) and isinstance(
+            depth_tolerance_m, (int, float)
+        ):
+            minimum_depth_mm = (float(nominal_depth_m) - float(depth_tolerance_m)) * 1000.0
+            maximum_depth_mm = (float(nominal_depth_m) + float(depth_tolerance_m)) * 1000.0
+            allowed_depth_text = f"；允许 {minimum_depth_mm:.1f}–{maximum_depth_mm:.1f} mm"
         translations = {
             "tracking_gripper_distance": "正在逐帧测量",
             "insufficient_markers_for_distance": "必须同时看到两个标记",
@@ -612,7 +743,10 @@ class ArucoConfigWidget(QWidget):
             "no_markers": "未检测到配置的两个 ID",
             "processor_error": "处理错误",
         }
-        self.live_status_label.setText(f"{translations.get(status, status)}（{status}）")
+        status_detail = allowed_depth_text if status == "marker_depth_out_of_range" else ""
+        self.live_status_label.setText(
+            f"{translations.get(status, status)}{status_detail}（{status}）"
+        )
         color = "#2e7d32" if status == "tracking_gripper_distance" else "#ef6c00"
         if status in {"processor_error", "missing_intrinsics", "marker_depth_out_of_range"}:
             color = "#c62828"
@@ -631,8 +765,6 @@ class ArucoConfigWidget(QWidget):
             if output_error
             else f"{self.output_host_edit.text().strip()}:{self.output_port_spin.value()}"
         )
-        measurement = result.get("measurement") or {}
-        depths = measurement.get("marker_depth_m") or {}
         depth_text = ", ".join(
             f"ID {marker_id}={float(value) * 1000.0:.2f} mm"
             for marker_id, value in depths.items()
@@ -640,13 +772,14 @@ class ArucoConfigWidget(QWidget):
         )
         self.live_detail_label.setText(
             f"检测 ID：{', '.join(str(value) for value in ids) if ids else '--'}　"
-            f"深度：{depth_text or '--'}　重投影误差：{error_text}　UDP：{output_text}"
+            f"深度：{depth_text or '--'}{allowed_depth_text}　重投影误差：{error_text}　UDP：{output_text}"
         )
 
         distance = result.get("gripper_distance") or {}
         raw_m = distance.get("raw_marker_x_distance_m")
         if status == "tracking_gripper_distance" and isinstance(raw_m, (int, float)):
             self.last_raw_distance_m = float(raw_m)
+            self.recent_raw_samples.append((time.monotonic(), self.last_raw_distance_m))
             self.current_raw_label.setText(f"{self.last_raw_distance_m * 1000.0:.4f} mm")
             if self.calibration_collecting:
                 self.calibration_samples_m.append(self.last_raw_distance_m)
