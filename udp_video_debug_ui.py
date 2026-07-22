@@ -361,7 +361,8 @@ class VideoReceiverThread(QThread):
     def run(self) -> None:
         try:
             video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            video_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if sys.platform != "win32":
+                video_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             video_socket.bind((self.bind_host, self.video_port))
             video_socket.setblocking(False)
 
@@ -369,7 +370,8 @@ class VideoReceiverThread(QThread):
             sockets = [video_socket]
             if self.pose_port is not None and self.pose_port > 0:
                 pose_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                pose_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if sys.platform != "win32":
+                    pose_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 pose_socket.bind((self.bind_host, self.pose_port))
                 pose_socket.setblocking(False)
                 sockets.append(pose_socket)

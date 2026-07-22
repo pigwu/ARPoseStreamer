@@ -574,6 +574,15 @@ final class PositionViewModel: ObservableObject {
             configureSender()
         }
 
+        // Re-arm the existing live pipeline before recording. ARKit may have
+        // interrupted the internal video senders while the UI's streaming
+        // switch remained on, leaving recording active but the live view frozen.
+        if isSending {
+            sender?.start()
+        } else {
+            startSending()
+        }
+
         let experiment = ActiveExperimentSession(
             id: UUID(),
             startUnixTime: Date().timeIntervalSince1970,

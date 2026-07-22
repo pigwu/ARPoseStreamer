@@ -6,60 +6,87 @@ struct ContentView: View {
     @State private var isShowingSettings = false
     @State private var isShowingHistory = false
     @State private var isSidebarPresented = false
+    @State private var isRecordingFocusMode = false
 
     var body: some View {
         ZStack(alignment: .leading) {
             ARCameraPreviewView(session: viewModel.previewSession)
                 .ignoresSafeArea()
 
-            LinearGradient(
-                colors: [
-                    .black.opacity(0.42),
-                    .clear,
-                    .black.opacity(0.62)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .ignoresSafeArea()
-            .allowsHitTesting(false)
-
-            VStack(spacing: 0) {
-                TopBar(
-                    title: "ARPoseStreamer",
-                    onMenuTapped: {
-                        withAnimation(.easeInOut(duration: 0.22)) {
-                            isSidebarPresented.toggle()
-                        }
-                    }
-                )
-
-                Spacer()
-
-                BottomDashboard(viewModel: viewModel)
-            }
-
-            if isSidebarPresented {
-                Color.black.opacity(0.35)
+            if isRecordingFocusMode {
+                Color.clear
+                    .contentShape(Rectangle())
                     .ignoresSafeArea()
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.22)) {
+                    .onTapGesture(count: 2) {
+                        restoreInterface()
+                    }
+                    .accessibilityLabel("Camera preview")
+                    .accessibilityHint("Double-tap to restore all controls")
+
+                VStack {
+                    Spacer()
+
+                    RecordButton(viewModel: viewModel)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 10)
+                }
+                .transition(.opacity)
+            } else {
+                LinearGradient(
+                    colors: [
+                        .black.opacity(0.42),
+                        .clear,
+                        .black.opacity(0.62)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+
+                VStack(spacing: 0) {
+                    TopBar(
+                        title: "ARPoseStreamer",
+                        onMenuTapped: {
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                isSidebarPresented.toggle()
+                            }
+                        }
+                    )
+
+                    Spacer()
+
+                    BottomDashboard(viewModel: viewModel)
+                }
+
+                if isSidebarPresented {
+                    Color.black.opacity(0.35)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                isSidebarPresented = false
+                            }
+                        }
+
+                    SidebarDrawer(
+                        viewModel: viewModel,
+                        onEnterRecordingFocusMode: {
+                            isSidebarPresented = false
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                isRecordingFocusMode = true
+                            }
+                        },
+                        onOpenHistory: {
+                            isShowingHistory = true
+                            isSidebarPresented = false
+                        },
+                        onOpenSettings: {
+                            isShowingSettings = true
                             isSidebarPresented = false
                         }
-                    }
-
-                SidebarDrawer(
-                    viewModel: viewModel,
-                    onOpenHistory: {
-                        isShowingHistory = true
-                        isSidebarPresented = false
-                    },
-                    onOpenSettings: {
-                        isShowingSettings = true
-                        isSidebarPresented = false
-                    }
-                )
-                .transition(.move(edge: .leading))
+                    )
+                    .transition(.move(edge: .leading))
+                }
             }
         }
         .statusBarHidden(true)
@@ -90,8 +117,19 @@ struct ContentView: View {
                 break
             }
         }
+        .onChange(of: viewModel.canStopRecording) { wasStoppable, isStoppable in
+            if isRecordingFocusMode && wasStoppable && !isStoppable {
+                restoreInterface()
+            }
+        }
         .onDisappear {
             viewModel.shutdown()
+        }
+    }
+
+    private func restoreInterface() {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            isRecordingFocusMode = false
         }
     }
 }
@@ -316,6 +354,7 @@ private struct RecordButton: View {
 
 private struct SidebarDrawer: View {
     @ObservedObject var viewModel: PositionViewModel
+    let onEnterRecordingFocusMode: () -> Void
     let onOpenHistory: () -> Void
     let onOpenSettings: () -> Void
 
@@ -324,6 +363,17 @@ private struct SidebarDrawer: View {
             Text("Menu")
                 .font(.headline)
                 .foregroundStyle(.white)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Button(action: onEnterRecordingFocusMode) {
+                    Label("Show Recording View Only", systemImage: "viewfinder")
+                }
+                .buttonStyle(.borderedProminent)
+
+                Text("Double-tap the preview to restore all controls.")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.62))
+            }
 
             Button(viewModel.isSending ? "Stop Legacy/Video Stream" : "Start Legacy/Video Stream") {
                 if viewModel.isSending {
