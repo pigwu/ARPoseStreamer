@@ -317,7 +317,7 @@ py capture_upload_server.py --host 0.0.0.0 --port 8000
 For the integrated live monitor, grouped upload receiver, and synchronized experiment replay UI:
 
 ```powershell
-py experiment_replay_ui.py --bind 0.0.0.0 --video-port 5560 --pose-port 5555 --combined-port 5558 --upload-port 8000 --phone-ip 172.20.10.1
+py experiment_replay_ui.py --bind 0.0.0.0 --video-port 5560 --aruco-video-port 5561 --pose-port 5555 --combined-port 5558 --upload-port 8000 --phone-ip 172.20.10.1
 ```
 
 Keep live streaming and sensor reception running as needed. On the iPhone, `Start Experiment` defines the shared time origin; `Stop & Save Experiment` finalizes the MP4 and uploads the entire experiment into one timestamp-named folder such as `20260714-205900` under `uploads/`. The UUID remains inside the manifest and state files for reliable association. Source runs use the repository `uploads/` directory; the packaged Windows monitor uses an `uploads/` directory beside the EXE so experiments persist after the one-file app exits. After a complete upload, the monitor automatically creates `dataset.zarr` in the same experiment folder on a background conversion queue. The replay tab can then select any complete experiment and synchronously inspect video, pose, all five magnetic chips, sender statistics, receiver latency, clock offset, bitrate, FPS, drops, and packet counters.

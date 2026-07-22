@@ -50,7 +50,24 @@ struct AppSettingsView: View {
                     TextField("Bitrate (Mbps)", text: $viewModel.videoBitrateMbps)
                         .keyboardType(.decimalPad)
 
+                    Toggle(
+                        "Enable 0.5x ArUco Stream",
+                        isOn: $viewModel.isUltraWideVideoStreamingEnabled
+                    )
+
+                    TextField("0.5x ArUco Video Port", text: $viewModel.ultraWideVideoPort)
+                        .keyboardType(.numberPad)
+
+                    LabeledContent("0.5x Status") {
+                        Text(viewModel.ultraWideVideoStatus)
+                            .multilineTextAlignment(.trailing)
+                    }
+
                     Text("The video path uses H.264 over raw UDP with small packets. For a lower-latency test, try 480p at 2–3 Mbps.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text("The original 1x ARKit stream remains unchanged. On supported iPhone Pro models, a research-only ARKit private frame supplies a separate 0.5x stream at about 10 FPS for ArUco processing (default UDP 5561).")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

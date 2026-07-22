@@ -12,6 +12,7 @@ def check_dependencies():
         'PyQt6': 'PyQt6.QtWidgets',
         'pyqtgraph': 'pyqtgraph',
         'numpy': 'numpy',
+        'pyserial': 'serial',
         'PyOpenGL': 'OpenGL'
     }
 
@@ -22,9 +23,9 @@ def check_dependencies():
         try:
             mod = __import__(module)
             version = getattr(mod, '__version__', 'unknown')
-            print(f"✓ {name:15} version {version}")
+            print(f"[OK]      {name:15} version {version}")
         except ImportError as e:
-            print(f"✗ {name:15} MISSING - {e}")
+            print(f"[MISSING] {name:15} {e}")
             all_ok = False
 
     print()

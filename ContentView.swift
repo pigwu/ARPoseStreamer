@@ -368,6 +368,13 @@ private struct SidebarDrawer: View {
                 .buttonStyle(.bordered)
             }
 
+            if let lastSavedUltraWideVideoURL = viewModel.lastSavedUltraWideVideoURL {
+                ShareLink(item: lastSavedUltraWideVideoURL) {
+                    Label("Share Last 0.5x Video", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+            }
+
             Spacer()
 
             Text(viewModel.computerGatewayStatus)

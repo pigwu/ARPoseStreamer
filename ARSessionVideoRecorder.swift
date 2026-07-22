@@ -90,11 +90,18 @@ enum VideoRecordingStatus {
 final class ARSessionVideoRecorder {
     var onStatusChange: ((VideoRecordingStatus) -> Void)?
 
+    private let fileNamePrefix: String
+    private let expectedFrameRate: Int
     private var assetWriter: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var outputURL: URL?
     private var recordingStatus: VideoRecordingStatus = .idle
+
+    init(fileNamePrefix: String = "ARPoseStreamer", expectedFrameRate: Int = 60) {
+        self.fileNamePrefix = fileNamePrefix
+        self.expectedFrameRate = max(1, expectedFrameRate)
+    }
 
     func startRecording() {
         guard recordingStatus.isTerminal else { return }
@@ -225,7 +232,7 @@ final class ARSessionVideoRecorder {
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
 
-        let outputURL = Self.makeOutputURL()
+        let outputURL = Self.makeOutputURL(prefix: fileNamePrefix)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
         }
@@ -237,8 +244,8 @@ final class ARSessionVideoRecorder {
             AVVideoHeightKey: height,
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: width * height * 6,
-                AVVideoExpectedSourceFrameRateKey: 60,
-                AVVideoMaxKeyFrameIntervalKey: 60
+                AVVideoExpectedSourceFrameRateKey: expectedFrameRate,
+                AVVideoMaxKeyFrameIntervalKey: expectedFrameRate
             ]
         ]
 
@@ -282,11 +289,11 @@ final class ARSessionVideoRecorder {
         onStatusChange?(status)
     }
 
-    private static func makeOutputURL() -> URL {
+    private static func makeOutputURL(prefix: String) -> URL {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
 
-        let fileName = "ARPoseStreamer-\(formatter.string(from: Date())).mp4"
+        let fileName = "\(prefix)-\(formatter.string(from: Date())).mp4"
         let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
 
         return documentsURL.appendingPathComponent(fileName)

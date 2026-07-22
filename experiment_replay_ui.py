@@ -388,6 +388,7 @@ class ExperimentMonitorWindow(QMainWindow):
         self.resize(1550, 980)
         self.args = args
         self.video_worker: VideoReceiverThread | None = None
+        self.aruco_video_worker: VideoReceiverThread | None = None
         self.combined_worker: CombinedReceiverThread | None = None
         self.upload_bridge = UploadServerBridge()
         self.upload_bridge.event_received.connect(self.on_server_event)
@@ -420,6 +421,7 @@ class ExperimentMonitorWindow(QMainWindow):
         service_grid = QGridLayout(service_box)
         self.bind_edit = QLineEdit(self.args.bind)
         self.video_port_edit = QLineEdit(str(self.args.video_port))
+        self.aruco_video_port_edit = QLineEdit(str(self.args.aruco_video_port))
         self.pose_port_edit = QLineEdit(str(self.args.pose_port))
         self.combined_port_edit = QLineEdit(str(self.args.combined_port))
         self.upload_port_edit = QLineEdit(str(self.args.upload_port))
@@ -428,7 +430,8 @@ class ExperimentMonitorWindow(QMainWindow):
         for column, (label, widget) in enumerate(
             [
                 ("Bind", self.bind_edit),
-                ("Video", self.video_port_edit),
+                ("1x Video", self.video_port_edit),
+                ("0.5x ArUco", self.aruco_video_port_edit),
                 ("Pose", self.pose_port_edit),
                 ("Combined", self.combined_port_edit),
                 ("Upload", self.upload_port_edit),
@@ -438,12 +441,12 @@ class ExperimentMonitorWindow(QMainWindow):
             service_grid.addWidget(QLabel(label), 0, column)
             service_grid.addWidget(widget, 1, column)
         service_grid.addWidget(QLabel("Experiment Library"), 2, 0)
-        service_grid.addWidget(self.root_edit, 2, 1, 1, 4)
+        service_grid.addWidget(self.root_edit, 2, 1, 1, 5)
         self.services_button = QPushButton("Start Monitor")
         self.services_button.clicked.connect(self.toggle_services)
-        service_grid.addWidget(self.services_button, 2, 5)
+        service_grid.addWidget(self.services_button, 2, 6)
         self.service_status = QLabel("Stopped")
-        service_grid.addWidget(self.service_status, 3, 0, 1, 6)
+        service_grid.addWidget(self.service_status, 3, 0, 1, 7)
         root.addWidget(service_box)
 
         self.tabs = QTabWidget()
@@ -687,6 +690,7 @@ class ExperimentMonitorWindow(QMainWindow):
         try:
             bind = self.bind_edit.text().strip() or "0.0.0.0"
             video_port = int(self.video_port_edit.text())
+            aruco_video_port = int(self.aruco_video_port_edit.text())
             pose_port = int(self.pose_port_edit.text())
             combined_port = int(self.combined_port_edit.text())
             upload_port = int(self.upload_port_edit.text())
@@ -710,13 +714,21 @@ class ExperimentMonitorWindow(QMainWindow):
             bind,
             video_port,
             pose_port,
-            aruco_config=aruco_config,
+            aruco_config=None,
         )
         self.video_worker.frame_ready.connect(self.update_live_video)
         self.video_worker.video_metrics.connect(self.update_live_video_metrics)
         self.video_worker.pose_metrics.connect(self.update_live_pose_metrics)
-        self.video_worker.aruco_metrics.connect(self.update_live_aruco_metrics)
         self.video_worker.start()
+
+        self.aruco_video_worker = VideoReceiverThread(
+            bind,
+            aruco_video_port,
+            None,
+            aruco_config=aruco_config,
+        )
+        self.aruco_video_worker.aruco_metrics.connect(self.update_live_aruco_metrics)
+        self.aruco_video_worker.start()
 
         self.combined_worker = CombinedReceiverThread(
             bind,
@@ -729,13 +741,17 @@ class ExperimentMonitorWindow(QMainWindow):
         self.combined_worker.status_changed.connect(self.live_sensor_status.setText)
         self.combined_worker.start()
         self.services_button.setText("Stop Monitor")
-        self.set_service_status("Live video, pose, sensor, upload, and diagnostics started")
+        self.set_service_status("1x video plus 0.5x ArUco video, pose, sensor, upload, and diagnostics started")
 
     def stop_services(self) -> None:
         if self.video_worker is not None:
             self.video_worker.stop()
             self.video_worker.wait(1500)
             self.video_worker = None
+        if self.aruco_video_worker is not None:
+            self.aruco_video_worker.stop()
+            self.aruco_video_worker.wait(1500)
+            self.aruco_video_worker = None
         if self.combined_worker is not None:
             self.combined_worker.stop()
             self.combined_worker.wait(1500)
@@ -1222,6 +1238,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Monitor and replay synchronized ARPose experiments.")
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--video-port", type=int, default=5560)
+    parser.add_argument("--aruco-video-port", type=int, default=5561)
     parser.add_argument("--pose-port", type=int, default=5555)
     parser.add_argument("--combined-port", type=int, default=5558)
     parser.add_argument("--upload-port", type=int, default=8000)

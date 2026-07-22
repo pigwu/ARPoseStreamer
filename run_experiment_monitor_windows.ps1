@@ -1,6 +1,7 @@
 param(
     [string]$BindHost = "0.0.0.0",
     [int]$VideoPort = 5560,
+    [int]$ArucoVideoPort = 5561,
     [int]$PosePort = 5555,
     [int]$CombinedPort = 5558,
     [int]$UploadPort = 8000,
@@ -14,6 +15,7 @@ $arguments = @(
     "experiment_replay_ui.py",
     "--bind", $BindHost,
     "--video-port", $VideoPort,
+    "--aruco-video-port", $ArucoVideoPort,
     "--pose-port", $PosePort,
     "--combined-port", $CombinedPort,
     "--upload-port", $UploadPort,

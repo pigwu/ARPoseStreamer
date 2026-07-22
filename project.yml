@@ -26,6 +26,7 @@ targets:
       - path: ARPositionApp.swift
       - path: ContentView.swift
       - path: ARCameraPreviewView.swift
+      - path: ARUltraWideFrameAccess.swift
       - path: AppSettingsView.swift
       - path: CaptureHistoryView.swift
       - path: PositionViewModel.swift

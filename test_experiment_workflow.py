@@ -9,6 +9,7 @@ from pathlib import Path
 import zarr
 
 from capture_upload_server import (
+    UploadHandler,
     create_upload_server,
     migrate_uuid_experiment_directories,
     readable_experiment_name,
@@ -39,6 +40,12 @@ class ExperimentWorkflowTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         self.temporary_directory.cleanup()
+
+    def test_ultrawide_video_uses_a_stable_server_filename(self) -> None:
+        self.assertEqual(
+            UploadHandler.canonical_filename("ultrawide_video", "ARPoseStreamer-UltraWide.mp4"),
+            "ultrawide_video.mp4",
+        )
 
     def test_control_and_grouped_upload_create_one_experiment_folder(self) -> None:
         experiment_id = "12345678-1234-5678-9ABC-DEF012345678"

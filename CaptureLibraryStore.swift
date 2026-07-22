@@ -57,6 +57,7 @@ struct CaptureRecord: Identifiable, Codable, Hashable {
     let senderTransportCSVFileName: String?
     let manifestFileName: String
     let videoFileName: String?
+    let ultraWideVideoFileName: String?
     var videoUploadedAt: Date?
     var poseUploadedAt: Date?
     var experimentUploadedAt: Date?
@@ -102,6 +103,7 @@ final class CaptureLibraryStore {
             senderTransportCSVFileName: artifact.senderTransportCSVURL?.lastPathComponent,
             manifestFileName: artifact.manifestURL.lastPathComponent,
             videoFileName: artifact.videoURL?.lastPathComponent,
+            ultraWideVideoFileName: artifact.ultraWideVideoURL?.lastPathComponent,
             videoUploadedAt: nil,
             poseUploadedAt: nil,
             experimentUploadedAt: nil
@@ -163,6 +165,12 @@ final class CaptureLibraryStore {
 
     func urlForVideo(record: CaptureRecord) -> URL? {
         videoFileState(for: record).uploadURL
+    }
+
+    func urlForUltraWideVideo(record: CaptureRecord) -> URL? {
+        guard let fileName = record.ultraWideVideoFileName else { return nil }
+        let url = Self.captureDirectory(for: record).appendingPathComponent(fileName)
+        return Self.stateForExistingVideo(url)?.uploadURL
     }
 
     func videoFileState(for record: CaptureRecord) -> CaptureVideoFileState {

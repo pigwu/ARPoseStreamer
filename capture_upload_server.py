@@ -393,6 +393,9 @@ class UploadHandler(BaseHTTPRequestHandler):
         if component == "video":
             suffix = Path(original_filename).suffix.lower() or ".mp4"
             return f"video{suffix}"
+        if component == "ultrawide_video":
+            suffix = Path(original_filename).suffix.lower() or ".mp4"
+            return f"ultrawide_video{suffix}"
         return COMPONENT_FILENAMES.get(component, f"{UploadHandler.sanitize_token(component)}__{original_filename}")
 
     @staticmethod

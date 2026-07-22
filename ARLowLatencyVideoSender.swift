@@ -76,6 +76,15 @@ struct LowLatencyVideoConfiguration: Equatable {
         frameRate: 60,
         bitrateMbps: 6.0
     )
+
+    static let ultraWideDefaults = LowLatencyVideoConfiguration(
+        isEnabled: true,
+        hostIP: "192.168.1.10",
+        port: 5561,
+        resolution: .sd480p,
+        frameRate: 10,
+        bitrateMbps: 3.0
+    )
 }
 
 struct LowLatencyVideoStats: Equatable {

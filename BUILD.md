@@ -23,6 +23,7 @@ The build scripts force `QT_API=pyqt6` and exclude other Qt bindings so PyInstal
    - `dist\ARPose Packet Loss Monitor.exe`
    - `dist\ARPose Zarr Exporter.exe`
    - `dist\AnySkin UDP Monitor.exe`
+   - `dist\AnySkin Serial Mapper.exe`
 4. You can distribute these .exe files
 
 ## Building on macOS

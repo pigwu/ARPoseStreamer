@@ -128,6 +128,7 @@ private struct CaptureRecordCard: View {
             "pose",
             record.magneticCSVFileName == nil ? nil : "sensor",
             videoFileState.canUpload ? "video" : nil,
+            record.ultraWideVideoFileName == nil ? nil : "0.5x video",
             record.senderTransportCSVFileName == nil ? nil : "transport"
         ].compactMap { $0 }
         return "Ready to upload: \(modalities.joined(separator: " + "))"

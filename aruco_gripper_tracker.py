@@ -832,7 +832,7 @@ def parse_args() -> argparse.Namespace:
         help="JSON calibration/configuration file.",
     )
     parser.add_argument("--bind", default="0.0.0.0", help="Local address for the video UDP socket.")
-    parser.add_argument("--video-port", type=int, default=5560, help="ARPoseStreamer APV1/APV2 video UDP port.")
+    parser.add_argument("--video-port", type=int, default=5561, help="ARPoseStreamer 0.5x APV2 video UDP port.")
     parser.add_argument("--output-host", default="127.0.0.1", help="Gripper-distance destination address.")
     parser.add_argument("--output-port", type=int, default=5570, help="AGP1 JSON output UDP port.")
     parser.add_argument("--csv-log", type=Path, default=None, help="Optional tracking CSV path.")

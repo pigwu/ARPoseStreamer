@@ -139,7 +139,9 @@ continues on the phone.
 
 ## Low-Latency Video Stream
 
-The optional low-latency video stream uses a second UDP port, default `5560`, and carries H.264 NAL units without MP4/RTSP/WebRTC container overhead. New senders use `APV2`; receivers remain backward compatible with `APV1`.
+The original 1x low-latency video stream uses UDP port `5560`. A separate 0.5x ultra-wide APV2 stream for ArUco processing uses UDP port `5561` at approximately 10 FPS. Both carry H.264 NAL units without MP4/RTSP/WebRTC container overhead. New senders use `APV2`; receivers remain backward compatible with `APV1`.
+
+The 0.5x stream follows the research-only UMI-FT approach and reads ARKit's private ultra-wide `ARFrame` storage on supported iPhone Pro devices. It does not alter the primary `capturedImage`, preview, pose, or 1x recording. Because the fields are private API, this build is intended for development signing/sideloading rather than App Store distribution, and iOS updates may require compatibility changes.
 
 Common packet header layout:
 
@@ -190,7 +192,7 @@ Sender behavior:
 
 ## ArUco Gripper Distance Output (AGP1)
 
-The integrated monitor can detect two configured ArUco markers from each APV2 video frame and send one UTF-8 JSON datagram per processed frame, normally to UDP port `5570`. This path uses the APV2 camera intrinsics but does not use the AR pose stream or any robot base/TCP transform.
+The integrated monitor detects the two configured ArUco markers from the 0.5x APV2 stream on UDP `5561` and sends one UTF-8 JSON datagram per processed frame, normally to UDP port `5570`. This path uses the ultra-wide APV2 camera intrinsics but does not use the AR pose stream or any robot base/TCP transform.
 
 For a valid frame, `status` is `tracking_gripper_distance` and `gripper_distance` contains:
 

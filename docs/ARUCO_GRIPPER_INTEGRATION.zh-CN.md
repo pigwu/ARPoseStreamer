@@ -22,6 +22,10 @@ raw_width = abs(x_id1 - x_id0)
 
 ## 相机内参
 
+手机保留原有 ARKit 1× 画面、位姿、录像和 UDP `5560` 视频不变；ArUco 专用画面来自独立的 0.5× 超广角 APV2 流，默认使用 UDP `5561`、约 10 FPS。实验录像目录会同时保存主摄 MP4 和文件名带 `UltraWide` 的超广角 MP4。
+
+0.5× 取帧采用 UMI-FT 同款研究实现，读取 iPhone Pro 上 ARKit `ARFrame` 的私有超广角字段。因此 App 需要开发签名侧载，不能用于 App Store 发布；若 iOS 升级后私有字段改变，0.5× 会安全停止，原有 1× 路径仍继续工作。
+
 APV2 每帧携带 ARKit 提供的：
 
 ```text
@@ -50,6 +54,8 @@ python -m pip install -r requirements_visualizer.txt
 ```
 
 点击主窗口顶部 `Start Monitor`，再打开 `ArUco Gripper` 页签。
+
+顶部 `1x Video` 默认监听 `5560`，`0.5x ArUco` 默认监听 `5561`。ArUco 标定与逐帧测距只处理后者。
 
 ## 连续开合标定
 

@@ -2,7 +2,14 @@ import Foundation
 import ARKit
 import Network
 import CoreMedia
+import CoreVideo
 import simd
+
+private struct UltraWideFrameData {
+    let pixelBuffer: CVPixelBuffer
+    let timestamp: TimeInterval
+    let calibration: VideoCameraCalibration
+}
 
 final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     enum CoordinateSystem {
@@ -72,6 +79,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     var onTrackingStatusChange: ((String) -> Void)?
     var onVideoStateChange: ((String) -> Void)?
     var onVideoStatsChange: ((LowLatencyVideoStats) -> Void)?
+    var onUltraWideRecordingStatusChange: ((VideoRecordingStatus) -> Void)?
+    var onUltraWideVideoStateChange: ((String) -> Void)?
+    var onUltraWideVideoStatsChange: ((LowLatencyVideoStats) -> Void)?
 
     private let coordinateSystem: CoordinateSystem
     private let payloadEncoding: PayloadEncoding
@@ -80,15 +90,22 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     private let networkQueue = DispatchQueue(label: "umi.pose.udp", qos: .userInitiated)
     private let zUpAlignment = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0))
     private let videoRecorder = ARSessionVideoRecorder()
+    private let ultraWideVideoRecorder = ARSessionVideoRecorder(
+        fileNamePrefix: "ARPoseStreamer-UltraWide",
+        expectedFrameRate: 10
+    )
     private let poseSessionRecorder = PoseDataSessionRecorder()
     private let videoSender: ARLowLatencyVideoSender
+    private let ultraWideVideoSender: ARLowLatencyVideoSender
 
     private var host: NWEndpoint.Host
     private var port: NWEndpoint.Port
     private var videoConfiguration: LowLatencyVideoConfiguration
+    private var ultraWideVideoConfiguration: LowLatencyVideoConfiguration
     private var connection: NWConnection?
     private var originTransform: simd_float4x4?
     private var lastSentTimestamp: TimeInterval = -.infinity
+    private var lastUltraWideFrameTimestamp: TimeInterval = -.infinity
     private var sequenceNumber: UInt32 = 0
     private var shouldResetOriginOnNextFrame = true
     private var isConnectionReady = false
@@ -103,7 +120,8 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         port: UInt16 = 5555,
         coordinateSystem: CoordinateSystem = .zUpRightHanded,
         payloadEncoding: PayloadEncoding = .binaryFloat32,
-        videoConfiguration: LowLatencyVideoConfiguration = .defaults
+        videoConfiguration: LowLatencyVideoConfiguration = .defaults,
+        ultraWideVideoConfiguration: LowLatencyVideoConfiguration = .ultraWideDefaults
     ) {
         guard let udpPort = NWEndpoint.Port(rawValue: port) else {
             return nil
@@ -114,7 +132,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         self.coordinateSystem = coordinateSystem
         self.payloadEncoding = payloadEncoding
         self.videoConfiguration = videoConfiguration
+        self.ultraWideVideoConfiguration = ultraWideVideoConfiguration
         self.videoSender = ARLowLatencyVideoSender(configuration: videoConfiguration)
+        self.ultraWideVideoSender = ARLowLatencyVideoSender(configuration: ultraWideVideoConfiguration)
 
         super.init()
 
@@ -135,6 +155,15 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         videoSender.onError = { [weak self] error in
             self?.onError?(error)
         }
+        ultraWideVideoSender.onStateChange = { [weak self] state in
+            self?.onUltraWideVideoStateChange?(state)
+        }
+        ultraWideVideoSender.onStatsChange = { [weak self] stats in
+            self?.onUltraWideVideoStatsChange?(stats)
+        }
+        ultraWideVideoSender.onError = { [weak self] error in
+            self?.onError?(error)
+        }
         videoRecorder.onStatusChange = { [weak self] status in
             self?.arQueue.async {
                 guard let self else { return }
@@ -143,8 +172,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
                     self.poseSessionRecorder.attachVideo(url: url)
                 }
 
-                if status.isTerminal {
+                if case .failed = status, self.isRecordingEnabled {
                     self.isRecordingEnabled = false
+                    self.ultraWideVideoRecorder.cancelRecording(reason: "Primary 1x recording failed")
                     self.finishPoseSessionIfNeeded()
                     if !self.isStreamingEnabled {
                         self.pauseSessionIfNeeded()
@@ -152,8 +182,25 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
                 }
             }
 
+            if case .saved = status {
+                // The public recording state becomes terminal only after the
+                // 0.5x writer has also finished.
+            } else {
+                DispatchQueue.main.async {
+                    self?.onRecordingStatusChange?(status)
+                }
+            }
+        }
+        ultraWideVideoRecorder.onStatusChange = { [weak self] status in
+            self?.arQueue.async {
+                guard let self else { return }
+                if case .saved(let url) = status {
+                    self.poseSessionRecorder.attachUltraWideVideo(url: url)
+                }
+            }
+
             DispatchQueue.main.async {
-                self?.onRecordingStatusChange?(status)
+                self?.onUltraWideRecordingStatusChange?(status)
             }
         }
         poseSessionRecorder.onSessionSaved = { [weak self] artifact in
@@ -179,6 +226,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             guard let self else { return }
             self.isStreamingEnabled = true
             self.videoSender.startStreaming()
+            self.ultraWideVideoSender.startStreaming()
             self.startSessionIfNeeded()
         }
     }
@@ -198,6 +246,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             guard let self else { return }
             self.isStreamingEnabled = false
             self.videoSender.stopStreaming()
+            self.ultraWideVideoSender.stopStreaming()
             if !self.isRecordingEnabled {
                 self.pauseSessionIfNeeded()
             }
@@ -245,6 +294,14 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         }
     }
 
+    func updateUltraWideVideoStreamingConfiguration(_ configuration: LowLatencyVideoConfiguration) {
+        arQueue.async { [weak self] in
+            guard let self else { return }
+            self.ultraWideVideoConfiguration = configuration
+            self.ultraWideVideoSender.updateConfiguration(configuration)
+        }
+    }
+
     func resetOrigin() {
         arQueue.async { [weak self] in
             self?.originTransform = nil
@@ -284,6 +341,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             )
             self.ensurePoseSession()
             self.videoRecorder.startRecording()
+            self.ultraWideVideoRecorder.startRecording()
             self.startSessionIfNeeded()
             self.failRecordingIfFirstFrameDoesNotArrive(attemptID: attemptID)
         }
@@ -298,12 +356,52 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
                 unixTime: stopUnixTime,
                 monotonicTime: stopMonotonicTime
             )
-            self.videoRecorder.stopRecording { [weak self] _ in
-                guard let self else { return }
+            let recorders = DispatchGroup()
+            var primaryFinalStatus: VideoRecordingStatus?
+            var ultraWideFinalStatus: VideoRecordingStatus?
 
+            recorders.enter()
+            self.videoRecorder.stopRecording { [weak self] status in
+                guard let self else {
+                    recorders.leave()
+                    return
+                }
                 self.arQueue.async {
-                    if !self.isStreamingEnabled {
-                        self.pauseSessionIfNeeded()
+                    primaryFinalStatus = status
+                    if case .saved(let url) = status {
+                        self.poseSessionRecorder.attachVideo(url: url)
+                    }
+                    recorders.leave()
+                }
+            }
+
+            recorders.enter()
+            self.ultraWideVideoRecorder.stopRecording { [weak self] status in
+                guard let self else {
+                    recorders.leave()
+                    return
+                }
+                self.arQueue.async {
+                    ultraWideFinalStatus = status
+                    if case .saved(let url) = status {
+                        self.poseSessionRecorder.attachUltraWideVideo(url: url)
+                    }
+                    recorders.leave()
+                }
+            }
+
+            recorders.notify(queue: self.arQueue) { [weak self] in
+                guard let self else { return }
+                if let ultraWideFinalStatus, case .failed(let message) = ultraWideFinalStatus {
+                    self.poseSessionRecorder.addWarning("0.5x recording failed: \(message)")
+                }
+                self.finishPoseSessionIfNeeded()
+                if !self.isStreamingEnabled {
+                    self.pauseSessionIfNeeded()
+                }
+                if let primaryFinalStatus, case .saved(let url) = primaryFinalStatus {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onRecordingStatusChange?(.saved(url))
                     }
                 }
             }
@@ -325,13 +423,40 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             imageWidth: UInt16(clamping: Int(imageResolution.width.rounded())),
             imageHeight: UInt16(clamping: Int(imageResolution.height.rounded()))
         )
+        let ultraWideFrame: UltraWideFrameData?
+        if
+            let ultraWideImage = frame.capturedUltraWideImage,
+            let ultraWideCamera = frame.ultraWideCamera
+        {
+            let ultraWideIntrinsics = ultraWideCamera.intrinsics
+            let ultraWideWidth = CVPixelBufferGetWidth(ultraWideImage)
+            let ultraWideHeight = CVPixelBufferGetHeight(ultraWideImage)
+            let calibrationResolution = ultraWideCamera.imageResolution
+            let scaleX = Float(ultraWideWidth) / max(Float(calibrationResolution.width), 1)
+            let scaleY = Float(ultraWideHeight) / max(Float(calibrationResolution.height), 1)
+            ultraWideFrame = UltraWideFrameData(
+                pixelBuffer: ultraWideImage,
+                timestamp: frame.ultraWideImageTimestamp ?? frameTimestamp,
+                calibration: VideoCameraCalibration(
+                    fx: ultraWideIntrinsics.columns.0.x * scaleX,
+                    fy: ultraWideIntrinsics.columns.1.y * scaleY,
+                    cx: ultraWideIntrinsics.columns.2.x * scaleX,
+                    cy: ultraWideIntrinsics.columns.2.y * scaleY,
+                    imageWidth: UInt16(clamping: ultraWideWidth),
+                    imageHeight: UInt16(clamping: ultraWideHeight)
+                )
+            )
+        } else {
+            ultraWideFrame = nil
+        }
 
         arQueue.async { [weak self] in
             self?.processFrame(
                 transform: cameraTransform,
                 pixelBuffer: capturedImage,
                 frameTimestamp: frameTimestamp,
-                videoCalibration: videoCalibration
+                videoCalibration: videoCalibration,
+                ultraWideFrame: ultraWideFrame
             )
         }
     }
@@ -434,7 +559,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             guard let self else { return }
             self.isSessionRunning = false
             self.videoSender.stopStreaming()
+            self.ultraWideVideoSender.stopStreaming()
             self.videoRecorder.cancelRecording(reason: "AR session failed: \(error.localizedDescription)")
+            self.ultraWideVideoRecorder.cancelRecording(reason: "AR session failed: \(error.localizedDescription)")
             self.reportTrackingStatus("AR failed: \(error.localizedDescription)")
         }
     }
@@ -444,7 +571,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             guard let self else { return }
             self.isSessionRunning = false
             self.videoSender.stopStreaming()
+            self.ultraWideVideoSender.stopStreaming()
             self.videoRecorder.cancelRecording(reason: "AR session interrupted")
+            self.ultraWideVideoRecorder.cancelRecording(reason: "AR session interrupted")
             self.reportTrackingStatus("AR interrupted")
         }
     }
@@ -456,6 +585,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             if self.isStreamingEnabled || self.isRecordingEnabled {
                 if self.isStreamingEnabled {
                     self.videoSender.startStreaming()
+                    self.ultraWideVideoSender.startStreaming()
                 }
                 self.startSessionIfNeeded()
             } else {
@@ -468,7 +598,8 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         transform: simd_float4x4,
         pixelBuffer: CVPixelBuffer,
         frameTimestamp: TimeInterval,
-        videoCalibration: VideoCameraCalibration
+        videoCalibration: VideoCameraCalibration,
+        ultraWideFrame: UltraWideFrameData?
     ) {
         if shouldResetOriginOnNextFrame || originTransform == nil {
             originTransform = transform
@@ -504,6 +635,35 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         if isRecordingEnabled {
             poseSessionRecorder.markVideoStarted(frameTimestamp: frameTimestamp)
             videoRecorder.appendFrame(pixelBuffer: pixelBuffer, at: presentationTime)
+        }
+
+        if
+            let ultraWideFrame,
+            ultraWideFrame.timestamp > lastUltraWideFrameTimestamp + 0.000_001
+        {
+            lastUltraWideFrameTimestamp = ultraWideFrame.timestamp
+            let ultraWidePresentationTime = CMTime(
+                seconds: ultraWideFrame.timestamp,
+                preferredTimescale: 600
+            )
+
+            if isRecordingEnabled {
+                poseSessionRecorder.markUltraWideVideoStarted(frameTimestamp: ultraWideFrame.timestamp)
+                ultraWideVideoRecorder.appendFrame(
+                    pixelBuffer: ultraWideFrame.pixelBuffer,
+                    at: ultraWidePresentationTime
+                )
+            }
+
+            if isStreamingEnabled && ultraWideVideoConfiguration.isEnabled {
+                let ultraWideCaptureUnixTime = sample.timestamp + ultraWideFrame.timestamp - frameTimestamp
+                ultraWideVideoSender.appendFrame(
+                    pixelBuffer: ultraWideFrame.pixelBuffer,
+                    presentationTimeStamp: ultraWidePresentationTime,
+                    captureTimestamp: ultraWideCaptureUnixTime,
+                    cameraCalibration: ultraWideFrame.calibration
+                )
+            }
         }
 
         if isStreamingEnabled && videoConfiguration.isEnabled {

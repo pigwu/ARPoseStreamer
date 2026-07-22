@@ -10,6 +10,7 @@ struct PoseCaptureArtifact {
     let senderTransportCSVURL: URL?
     let manifestURL: URL
     let videoURL: URL?
+    let ultraWideVideoURL: URL?
     let warning: String?
 }
 
@@ -25,12 +26,14 @@ private struct PoseCaptureManifest: Codable {
     let magneticCSVFileName: String?
     let senderTransportCSVFileName: String?
     let videoFileName: String?
+    let ultraWideVideoFileName: String?
     let sessionStartFrameTime: TimeInterval
     let magneticStartOffsetSeconds: TimeInterval?
     let poseSampleCount: Int
     let magneticSampleCount: Int
     let senderTransportSampleCount: Int
     let videoStartOffsetSeconds: TimeInterval?
+    let ultraWideVideoStartOffsetSeconds: TimeInterval?
 }
 
 final class PoseDataSessionRecorder {
@@ -42,16 +45,18 @@ final class PoseDataSessionRecorder {
     private var magneticCSVURL: URL?
     private var senderTransportCSVURL: URL?
     private var videoURL: URL?
+    private var ultraWideVideoURL: URL?
     private var fileHandle: FileHandle?
     private var magneticFileHandle: FileHandle?
     private var senderTransportFileHandle: FileHandle?
     private var sessionStartFrameTime: TimeInterval?
     private var firstMagneticMonotonicTime: TimeInterval?
     private var videoStartFrameTime: TimeInterval?
+    private var ultraWideVideoStartFrameTime: TimeInterval?
     private var creationTime: Date?
     private var experimentStopUnixTime: TimeInterval?
     private var experimentStopMonotonicTime: TimeInterval?
-    private var lastVideoArchiveWarning: String?
+    private var videoArchiveWarnings: [String] = []
     private var sampleCount = 0
     private var magneticSampleCount = 0
     private var senderTransportSampleCount = 0
@@ -213,6 +218,21 @@ final class PoseDataSessionRecorder {
         videoURL = url
     }
 
+    func markUltraWideVideoStarted(frameTimestamp: TimeInterval) {
+        if ultraWideVideoStartFrameTime == nil {
+            ultraWideVideoStartFrameTime = frameTimestamp
+        }
+    }
+
+    func attachUltraWideVideo(url: URL?) {
+        ultraWideVideoURL = url
+    }
+
+    func addWarning(_ message: String) {
+        guard !message.isEmpty else { return }
+        videoArchiveWarnings.append(message)
+    }
+
     func finishSession() {
         guard
             let sessionDirectoryURL,
@@ -224,7 +244,7 @@ final class PoseDataSessionRecorder {
             return
         }
 
-        guard sampleCount > 0 || magneticSampleCount > 0 || videoURL != nil else {
+        guard sampleCount > 0 || magneticSampleCount > 0 || videoURL != nil || ultraWideVideoURL != nil else {
             reset(deleteSessionDirectory: true)
             return
         }
@@ -233,14 +253,18 @@ final class PoseDataSessionRecorder {
         try? magneticFileHandle?.close()
         try? senderTransportFileHandle?.close()
 
-        lastVideoArchiveWarning = nil
-        let archivedVideoURL = archiveVideoIfNeeded(videoURL, into: sessionDirectoryURL)
+        let archivedVideoURL = archiveVideoIfNeeded(videoURL, into: sessionDirectoryURL, label: "1x video")
+        let archivedUltraWideVideoURL = archiveVideoIfNeeded(
+            ultraWideVideoURL,
+            into: sessionDirectoryURL,
+            label: "0.5x ultra-wide video"
+        )
         let manifestSessionStartFrameTime = sessionStartFrameTime ?? firstMagneticMonotonicTime ?? videoStartFrameTime ?? 0
         let stopUnixTime = experimentStopUnixTime ?? Date().timeIntervalSince1970
         let stopMonotonicTime = experimentStopMonotonicTime ?? ProcessInfo.processInfo.systemUptime
 
         let manifest = PoseCaptureManifest(
-            schemaVersion: 2,
+            schemaVersion: 3,
             experimentID: experimentID.uuidString,
             createdAtUnixTime: creationTime.timeIntervalSince1970,
             experimentStartUnixTime: creationTime.timeIntervalSince1970,
@@ -251,12 +275,16 @@ final class PoseDataSessionRecorder {
             magneticCSVFileName: magneticCSVURL?.lastPathComponent,
             senderTransportCSVFileName: senderTransportCSVURL?.lastPathComponent,
             videoFileName: archivedVideoURL?.lastPathComponent,
+            ultraWideVideoFileName: archivedUltraWideVideoURL?.lastPathComponent,
             sessionStartFrameTime: manifestSessionStartFrameTime,
             magneticStartOffsetSeconds: firstMagneticMonotonicTime.map { $0 - manifestSessionStartFrameTime },
             poseSampleCount: sampleCount,
             magneticSampleCount: magneticSampleCount,
             senderTransportSampleCount: senderTransportSampleCount,
-            videoStartOffsetSeconds: videoStartFrameTime.map { $0 - manifestSessionStartFrameTime }
+            videoStartOffsetSeconds: videoStartFrameTime.map { $0 - manifestSessionStartFrameTime },
+            ultraWideVideoStartOffsetSeconds: ultraWideVideoStartFrameTime.map {
+                $0 - manifestSessionStartFrameTime
+            }
         )
 
         let manifestURL = sessionDirectoryURL.appendingPathComponent("capture_manifest.json")
@@ -274,7 +302,8 @@ final class PoseDataSessionRecorder {
                 senderTransportCSVURL: senderTransportCSVURL,
                 manifestURL: manifestURL,
                 videoURL: archivedVideoURL,
-                warning: lastVideoArchiveWarning
+                ultraWideVideoURL: archivedUltraWideVideoURL,
+                warning: videoArchiveWarnings.isEmpty ? nil : videoArchiveWarnings.joined(separator: "; ")
             )
         )
 
@@ -325,14 +354,18 @@ final class PoseDataSessionRecorder {
         }
     }
 
-    private func archiveVideoIfNeeded(_ sourceURL: URL?, into sessionDirectoryURL: URL) -> URL? {
+    private func archiveVideoIfNeeded(
+        _ sourceURL: URL?,
+        into sessionDirectoryURL: URL,
+        label: String
+    ) -> URL? {
         guard let sourceURL else { return nil }
 
         let fileManager = FileManager.default
         let destinationURL = sessionDirectoryURL.appendingPathComponent(sourceURL.lastPathComponent)
 
         guard let sourceSize = Self.usableRegularFileSize(sourceURL) else {
-            lastVideoArchiveWarning = "Video file is missing or empty: \(sourceURL.lastPathComponent)"
+            videoArchiveWarnings.append("\(label) is missing or empty: \(sourceURL.lastPathComponent)")
             return nil
         }
 
@@ -348,14 +381,16 @@ final class PoseDataSessionRecorder {
             try fileManager.copyItem(at: sourceURL, to: destinationURL)
             guard Self.usableRegularFileSize(destinationURL) == sourceSize else {
                 try? fileManager.removeItem(at: destinationURL)
-                lastVideoArchiveWarning = "Copied video size check failed: \(sourceURL.lastPathComponent)"
+                videoArchiveWarnings.append("\(label) copy size check failed: \(sourceURL.lastPathComponent)")
                 return nil
             }
 
             try? fileManager.removeItem(at: sourceURL)
             return destinationURL
         } catch {
-            lastVideoArchiveWarning = "Could not archive video \(sourceURL.lastPathComponent): \(error.localizedDescription)"
+            videoArchiveWarnings.append(
+                "Could not archive \(label) \(sourceURL.lastPathComponent): \(error.localizedDescription)"
+            )
             return nil
         }
     }
@@ -372,16 +407,18 @@ final class PoseDataSessionRecorder {
         magneticCSVURL = nil
         senderTransportCSVURL = nil
         videoURL = nil
+        ultraWideVideoURL = nil
         fileHandle = nil
         magneticFileHandle = nil
         senderTransportFileHandle = nil
         sessionStartFrameTime = nil
         firstMagneticMonotonicTime = nil
         videoStartFrameTime = nil
+        ultraWideVideoStartFrameTime = nil
         creationTime = nil
         experimentStopUnixTime = nil
         experimentStopMonotonicTime = nil
-        lastVideoArchiveWarning = nil
+        videoArchiveWarnings = []
         sampleCount = 0
         magneticSampleCount = 0
         senderTransportSampleCount = 0

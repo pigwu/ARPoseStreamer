@@ -240,6 +240,21 @@ final class PositionViewModel: ObservableObject {
             applySenderConfigurationIfNeeded()
         }
     }
+    @Published var isUltraWideVideoStreamingEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                isUltraWideVideoStreamingEnabled,
+                forKey: Self.isUltraWideVideoStreamingEnabledKey
+            )
+            applySenderConfigurationIfNeeded()
+        }
+    }
+    @Published var ultraWideVideoPort: String {
+        didSet {
+            UserDefaults.standard.set(ultraWideVideoPort, forKey: Self.ultraWideVideoPortKey)
+            applySenderConfigurationIfNeeded()
+        }
+    }
     @Published var showPositionChart: Bool {
         didSet { UserDefaults.standard.set(showPositionChart, forKey: Self.showPositionChartKey) }
     }
@@ -266,6 +281,8 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var magneticStats = MagneticGatewayStats()
     @Published private(set) var videoStatus = "Video off"
     @Published private(set) var videoStats = VideoStreamStatsViewState.idle
+    @Published private(set) var ultraWideVideoStatus = "0.5x video off"
+    @Published private(set) var ultraWideVideoStats = VideoStreamStatsViewState.idle
     @Published private(set) var connectedAccessories: [WiredSensorAccessoryInfo] = []
     @Published private(set) var recordingStatus = VideoRecordingStatus.idle.message
     @Published private(set) var recordingPhase = VideoRecordingStatus.idle
@@ -276,6 +293,8 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var isRecordingVideo = false
     @Published private(set) var lastSavedVideoURL: URL?
     @Published private(set) var lastSavedVideoName = "No saved video yet"
+    @Published private(set) var lastSavedUltraWideVideoURL: URL?
+    @Published private(set) var lastSavedUltraWideVideoName = "No saved 0.5x video yet"
     @Published private(set) var lastCaptureSessionName = "No capture exported yet"
     @Published private(set) var lastSensorLogName = "No sensor log yet"
     @Published private(set) var captureRecords: [CaptureRecord] = []
@@ -301,7 +320,7 @@ final class PositionViewModel: ObservableObject {
     }
 
     var videoTargetSummary: String {
-        "Low-latency video at \(hostIP):\(videoPort)"
+        "1x at \(hostIP):\(videoPort); 0.5x ArUco at \(hostIP):\(ultraWideVideoPort)"
     }
 
     var videoAccessHint: String {
@@ -420,11 +439,20 @@ final class PositionViewModel: ObservableObject {
         videoFrameRate = defaults.string(forKey: Self.videoFrameRateKey) ?? "60"
         videoBitrateMbps = defaults.string(forKey: Self.videoBitrateKey) ?? "6.0"
         videoResolution = VideoStreamResolution(rawValue: defaults.string(forKey: Self.videoResolutionKey) ?? VideoStreamResolution.hd720p.rawValue) ?? .hd720p
+        isUltraWideVideoStreamingEnabled = Self.storedBool(
+            defaults,
+            key: Self.isUltraWideVideoStreamingEnabledKey,
+            fallback: true
+        )
+        ultraWideVideoPort = defaults.string(forKey: Self.ultraWideVideoPortKey) ?? "5561"
         showPositionChart = Self.storedBool(defaults, key: Self.showPositionChartKey, fallback: true)
         captureRecords = captureLibraryStore.loadRecords().sorted { $0.createdAt > $1.createdAt }
         videoStatus = isVideoStreamingEnabled ? "Video ready" : "Video off"
         videoStats = VideoStreamStatsViewState()
         videoStats.state = videoStatus
+        ultraWideVideoStatus = isUltraWideVideoStreamingEnabled ? "0.5x video ready" : "0.5x video off"
+        ultraWideVideoStats = VideoStreamStatsViewState()
+        ultraWideVideoStats.state = ultraWideVideoStatus
 
         configureSender()
         configureMagneticGateway()
@@ -446,6 +474,7 @@ final class PositionViewModel: ObservableObject {
         } else {
             sender?.updateDestination(hostIP: hostIP, port: port)
             sender?.updateVideoStreamingConfiguration(makeVideoConfiguration())
+            sender?.updateUltraWideVideoStreamingConfiguration(makeUltraWideVideoConfiguration())
         }
 
         startMagneticSensor()
@@ -454,8 +483,15 @@ final class PositionViewModel: ObservableObject {
         }
         sender?.start()
         isSending = true
-        if isVideoStreamingEnabled {
-            sendStatus = "Streaming pose to \(hostIP):\(port) and video to \(hostIP):\(normalizedPort(videoPort) ?? 5560)"
+        if isVideoStreamingEnabled || isUltraWideVideoStreamingEnabled {
+            var destinations: [String] = []
+            if isVideoStreamingEnabled {
+                destinations.append("1x video :\(normalizedPort(videoPort) ?? 5560)")
+            }
+            if isUltraWideVideoStreamingEnabled {
+                destinations.append("0.5x ArUco :\(normalizedPort(ultraWideVideoPort) ?? 5561)")
+            }
+            sendStatus = "Streaming pose to \(hostIP):\(port); \(destinations.joined(separator: ", "))"
         } else {
             sendStatus = "Streaming pose to \(hostIP):\(port)"
         }
@@ -609,6 +645,7 @@ final class PositionViewModel: ObservableObject {
         }
 
         sender?.updateVideoStreamingConfiguration(makeVideoConfiguration())
+        sender?.updateUltraWideVideoStreamingConfiguration(makeUltraWideVideoConfiguration())
         sender?.startPreview()
         if autoStartMagneticSensor {
             startMagneticSensor()
@@ -730,6 +767,11 @@ final class PositionViewModel: ObservableObject {
             if let videoURL = captureLibraryStore.videoFileState(for: record).uploadURL {
                 experimentDescriptors.append(UploadDescriptor(fileURL: videoURL, component: "video"))
             }
+            if let ultraWideVideoURL = captureLibraryStore.urlForUltraWideVideo(record: record) {
+                experimentDescriptors.append(
+                    UploadDescriptor(fileURL: ultraWideVideoURL, component: "ultrawide_video")
+                )
+            }
             experimentDescriptors.append(
                 UploadDescriptor(fileURL: captureLibraryStore.urlForManifest(record: record), component: "manifest")
             )
@@ -807,7 +849,8 @@ final class PositionViewModel: ObservableObject {
         let newSender = ARPoseUDPSender(
             hostIP: hostIP,
             port: senderPort,
-            videoConfiguration: makeVideoConfiguration()
+            videoConfiguration: makeVideoConfiguration(),
+            ultraWideVideoConfiguration: makeUltraWideVideoConfiguration()
         )
         sender = newSender
 
@@ -866,6 +909,29 @@ final class PositionViewModel: ObservableObject {
             }
         }
 
+        newSender?.onUltraWideVideoStateChange = { [weak self] state in
+            Task { @MainActor [weak self] in
+                self?.ultraWideVideoStatus = state
+                self?.ultraWideVideoStats.state = state
+            }
+        }
+
+        newSender?.onUltraWideVideoStatsChange = { [weak self] stats in
+            Task { @MainActor [weak self] in
+                self?.ultraWideVideoStats = VideoStreamStatsViewState(from: stats)
+                self?.ultraWideVideoStatus = stats.state
+            }
+        }
+
+        newSender?.onUltraWideRecordingStatusChange = { [weak self] status in
+            Task { @MainActor [weak self] in
+                if case .saved(let url) = status {
+                    self?.lastSavedUltraWideVideoURL = url
+                    self?.lastSavedUltraWideVideoName = url.lastPathComponent
+                }
+            }
+        }
+
         newSender?.onRecordingStatusChange = { [weak self] status in
             Task { @MainActor [weak self] in
                 self?.recordingStatus = status.message
@@ -911,6 +977,10 @@ final class PositionViewModel: ObservableObject {
                 }
                 if let warning = artifact.warning {
                     self.recordingStatus = warning
+                }
+                if let ultraWideVideoURL = artifact.ultraWideVideoURL {
+                    self.lastSavedUltraWideVideoURL = ultraWideVideoURL
+                    self.lastSavedUltraWideVideoName = ultraWideVideoURL.lastPathComponent
                 }
             }
         }
@@ -1116,6 +1186,7 @@ final class PositionViewModel: ObservableObject {
         }
 
         sender.updateVideoStreamingConfiguration(makeVideoConfiguration())
+        sender.updateUltraWideVideoStreamingConfiguration(makeUltraWideVideoConfiguration())
     }
 
     private func makeVideoConfiguration() -> LowLatencyVideoConfiguration {
@@ -1126,6 +1197,17 @@ final class PositionViewModel: ObservableObject {
             resolution: videoResolution,
             frameRate: Int(videoFrameRate) ?? LowLatencyVideoConfiguration.defaults.frameRate,
             bitrateMbps: Double(videoBitrateMbps) ?? LowLatencyVideoConfiguration.defaults.bitrateMbps
+        )
+    }
+
+    private func makeUltraWideVideoConfiguration() -> LowLatencyVideoConfiguration {
+        LowLatencyVideoConfiguration(
+            isEnabled: isUltraWideVideoStreamingEnabled,
+            hostIP: hostIP,
+            port: normalizedPort(ultraWideVideoPort) ?? LowLatencyVideoConfiguration.ultraWideDefaults.port,
+            resolution: .sd480p,
+            frameRate: 10,
+            bitrateMbps: 3.0
         )
     }
 
@@ -1209,5 +1291,7 @@ final class PositionViewModel: ObservableObject {
     private static let videoFrameRateKey = "ARPoseStreamer.video.frameRate"
     private static let videoBitrateKey = "ARPoseStreamer.video.bitrateMbps"
     private static let videoResolutionKey = "ARPoseStreamer.video.resolution"
+    private static let isUltraWideVideoStreamingEnabledKey = "ARPoseStreamer.video.ultrawide.enabled"
+    private static let ultraWideVideoPortKey = "ARPoseStreamer.video.ultrawide.port"
     private static let showPositionChartKey = "ARPoseStreamer.showPositionChart"
 }
