@@ -2,12 +2,14 @@ import csv
 import http.client
 import json
 import math
+import socket
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
 import zarr
+from PyQt6.QtCore import Qt
 
 from capture_upload_server import (
     UploadHandler,
@@ -18,6 +20,7 @@ from capture_upload_server import (
 )
 from experiment_data import ExperimentDataset, discover_experiments
 from experiment_replay_ui import (
+    CombinedReceiverThread,
     ReceiverDiagnosticsRecorder,
     _relative_magnetic_magnitudes,
     decode_remote_recording_ack,
@@ -198,6 +201,56 @@ class ExperimentWorkflowTests(unittest.TestCase):
                 b"PC_RECORD_ACK,1,request-42,START,OK,unknown\n"
             )
         )
+
+    def test_remote_recording_uses_a_dedicated_control_socket(self) -> None:
+        phone_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        phone_socket.bind(("127.0.0.1", 0))
+        phone_socket.settimeout(5.0)
+        registration_port = int(phone_socket.getsockname()[1])
+
+        port_reservation = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        port_reservation.bind(("127.0.0.1", 0))
+        combined_port = int(port_reservation.getsockname()[1])
+        port_reservation.close()
+
+        acknowledgements: list[dict] = []
+        acknowledgement_received = threading.Event()
+        worker = CombinedReceiverThread(
+            "127.0.0.1",
+            combined_port,
+            "127.0.0.1",
+            registration_port,
+            5560,
+        )
+        worker.recording_ack_ready.connect(
+            lambda acknowledgement: (
+                acknowledgements.append(acknowledgement),
+                acknowledgement_received.set(),
+            ),
+            Qt.ConnectionType.DirectConnection,
+        )
+
+        try:
+            worker.start()
+            request_id = worker.request_recording_action("STATUS")
+            command_source_port = None
+            while command_source_port is None:
+                datagram, address = phone_socket.recvfrom(4096)
+                if datagram.startswith(b"PC_RECORD,"):
+                    command_source_port = int(address[1])
+                    phone_socket.sendto(
+                        f"PC_RECORD_ACK,1,{request_id},STATUS,OK,idle\n".encode("ascii"),
+                        address,
+                    )
+
+            self.assertNotEqual(command_source_port, combined_port)
+            self.assertTrue(acknowledgement_received.wait(2.0))
+            self.assertEqual(acknowledgements[0]["request_id"], request_id)
+            self.assertEqual(acknowledgements[0]["state"], "idle")
+        finally:
+            worker.stop()
+            worker.wait(2000)
+            phone_socket.close()
 
     def test_legacy_magnetic_time_is_aligned_from_manifest(self) -> None:
         folder = self.root / "legacy"

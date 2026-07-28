@@ -6,6 +6,7 @@ import json
 import math
 import os
 import queue
+import select
 import shutil
 import socket
 import sys
@@ -447,26 +448,34 @@ class CombinedReceiverThread(QThread):
         return request_id
 
     def run(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        combined_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if sys.platform != "win32":
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            combined_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            control_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind((self.bind_host, self.port))
+            combined_socket.bind((self.bind_host, self.port))
+            control_socket.bind((self.bind_host, 0))
         except OSError as exc:
             self.status_changed.emit(f"Combined bind failed: {exc}")
-            sock.close()
+            combined_socket.close()
+            control_socket.close()
             return
-        sock.settimeout(0.2)
+        combined_socket.setblocking(False)
+        control_socket.setblocking(False)
         hello = f"PC_HELLO,1,{self.port},{self.video_port}\n".encode("ascii")
         next_hello = 0.0
-        self.status_changed.emit(f"Combined sensor listening {self.bind_host}:{self.port}")
+        control_port = int(control_socket.getsockname()[1])
+        self.status_changed.emit(
+            f"Combined sensor listening {self.bind_host}:{self.port}; control UDP {control_port}"
+        )
 
         try:
             while self.running:
                 now = time.monotonic()
                 if self.phone_ip and now >= next_hello:
                     try:
-                        sock.sendto(hello, (self.phone_ip, self.registration_port))
+                        control_socket.sendto(hello, (self.phone_ip, self.registration_port))
                     except OSError:
                         pass
                     next_hello = now + 2.0
@@ -477,57 +486,67 @@ class CombinedReceiverThread(QThread):
                         except queue.Empty:
                             break
                         try:
-                            sock.sendto(payload, (self.phone_ip, self.registration_port))
+                            control_socket.sendto(payload, (self.phone_ip, self.registration_port))
                         except OSError:
                             pass
                 try:
-                    datagram, address = sock.recvfrom(65535)
-                except socket.timeout:
-                    continue
+                    readable, _, _ = select.select(
+                        (combined_socket, control_socket),
+                        (),
+                        (),
+                        0.2,
+                    )
                 except OSError:
                     break
 
-                receive_wall = time.time()
-                receive_mono = time.monotonic()
-                acknowledgement = decode_remote_recording_ack(datagram)
-                if acknowledgement is not None:
-                    acknowledgement["source"] = f"{address[0]}:{address[1]}"
-                    acknowledgement["received_at"] = str(receive_wall)
-                    self.recording_ack_ready.emit(acknowledgement)
-                    continue
-                try:
-                    packet = decode_apm1_packet(datagram)
-                except APM1DecodeError:
-                    continue
+                for current_socket in readable:
+                    try:
+                        datagram, address = current_socket.recvfrom(65535)
+                    except OSError:
+                        continue
 
-                latency = self.clock.observe(
-                    packet.phone_send_unix,
-                    receive_wall,
-                    receive_mono,
-                    is_pose_reference=True,
-                )
-                self.packet_times.append(receive_mono)
-                while self.packet_times and receive_mono - self.packet_times[0] > 1.0:
-                    self.packet_times.popleft()
-                offset = self.clock.offset_seconds
-                latest_magnetic = packet.magnetic_samples[-1] if packet.magnetic_samples else None
-                metrics = {
-                    "status": f"Combined from {address[0]}:{address[1]}",
-                    "session_id": str(packet.session_id),
-                    "packet_sequence": packet.packet_sequence,
-                    "sender_timestamp": packet.phone_send_unix,
-                    "receive_wall_time": receive_wall,
-                    "raw_latency_ms": (receive_wall - packet.phone_send_unix) * 1000.0,
-                    "latency_ms": latency,
-                    "clock_offset_ms": offset * 1000.0 if offset is not None else None,
-                    "fps": float(len(self.packet_times)),
-                    "magnetic_count": len(packet.magnetic_samples),
-                    "chips": latest_magnetic.sensors() if latest_magnetic else (),
-                    "magnetic_sequence": latest_magnetic.sequence if latest_magnetic else None,
-                }
-                self.metrics_ready.emit(metrics)
+                    receive_wall = time.time()
+                    receive_mono = time.monotonic()
+                    acknowledgement = decode_remote_recording_ack(datagram)
+                    if acknowledgement is not None:
+                        acknowledgement["source"] = f"{address[0]}:{address[1]}"
+                        acknowledgement["received_at"] = str(receive_wall)
+                        self.recording_ack_ready.emit(acknowledgement)
+                        continue
+                    try:
+                        packet = decode_apm1_packet(datagram)
+                    except APM1DecodeError:
+                        continue
+
+                    latency = self.clock.observe(
+                        packet.phone_send_unix,
+                        receive_wall,
+                        receive_mono,
+                        is_pose_reference=True,
+                    )
+                    self.packet_times.append(receive_mono)
+                    while self.packet_times and receive_mono - self.packet_times[0] > 1.0:
+                        self.packet_times.popleft()
+                    offset = self.clock.offset_seconds
+                    latest_magnetic = packet.magnetic_samples[-1] if packet.magnetic_samples else None
+                    metrics = {
+                        "status": f"Combined from {address[0]}:{address[1]}",
+                        "session_id": str(packet.session_id),
+                        "packet_sequence": packet.packet_sequence,
+                        "sender_timestamp": packet.phone_send_unix,
+                        "receive_wall_time": receive_wall,
+                        "raw_latency_ms": (receive_wall - packet.phone_send_unix) * 1000.0,
+                        "latency_ms": latency,
+                        "clock_offset_ms": offset * 1000.0 if offset is not None else None,
+                        "fps": float(len(self.packet_times)),
+                        "magnetic_count": len(packet.magnetic_samples),
+                        "chips": latest_magnetic.sensors() if latest_magnetic else (),
+                        "magnetic_sequence": latest_magnetic.sequence if latest_magnetic else None,
+                    }
+                    self.metrics_ready.emit(metrics)
         finally:
-            sock.close()
+            combined_socket.close()
+            control_socket.close()
             self.status_changed.emit("Combined sensor stopped")
 
 
