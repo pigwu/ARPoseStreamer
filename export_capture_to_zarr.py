@@ -366,14 +366,6 @@ def build_episode(
             f"(abs threshold {MAGNET_ABNORMAL_ABS_THRESHOLD:g})"
     )
     magnet_xyz = cleaned_magnet_xyz
-    processed_chip_count = int(magnet_xyz.shape[2])
-    processed_magnetic_txyz = np.zeros_like(magnetic_txyz, dtype=np.float32)
-    processed_magnetic_valid = np.zeros_like(magnetic_valid, dtype=bool)
-    processed_magnetic_txyz[:, :processed_chip_count, 0] = magnetic_txyz[:, :processed_chip_count, 0]
-    processed_magnetic_txyz[:, :processed_chip_count, 1:4] = magnet_xyz[:, 0, :, :]
-    processed_magnetic_valid[:, :processed_chip_count] = magnetic_valid[:, :processed_chip_count]
-    magnetic_txyz = processed_magnetic_txyz
-    magnetic_valid = processed_magnetic_valid
 
     data = {
         "camera0_rgb": camera_rgb,
