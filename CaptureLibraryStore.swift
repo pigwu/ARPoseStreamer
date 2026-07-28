@@ -109,7 +109,8 @@ final class CaptureLibraryStore {
             experimentUploadedAt: nil
         )
 
-        records.insert(record, at: 0)
+        records.append(record)
+        records.sort { $0.createdAt > $1.createdAt }
         save(records: records)
         return record
     }

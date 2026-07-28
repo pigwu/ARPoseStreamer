@@ -743,6 +743,7 @@ class ExperimentMonitorWindow(QMainWindow):
         self.remote_recording_state_updated_at = 0.0
         self.remote_recording_last_ack_at: float | None = None
         self.remote_recording_monitor_started_at: float | None = None
+        self.remote_recording_experiment_id: str | None = None
         self.plot_cursors = []
         self._build_ui()
         self.timer = QTimer(self)
@@ -1305,16 +1306,21 @@ class ExperimentMonitorWindow(QMainWindow):
         result = str(acknowledgement.get("result", "REJECTED"))
         action = str(acknowledgement.get("action", requested_action))
         self.remote_recording_state = state
+        if state == "idle":
+            self.remote_recording_experiment_id = None
         if action != "STATUS":
             self.remote_recording_state_updated_at = now
 
         if result == "OK":
-            message = {
-                "idle": "Phone ready; capture is idle",
-                "recording": "Recording synchronized experiment on phone",
-                "saving": "Phone is saving and uploading the experiment...",
-                "busy": "Phone recorder is busy",
-            }.get(state, f"Phone state: {state}")
+            if action == "STOP" and state == "idle":
+                message = "Previous experiment is saving in background; ready to start the next one"
+            else:
+                message = {
+                    "idle": "Phone ready; capture is idle",
+                    "recording": "Recording synchronized experiment on phone",
+                    "saving": "Phone is saving and uploading the experiment...",
+                    "busy": "Phone recorder is busy",
+                }.get(state, f"Phone state: {state}")
         else:
             message = f"Phone rejected {action.lower()} request (state: {state})"
         self._render_remote_recording_state(message)
@@ -1590,16 +1596,29 @@ class ExperimentMonitorWindow(QMainWindow):
             control_event = str(event.get("event", "")).lower()
             experiment_id = str(event.get("experiment_id", ""))
             if control_event == "start":
+                self.remote_recording_experiment_id = experiment_id or None
                 self.remote_recording_pending_request_id = None
                 self._set_remote_recording_state(
                     "recording",
                     f"Recording experiment {experiment_id}",
                 )
             elif control_event == "stop":
+                if (
+                    (
+                        self.remote_recording_experiment_id is not None
+                        and self.remote_recording_experiment_id != experiment_id
+                    )
+                    or (
+                        self.remote_recording_experiment_id is None
+                        and self.remote_recording_state == "recording"
+                    )
+                ):
+                    return
+                self.remote_recording_experiment_id = None
                 self.remote_recording_pending_request_id = None
                 self._set_remote_recording_state(
-                    "saving",
-                    f"Saving and uploading experiment {experiment_id}...",
+                    "idle",
+                    f"Experiment {experiment_id} is saving in background; ready for the next one",
                 )
         if event.get("type") == "upload":
             self.set_service_status(f"Received {event.get('component')} for {event.get('capture_id')}")

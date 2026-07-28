@@ -291,9 +291,10 @@ final class ARSessionVideoRecorder {
 
     private static func makeOutputURL(prefix: String) -> URL {
         let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
 
-        let fileName = "\(prefix)-\(formatter.string(from: Date())).mp4"
+        let uniqueSuffix = UUID().uuidString.prefix(8).lowercased()
+        let fileName = "\(prefix)-\(formatter.string(from: Date()))-\(uniqueSuffix).mp4"
         let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
 
         return documentsURL.appendingPathComponent(fileName)

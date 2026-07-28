@@ -314,12 +314,16 @@ private struct RecordButton: View {
     @ObservedObject var viewModel: PositionViewModel
 
     private var title: String {
-        if viewModel.recordingPhase.isSaving {
-            return "Saving"
-        }
-
         if viewModel.canStopRecording {
             return "Stop & Save Experiment"
+        }
+
+        if viewModel.canStartRecording {
+            return "Start Experiment"
+        }
+
+        if viewModel.recordingPhase.isSaving {
+            return "Saving"
         }
 
         return "Start Experiment"
@@ -334,7 +338,7 @@ private struct RecordButton: View {
     }
 
     private var isDisabled: Bool {
-        viewModel.isSavingRecording || (!viewModel.canStartRecording && !viewModel.canStopRecording)
+        !viewModel.canStartRecording && !viewModel.canStopRecording
     }
 
     var body: some View {

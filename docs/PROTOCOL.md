@@ -113,6 +113,11 @@ The desktop must not assume a command succeeded before receiving this reply or
 the existing HTTP `/experiment/control` event. `STATUS` is side-effect free and
 is used to synchronize the desktop button after startup or reconnect.
 
+After `STOP` hands the finished writers to background finalization, the phone
+may acknowledge state `idle` immediately. A new `START` can then create an
+independent recording context while the previous experiment finishes saving
+and uploading; files and experiment identifiers remain isolated.
+
 ## Combined Pose and Magnetic Stream (APM1)
 
 After registration, the app sends APM1 UDP datagrams to the advertised

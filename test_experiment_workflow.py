@@ -187,6 +187,17 @@ class ExperimentWorkflowTests(unittest.TestCase):
                 "state": "recording",
             },
         )
+        self.assertEqual(
+            decode_remote_recording_ack(
+                b"PC_RECORD_ACK,1,request-43,STOP,OK,idle\n"
+            ),
+            {
+                "request_id": "request-43",
+                "action": "STOP",
+                "result": "OK",
+                "state": "idle",
+            },
+        )
 
     def test_remote_recording_protocol_rejects_invalid_packets(self) -> None:
         with self.assertRaises(ValueError):

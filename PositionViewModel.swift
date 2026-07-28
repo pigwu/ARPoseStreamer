@@ -357,15 +357,11 @@ final class PositionViewModel: ObservableObject {
     }
 
     var canStartRecording: Bool {
-        recordingPhase.isTerminal
+        activeExperiment == nil
     }
 
     var canStopRecording: Bool {
-        recordingPhase.isStoppable
-    }
-
-    var isSavingRecording: Bool {
-        recordingPhase.isSaving
+        activeExperiment != nil
     }
 
     var uploadServerSummary: String {
@@ -625,14 +621,14 @@ final class PositionViewModel: ObservableObject {
     }
 
     private var remoteRecordingState: String {
-        if recordingPhase.isSaving {
-            return "saving"
-        }
         if activeExperiment != nil || canStopRecording {
             return "recording"
         }
-        if recordingPhase.isTerminal {
+        if canStartRecording {
             return "idle"
+        }
+        if recordingPhase.isSaving {
+            return "saving"
         }
         return "busy"
     }
@@ -654,7 +650,7 @@ final class PositionViewModel: ObservableObject {
                 return (false, remoteRecordingState)
             }
             stopRecording()
-            return (true, "saving")
+            return (true, remoteRecordingState)
         }
     }
 
@@ -1006,6 +1002,7 @@ final class PositionViewModel: ObservableObject {
 
                 if let record = self.captureLibraryStore.addCapture(from: artifact) {
                     self.captureRecords.insert(record, at: 0)
+                    self.captureRecords.sort { $0.createdAt > $1.createdAt }
                     if self.autoUploadExperiments {
                         self.upload(record: record, kind: .experiment)
                     }
