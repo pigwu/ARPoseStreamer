@@ -1,7 +1,9 @@
 import argparse
 import json
 import re
+import shutil
 import sys
+import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,9 +20,22 @@ COMPONENT_FILENAMES = {
     "receiver_transport": "receiver_transport.csv",
     "manifest": "capture_manifest.json",
 }
+PHONE_COMPONENT_CANDIDATES = {
+    "pose_csv": ("pose.csv", "pose_csv__pose.csv"),
+    "magnetic_csv": ("magnetic.csv", "magnetic_csv__magnetic.csv"),
+    "sender_transport": ("sender_transport.csv", "sender_transport__sender_transport.csv"),
+    "video": ("video.mp4", "video.mov", "video.m4v"),
+    "ultrawide_video": ("ultrawide_video.mp4", "ultrawide_video.mov", "ultrawide_video.m4v"),
+    "manifest": ("capture_manifest.json", "manifest__capture_manifest.json"),
+}
+PC_COMPONENT_CANDIDATES = {
+    "receiver_transport": ("receiver_transport.csv",),
+    "aruco_gripper": ("aruco_gripper.csv",),
+}
 UUID_DIRECTORY_PATTERN = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 )
+EXPERIMENT_DIRECTORY_LOCK = threading.RLock()
 
 
 def get_default_upload_dir() -> Path:
@@ -46,6 +61,12 @@ def read_json_file(path: Path) -> dict:
         return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def write_json_file_atomic(path: Path, value: dict) -> None:
+    temp_path = path.with_name(f".{path.name}.{threading.get_ident()}.part")
+    temp_path.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(path)
 
 
 def experiment_directory_identity(directory: Path) -> str:
@@ -84,13 +105,23 @@ def readable_experiment_name(start_unix: float) -> str:
 
 
 def find_experiment_directory(root: Path, capture_id: str) -> Path | None:
-    direct = root / capture_id
-    if direct.is_dir():
-        return direct
-    for directory in root.iterdir() if root.is_dir() else ():
-        if directory.is_dir() and experiment_directory_identity(directory) == capture_id:
-            return directory
-    return None
+    matches = [
+        directory
+        for directory in (root.iterdir() if root.is_dir() else ())
+        if directory.is_dir() and experiment_directory_identity(directory) == capture_id
+    ]
+    if not matches:
+        return None
+    # Prefer the human-readable timestamp directory when an interrupted or
+    # out-of-order control request previously created both it and a UUID folder.
+    matches.sort(
+        key=lambda directory: (
+            UUID_DIRECTORY_PATTERN.fullmatch(directory.name) is not None,
+            -sum(1 for item in directory.iterdir() if item.is_file()),
+            directory.name,
+        )
+    )
+    return matches[0]
 
 
 def available_readable_directory(root: Path, start_unix: float, capture_id: str) -> Path:
@@ -109,42 +140,228 @@ def resolve_experiment_directory(
     start_unix: float | None = None,
 ) -> Path:
     root = root.expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    existing = find_experiment_directory(root, capture_id)
-    if existing is not None:
+    with EXPERIMENT_DIRECTORY_LOCK:
+        root.mkdir(parents=True, exist_ok=True)
+        existing = find_experiment_directory(root, capture_id)
+        if existing is not None and start_unix is not None and UUID_DIRECTORY_PATTERN.fullmatch(existing.name):
+            try:
+                readable = available_readable_directory(root, float(start_unix), capture_id)
+            except (OSError, OverflowError, TypeError, ValueError):
+                readable = existing
+            if readable != existing:
+                if readable.exists():
+                    _merge_experiment_directories(existing, readable, capture_id)
+                else:
+                    existing.rename(readable)
+                existing = readable
+        if existing is None:
+            if start_unix is not None:
+                try:
+                    existing = available_readable_directory(root, float(start_unix), capture_id)
+                except (OSError, OverflowError, TypeError, ValueError):
+                    existing = root / capture_id
+            else:
+                existing = root / capture_id
+            existing.mkdir(parents=True, exist_ok=True)
+        _claim_experiment_directory(existing, capture_id, start_unix)
         return existing
-    if start_unix is not None:
-        try:
-            target = available_readable_directory(root, float(start_unix), capture_id)
-        except (OSError, OverflowError, TypeError, ValueError):
-            target = root / capture_id
-    else:
-        target = root / capture_id
+
+
+def _claim_experiment_directory(directory: Path, capture_id: str, start_unix: float | None) -> None:
+    """Persist identity before releasing the resolver lock.
+
+    Experiment control and file uploads are handled by different HTTP threads.
+    Without this small claim, a stop request can observe a newly-created but
+    still-empty timestamp directory and create a second UUID directory.
+    """
+    state_path = directory / "experiment_state.json"
+    state = read_json_file(state_path)
+    owner = str(state.get("experiment_id") or experiment_directory_identity(directory) or "")
+    if owner and owner != capture_id:
+        raise OSError(f"Experiment directory {directory} is already owned by {owner}")
+    changed = state.get("experiment_id") != capture_id
+    state["experiment_id"] = capture_id
+    if start_unix is not None and state.get("start_unix_time") is None:
+        state["start_unix_time"] = float(start_unix)
+        changed = True
+    if changed or not state_path.exists():
+        state["updated_at"] = datetime.now().isoformat(timespec="milliseconds")
+        write_json_file_atomic(state_path, state)
+
+
+def _next_fragment_path(directory: Path, name: str) -> Path:
+    candidate = directory / name
+    suffix = 2
+    while candidate.exists():
+        candidate = directory / f"{Path(name).stem}_{suffix}{Path(name).suffix}"
+        suffix += 1
+    return candidate
+
+
+def _merge_experiment_directories(source: Path, target: Path, capture_id: str) -> None:
+    """Merge split folders without discarding conflicting originals."""
+    if source == target:
+        return
     target.mkdir(parents=True, exist_ok=True)
-    return target
+    source_experiment = read_json_file(source / "experiment_state.json")
+    target_experiment = read_json_file(target / "experiment_state.json")
+    source_upload = read_json_file(source / "upload_state.json")
+    target_upload = read_json_file(target / "upload_state.json")
+
+    fragments = target / "_merged_fragments" / source.name
+    for state_name in ("experiment_state.json", "upload_state.json"):
+        source_state = source / state_name
+        target_state = target / state_name
+        if source_state.exists() or target_state.exists():
+            fragments.mkdir(parents=True, exist_ok=True)
+        if target_state.is_file():
+            shutil.copy2(target_state, _next_fragment_path(fragments, f"target__{state_name}"))
+        if source_state.is_file():
+            shutil.move(str(source_state), _next_fragment_path(fragments, f"source__{state_name}"))
+
+    for item in list(source.iterdir()):
+        destination = target / item.name
+        if not destination.exists():
+            shutil.move(str(item), str(destination))
+            continue
+        fragments.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(item), str(_next_fragment_path(fragments, item.name)))
+
+    merged_experiment = dict(target_experiment)
+    for key, value in source_experiment.items():
+        if key not in merged_experiment or merged_experiment[key] in (None, ""):
+            merged_experiment[key] = value
+    merged_experiment["experiment_id"] = capture_id
+    timestamps = [
+        str(value)
+        for value in (target_experiment.get("updated_at"), source_experiment.get("updated_at"))
+        if value
+    ]
+    merged_experiment["updated_at"] = max(timestamps, default=datetime.now().isoformat(timespec="milliseconds"))
+    write_json_file_atomic(target / "experiment_state.json", merged_experiment)
+
+    merged_upload = dict(target_upload)
+    source_components = source_upload.get("components") if isinstance(source_upload.get("components"), dict) else {}
+    target_components = target_upload.get("components") if isinstance(target_upload.get("components"), dict) else {}
+    merged_components = dict(target_components)
+    merged_components.update(source_components)
+    source_uploaded = source_upload.get("uploaded_components") if isinstance(source_upload.get("uploaded_components"), list) else []
+    target_uploaded = target_upload.get("uploaded_components") if isinstance(target_upload.get("uploaded_components"), list) else []
+    merged_uploaded = list(dict.fromkeys([*target_uploaded, *source_uploaded, *merged_components.keys()]))
+    expected_values = [
+        int(value)
+        for value in (target_upload.get("expected_files"), source_upload.get("expected_files"))
+        if isinstance(value, (int, float)) and int(value) > 0
+    ]
+    expected = max(expected_values, default=None)
+    merged_upload.update(source_upload)
+    merged_upload.update(
+        {
+            "capture_id": capture_id,
+            "components": merged_components,
+            "uploaded_components": merged_uploaded,
+            "expected_files": expected,
+            "complete": bool(expected and len(merged_uploaded) >= expected),
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+    )
+    write_json_file_atomic(target / "upload_state.json", merged_upload)
+    try:
+        source.rmdir()
+    except OSError:
+        # Every file has already been preserved either in the canonical folder
+        # or under _merged_fragments; leave an unexpected remainder untouched.
+        pass
+
+
+def reconcile_upload_state(directory: Path) -> dict:
+    """Repair component metadata from files that are already safely on disk."""
+    directory = directory.expanduser().resolve()
+    state_path = directory / "upload_state.json"
+    state = read_json_file(state_path)
+    if not state and not experiment_directory_identity(directory):
+        return {}
+    components = state.get("components") if isinstance(state.get("components"), dict) else {}
+    components = dict(components)
+    all_candidates = {**PHONE_COMPONENT_CANDIDATES, **PC_COMPONENT_CANDIDATES}
+    for component, candidates in all_candidates.items():
+        registered = components.get(component)
+        if isinstance(registered, str) and (directory / Path(registered).name).is_file():
+            continue
+        found = next((directory / name for name in candidates if (directory / name).is_file()), None)
+        if found is not None:
+            components[component] = found.name
+
+    uploaded = state.get("uploaded_components") if isinstance(state.get("uploaded_components"), list) else []
+    uploaded = list(dict.fromkeys(str(component) for component in uploaded))
+    for component in PHONE_COMPONENT_CANDIDATES:
+        if component in components and component not in uploaded:
+            uploaded.append(component)
+
+    expected = state.get("expected_files")
+    try:
+        expected_count = int(expected) if expected is not None else 0
+    except (TypeError, ValueError):
+        expected_count = 0
+    phone_file_count = sum(component in components for component in PHONE_COMPONENT_CANDIDATES)
+    if expected_count > 0:
+        complete = phone_file_count >= expected_count
+    else:
+        complete = bool(state.get("complete"))
+
+    state.update(
+        {
+            "capture_id": state.get("capture_id") or experiment_directory_identity(directory),
+            "components": components,
+            "uploaded_components": uploaded,
+            "complete": complete,
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+    )
+    write_json_file_atomic(state_path, state)
+    return state
 
 
 def migrate_uuid_experiment_directories(root: Path) -> list[tuple[Path, Path]]:
-    """Rename UUID experiment folders to local timestamp names without merging data."""
+    """Rename UUID folders and safely consolidate split folders for one experiment."""
     root = root.expanduser().resolve()
     if not root.is_dir():
         return []
     migrated: list[tuple[Path, Path]] = []
-    for directory in sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name):
-        if UUID_DIRECTORY_PATTERN.fullmatch(directory.name) is None:
-            continue
-        start_unix = experiment_start_unix(directory)
-        if start_unix is None:
-            continue
-        capture_id = experiment_directory_identity(directory) or directory.name
-        try:
-            target = available_readable_directory(root, start_unix, capture_id)
-        except (OSError, OverflowError, TypeError, ValueError):
-            continue
-        if target == directory:
-            continue
-        directory.rename(target)
-        migrated.append((directory, target))
+    with EXPERIMENT_DIRECTORY_LOCK:
+        for directory in sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name):
+            if UUID_DIRECTORY_PATTERN.fullmatch(directory.name) is None:
+                continue
+            capture_id = experiment_directory_identity(directory) or directory.name
+            start_unix = experiment_start_unix(directory)
+            existing = find_experiment_directory(root, capture_id)
+            if start_unix is None and existing is not None and existing != directory:
+                start_unix = experiment_start_unix(existing)
+            if start_unix is None:
+                continue
+            try:
+                target = (
+                    existing
+                    if existing is not None and existing != directory
+                    else available_readable_directory(root, start_unix, capture_id)
+                )
+            except (OSError, OverflowError, TypeError, ValueError):
+                continue
+            if target == directory:
+                continue
+            try:
+                if target.exists():
+                    _merge_experiment_directories(directory, target, capture_id)
+                else:
+                    directory.rename(target)
+                _claim_experiment_directory(target, capture_id, start_unix)
+                reconcile_upload_state(target)
+                migrated.append((directory, target))
+            except OSError as exc:
+                # A replay process can temporarily hold an old video handle.
+                # One legacy fragment must never prevent the upload port from binding.
+                console_print(f"[WARN] Could not fully merge {directory.name}: {exc}", file=sys.stderr)
+                continue
     return migrated
 
 
@@ -154,6 +371,19 @@ class UploadHandler(BaseHTTPRequestHandler):
     upload_count = 0
     on_event: Optional[Callable[[dict], None]] = None
     zarr_exporter: AutoZarrExporter | None = None
+
+    def do_GET(self):
+        if self.path.rstrip("/") == "/health":
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "service": "ARPose experiment upload",
+                    "upload_path": "/upload",
+                },
+            )
+            return
+        self.send_error(404, "Unknown endpoint")
 
     def handle_expect_100(self):
         self.send_response_only(100)
@@ -393,6 +623,9 @@ class UploadHandler(BaseHTTPRequestHandler):
         if component == "video":
             suffix = Path(original_filename).suffix.lower() or ".mp4"
             return f"video{suffix}"
+        if component == "ultrawide_video":
+            suffix = Path(original_filename).suffix.lower() or ".mp4"
+            return f"ultrawide_video{suffix}"
         return COMPONENT_FILENAMES.get(component, f"{UploadHandler.sanitize_token(component)}__{original_filename}")
 
     @staticmethod
@@ -530,6 +763,12 @@ def create_upload_server(
     ConfiguredUploadHandler.upload_root = Path(upload_root).expanduser().resolve()
     ConfiguredUploadHandler.upload_root.mkdir(parents=True, exist_ok=True)
     migrate_uuid_experiment_directories(ConfiguredUploadHandler.upload_root)
+    for directory in ConfiguredUploadHandler.upload_root.iterdir():
+        if directory.is_dir():
+            try:
+                reconcile_upload_state(directory)
+            except OSError as exc:
+                console_print(f"[WARN] Could not reconcile {directory.name}: {exc}", file=sys.stderr)
     ConfiguredUploadHandler.on_event = staticmethod(on_event) if on_event is not None else None
     ConfiguredUploadHandler.zarr_exporter = AutoZarrExporter() if auto_zarr else None
     server = ThreadingHTTPServer((host, port), ConfiguredUploadHandler)

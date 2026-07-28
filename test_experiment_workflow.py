@@ -14,7 +14,11 @@ from capture_upload_server import (
     readable_experiment_name,
 )
 from experiment_data import ExperimentDataset, discover_experiments
-from experiment_replay_ui import ReceiverDiagnosticsRecorder
+from experiment_replay_ui import (
+    ReceiverDiagnosticsRecorder,
+    decode_remote_recording_ack,
+    encode_remote_recording_command,
+)
 from experiment_zarr import AutoZarrExporter
 
 
@@ -81,6 +85,37 @@ class ExperimentWorkflowTests(unittest.TestCase):
         self.assertEqual(dataset.experiment_id, experiment_id)
         self.assertAlmostEqual(dataset.pose.times[0], 0.1)
         self.assertEqual(dataset.pose.nearest(0.1)["x"], "1")
+
+    def test_remote_recording_protocol_round_trip(self) -> None:
+        self.assertEqual(
+            encode_remote_recording_command("request-42", "start"),
+            b"PC_RECORD,1,request-42,START\n",
+        )
+        self.assertEqual(
+            decode_remote_recording_ack(
+                b"PC_RECORD_ACK,1,request-42,START,OK,recording\n"
+            ),
+            {
+                "request_id": "request-42",
+                "action": "START",
+                "result": "OK",
+                "state": "recording",
+            },
+        )
+
+    def test_remote_recording_protocol_rejects_invalid_packets(self) -> None:
+        with self.assertRaises(ValueError):
+            encode_remote_recording_command("request,42", "START")
+        with self.assertRaises(ValueError):
+            encode_remote_recording_command("请求-42", "START")
+        with self.assertRaises(ValueError):
+            encode_remote_recording_command("request-42", "PAUSE")
+        self.assertIsNone(decode_remote_recording_ack(b"APM1 binary payload"))
+        self.assertIsNone(
+            decode_remote_recording_ack(
+                b"PC_RECORD_ACK,1,request-42,START,OK,unknown\n"
+            )
+        )
 
     def test_legacy_magnetic_time_is_aligned_from_manifest(self) -> None:
         folder = self.root / "legacy"

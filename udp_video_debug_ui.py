@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import socket
 import struct
@@ -42,11 +43,18 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from aruco_gripper_tracker import (
+    CameraIntrinsics as TrackingCameraIntrinsics,
+    GripperDistanceProcessor,
+    TrackerConfig,
+)
+
 
 POSE_PACKET = struct.Struct("<Id7f")
-VIDEO_PACKET_HEADER = struct.Struct("<4sBBHIdHHHH")
-VIDEO_MAGIC = b"APV1"
-VIDEO_VERSION = 1
+VIDEO_PACKET_HEADER_V1 = struct.Struct("<4sBBHIdHHHH")
+VIDEO_PACKET_HEADER_V2 = struct.Struct("<4sBBHIdHHHHffffHH")
+VIDEO_MAGIC_V1 = b"APV1"
+VIDEO_MAGIC_V2 = b"APV2"
 FRAME_STALE_SECONDS = 0.20
 MAX_INFLIGHT_FRAMES = 8
 LATENCY_HISTORY_SECONDS = 30.0
@@ -74,6 +82,110 @@ class NALAssembly:
         return len(self.fragments) == self.total_fragments
 
 
+@dataclass(frozen=True)
+class CameraIntrinsics:
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    image_width: int
+    image_height: int
+
+    def __post_init__(self) -> None:
+        if not all(math.isfinite(value) for value in (self.fx, self.fy, self.cx, self.cy)):
+            raise ValueError("Camera intrinsics contain a non-finite value")
+        if self.fx <= 0.0 or self.fy <= 0.0 or self.image_width <= 0 or self.image_height <= 0:
+            raise ValueError("Camera focal lengths and calibration resolution must be positive")
+
+
+@dataclass(frozen=True)
+class VideoPacketFragment:
+    flags: int
+    frame_id: int
+    capture_timestamp: float
+    nalu_index: int
+    nalu_count: int
+    fragment_index: int
+    fragment_count: int
+    payload: bytes
+    camera_intrinsics: CameraIntrinsics | None
+
+
+def decode_video_packet(packet: bytes) -> VideoPacketFragment:
+    if len(packet) < 6:
+        raise ValueError("Video packet is shorter than the magic/version prefix")
+
+    magic = packet[:4]
+    version = packet[4]
+    camera_intrinsics = None
+
+    if magic == VIDEO_MAGIC_V1 and version == 1:
+        header = VIDEO_PACKET_HEADER_V1
+        if len(packet) < header.size:
+            raise ValueError("APV1 packet is shorter than its header")
+        (
+            _magic,
+            _version,
+            flags,
+            _reserved,
+            frame_id,
+            capture_timestamp,
+            nalu_index,
+            nalu_count,
+            fragment_index,
+            fragment_count,
+        ) = header.unpack_from(packet)
+    elif magic == VIDEO_MAGIC_V2 and version == 2:
+        header = VIDEO_PACKET_HEADER_V2
+        if len(packet) < header.size:
+            raise ValueError("APV2 packet is shorter than its header")
+        (
+            _magic,
+            _version,
+            flags,
+            _reserved,
+            frame_id,
+            capture_timestamp,
+            nalu_index,
+            nalu_count,
+            fragment_index,
+            fragment_count,
+            fx,
+            fy,
+            cx,
+            cy,
+            image_width,
+            image_height,
+        ) = header.unpack_from(packet)
+        camera_intrinsics = CameraIntrinsics(
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            image_width=image_width,
+            image_height=image_height,
+        )
+    else:
+        raise ValueError(f"Unsupported video protocol {magic!r} version {version}")
+
+    if fragment_count <= 0 or nalu_count <= 0:
+        raise ValueError("Video packet has an invalid fragment or NAL count")
+    if not (0 <= nalu_index < nalu_count) or not (0 <= fragment_index < fragment_count):
+        raise ValueError("Video packet index is outside the advertised range")
+
+    return VideoPacketFragment(
+        flags=flags,
+        frame_id=frame_id,
+        capture_timestamp=capture_timestamp,
+        nalu_index=nalu_index,
+        nalu_count=nalu_count,
+        fragment_index=fragment_index,
+        fragment_count=fragment_count,
+        payload=packet[header.size :],
+        camera_intrinsics=camera_intrinsics,
+    )
+
+
 @dataclass
 class FrameAssembly:
     frame_id: int
@@ -83,6 +195,7 @@ class FrameAssembly:
     created_at: float
     last_update_at: float
     first_received_wall_time: float
+    camera_intrinsics: CameraIntrinsics | None = None
     nalus: dict[int, NALAssembly] = field(default_factory=dict)
 
     def is_complete(self) -> bool:
@@ -166,10 +279,17 @@ class VideoReceiverThread(QThread):
     frame_ready = pyqtSignal(QImage)
     video_metrics = pyqtSignal(dict)
     pose_metrics = pyqtSignal(dict)
+    aruco_metrics = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
     log_message = pyqtSignal(str)
 
-    def __init__(self, bind_host: str, video_port: int, pose_port: int | None) -> None:
+    def __init__(
+        self,
+        bind_host: str,
+        video_port: int,
+        pose_port: int | None,
+        aruco_config: TrackerConfig | None = None,
+    ) -> None:
         super().__init__()
         self.bind_host = bind_host
         self.video_port = video_port
@@ -193,6 +313,7 @@ class VideoReceiverThread(QThread):
             "latency_ms": None,
             "raw_latency_ms": None,
             "capture_timestamp": None,
+            "camera_intrinsics": None,
             "first_receive_wall_time": None,
             "decode_wall_time": None,
             "clock_offset_ms": None,
@@ -216,6 +337,17 @@ class VideoReceiverThread(QThread):
             "position": "(0.000, 0.000, 0.000)",
         }
         self._prev_pose_sequence: int | None = None
+        self._aruco_processor = (
+            GripperDistanceProcessor(aruco_config)
+            if aruco_config is not None and aruco_config.tracking_enabled
+            else None
+        )
+        self._aruco_output_address = (
+            (aruco_config.output_host, aruco_config.output_port)
+            if self._aruco_processor is not None and aruco_config is not None
+            else None
+        )
+        self._aruco_output_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     @staticmethod
     def _create_decoder():
@@ -229,7 +361,8 @@ class VideoReceiverThread(QThread):
     def run(self) -> None:
         try:
             video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            video_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if sys.platform != "win32":
+                video_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             video_socket.bind((self.bind_host, self.video_port))
             video_socket.setblocking(False)
 
@@ -237,13 +370,15 @@ class VideoReceiverThread(QThread):
             sockets = [video_socket]
             if self.pose_port is not None and self.pose_port > 0:
                 pose_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                pose_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if sys.platform != "win32":
+                    pose_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 pose_socket.bind((self.bind_host, self.pose_port))
                 pose_socket.setblocking(False)
                 sockets.append(pose_socket)
         except OSError as exc:
             self.status_changed.emit("Bind failed")
             self.log_message.emit(f"Could not bind UDP sockets: {exc}")
+            self._aruco_output_socket.close()
             return
 
         self._video_state["status"] = f"Listening on {self.bind_host}:{self.video_port}"
@@ -279,6 +414,7 @@ class VideoReceiverThread(QThread):
             video_socket.close()
             if pose_socket is not None:
                 pose_socket.close()
+            self._aruco_output_socket.close()
             self._video_state.update({"status": "Stopped", "fps": 0.0, "bitrate_mbps": 0.0})
             self._pose_state.update({"status": "Pose stopped", "fps": 0.0})
             self.video_metrics.emit(dict(self._video_state))
@@ -323,33 +459,15 @@ class VideoReceiverThread(QThread):
         self._emit_pose_metrics()
 
     def _handle_video_packet(self, packet: bytes, address: tuple[str, int]) -> None:
-        if len(packet) < VIDEO_PACKET_HEADER.size:
-            return
-
         try:
-            (
-                magic,
-                version,
-                flags,
-                _reserved,
-                frame_id,
-                capture_timestamp,
-                nalu_index,
-                nalu_count,
-                fragment_index,
-                fragment_count,
-            ) = VIDEO_PACKET_HEADER.unpack_from(packet)
-        except struct.error:
+            fragment = decode_video_packet(packet)
+        except (ValueError, struct.error):
             return
 
-        if magic != VIDEO_MAGIC or version != VIDEO_VERSION:
-            return
+        frame_id = fragment.frame_id
+        capture_timestamp = fragment.capture_timestamp
 
         if self._latest_decoded_frame_id is not None and frame_id <= self._latest_decoded_frame_id:
-            return
-
-        payload = packet[VIDEO_PACKET_HEADER.size :]
-        if fragment_count <= 0 or nalu_count <= 0:
             return
 
         now = time.monotonic()
@@ -370,25 +488,28 @@ class VideoReceiverThread(QThread):
             frame = FrameAssembly(
                 frame_id=frame_id,
                 capture_timestamp=capture_timestamp,
-                nalu_count=nalu_count,
-                is_keyframe=bool(flags & 0x01),
+                nalu_count=fragment.nalu_count,
+                is_keyframe=bool(fragment.flags & 0x01),
                 created_at=now,
                 last_update_at=now,
                 first_received_wall_time=now_wall_clock,
+                camera_intrinsics=fragment.camera_intrinsics,
             )
             self._frames[frame_id] = frame
         else:
             frame.last_update_at = now
+            if frame.camera_intrinsics is None:
+                frame.camera_intrinsics = fragment.camera_intrinsics
 
-        nalu = frame.nalus.get(nalu_index)
+        nalu = frame.nalus.get(fragment.nalu_index)
         if nalu is None:
-            nalu = NALAssembly(total_fragments=fragment_count)
-            frame.nalus[nalu_index] = nalu
-        elif nalu.total_fragments != fragment_count:
-            nalu.total_fragments = max(nalu.total_fragments, fragment_count)
+            nalu = NALAssembly(total_fragments=fragment.fragment_count)
+            frame.nalus[fragment.nalu_index] = nalu
+        elif nalu.total_fragments != fragment.fragment_count:
+            nalu.total_fragments = max(nalu.total_fragments, fragment.fragment_count)
 
-        if fragment_index not in nalu.fragments:
-            nalu.fragments[fragment_index] = payload
+        if fragment.fragment_index not in nalu.fragments:
+            nalu.fragments[fragment.fragment_index] = fragment.payload
 
         if frame.is_complete():
             self._frames.pop(frame_id, None)
@@ -486,10 +607,55 @@ class VideoReceiverThread(QThread):
         )
         self._video_state["raw_latency_ms"] = self._last_video_raw_delay * 1000.0
         self._video_state["capture_timestamp"] = frame.capture_timestamp
+        self._video_state["camera_intrinsics"] = frame.camera_intrinsics
         self._video_state["first_receive_wall_time"] = frame.first_received_wall_time
         self._video_state["decode_wall_time"] = now_wall_clock
         if frame.is_keyframe:
             self._video_state["keyframes"] += 1
+
+        if self._aruco_processor is not None:
+            try:
+                camera_intrinsics = None
+                if frame.camera_intrinsics is not None:
+                    camera_intrinsics = TrackingCameraIntrinsics(
+                        fx=frame.camera_intrinsics.fx,
+                        fy=frame.camera_intrinsics.fy,
+                        cx=frame.camera_intrinsics.cx,
+                        cy=frame.camera_intrinsics.cy,
+                        image_width=frame.camera_intrinsics.image_width,
+                        image_height=frame.camera_intrinsics.image_height,
+                    )
+                result = self._aruco_processor.process(
+                    image_bgr=np.ascontiguousarray(rgb[:, :, ::-1]),
+                    frame_id=frame.frame_id,
+                    capture_timestamp=frame.capture_timestamp,
+                    camera_intrinsics=camera_intrinsics,
+                )
+                if self._aruco_output_address is not None:
+                    payload = json.dumps(
+                        result,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    try:
+                        self._aruco_output_socket.sendto(payload, self._aruco_output_address)
+                    except OSError as exc:
+                        result["output_error"] = str(exc)
+                self.aruco_metrics.emit(result)
+            except Exception as exc:
+                self.aruco_metrics.emit(
+                    {
+                        "protocol": "AGP1",
+                        "frame_id": frame.frame_id,
+                        "capture_time": frame.capture_timestamp,
+                        "status": "processor_error",
+                        "detected_ids": [],
+                        "markers": {},
+                        "gripper_distance": None,
+                        "error": str(exc),
+                    }
+                )
 
         self._emit_video_metrics()
         self.frame_ready.emit(image)

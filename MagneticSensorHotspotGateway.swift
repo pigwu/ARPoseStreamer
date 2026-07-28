@@ -1,6 +1,18 @@
 import Foundation
 import Network
 
+enum RemoteRecordingAction: String {
+    case start = "START"
+    case stop = "STOP"
+    case status = "STATUS"
+}
+
+struct RemoteRecordingCommand {
+    let requestID: String
+    let action: RemoteRecordingAction
+    fileprivate let connectionID: UUID
+}
+
 struct MagneticGatewayStats: Equatable, Sendable {
     var receivedPackets: UInt64 = 0
     var invalidPackets: UInt64 = 0
@@ -31,6 +43,7 @@ final class MagneticSensorHotspotGateway {
     var onComputerAvailabilityChanged: ((Bool) -> Void)?
     var onListeningChanged: ((Bool) -> Void)?
     var onStatsChanged: ((MagneticGatewayStats) -> Void)?
+    var onRemoteRecordingCommand: ((RemoteRecordingCommand) -> Void)?
     var onError: ((Error) -> Void)?
 
     private let queue = DispatchQueue(label: "umi.pose.magnetic.hotspot", qos: .userInitiated)
@@ -89,6 +102,20 @@ final class MagneticSensorHotspotGateway {
     func handlePose(_ pose: PoseMagneticPoseValue) {
         queue.async { [weak self] in
             self?.handlePoseLocked(pose)
+        }
+    }
+
+    func acknowledgeRemoteRecordingCommand(
+        _ command: RemoteRecordingCommand,
+        accepted: Bool,
+        state: String
+    ) {
+        queue.async { [weak self] in
+            self?.sendRemoteRecordingAcknowledgementLocked(
+                command,
+                accepted: accepted,
+                state: state
+            )
         }
     }
 
@@ -373,7 +400,7 @@ final class MagneticSensorHotspotGateway {
             guard let self, let connection else { return }
 
             if let data, !data.isEmpty {
-                self.processComputerRegistration(data, from: connection)
+                self.processComputerMessage(data, from: connection, connectionID: id)
             }
 
             if let error {
@@ -387,13 +414,31 @@ final class MagneticSensorHotspotGateway {
         }
     }
 
-    private func processComputerRegistration(_ data: Data, from connection: NWConnection) {
+    private func processComputerMessage(
+        _ data: Data,
+        from connection: NWConnection,
+        connectionID: UUID
+    ) {
         guard
             let text = String(data: data, encoding: .utf8),
-            let registration = Self.parseComputerHello(text),
             case .hostPort(let host, _) = connection.endpoint
         else { return }
 
+        if let command = Self.parseRemoteRecordingCommand(text, connectionID: connectionID) {
+            lastComputerHeartbeatTime = ProcessInfo.processInfo.systemUptime
+            if let onRemoteRecordingCommand {
+                onRemoteRecordingCommand(command)
+            } else {
+                sendRemoteRecordingAcknowledgementLocked(
+                    command,
+                    accepted: false,
+                    state: "busy"
+                )
+            }
+            return
+        }
+
+        guard let registration = Self.parseComputerHello(text) else { return }
         lastComputerHeartbeatTime = ProcessInfo.processInfo.systemUptime
         registeredVideoPort = registration.videoPort
         let targetChanged = registeredComputerHost.map { String(describing: $0) } != String(describing: host)
@@ -408,6 +453,25 @@ final class MagneticSensorHotspotGateway {
 
         stats.computerEndpoint = "\(host):\(registration.combinedPort)"
         publishStatsIfNeeded(at: ProcessInfo.processInfo.systemUptime, force: true)
+    }
+
+    private func sendRemoteRecordingAcknowledgementLocked(
+        _ command: RemoteRecordingCommand,
+        accepted: Bool,
+        state: String
+    ) {
+        guard let connection = computerConnections[command.connectionID] else { return }
+        let allowedStates = ["idle", "recording", "saving", "busy"]
+        let normalizedState = allowedStates.contains(state) ? state : "busy"
+        let result = accepted ? "OK" : "REJECTED"
+        let payload = Data(
+            "PC_RECORD_ACK,1,\(command.requestID),\(command.action.rawValue),\(result),\(normalizedState)\n".utf8
+        )
+        connection.send(content: payload, completion: .contentProcessed { [weak self] error in
+            if let error {
+                self?.onError?(error)
+            }
+        })
     }
 
     private func removeComputerConnection(_ id: UUID, connection: NWConnection) {
@@ -605,6 +669,36 @@ final class MagneticSensorHotspotGateway {
             let videoPort = UInt16(fields[3])
         else { return nil }
         return (combinedPort, videoPort)
+    }
+
+    private static func parseRemoteRecordingCommand(
+        _ text: String,
+        connectionID: UUID
+    ) -> RemoteRecordingCommand? {
+        let fields = text.trimmingCharacters(in: .whitespacesAndNewlines).split(
+            separator: ",",
+            omittingEmptySubsequences: false
+        )
+        guard
+            fields.count == 4,
+            fields[0].uppercased() == "PC_RECORD",
+            fields[1] == "1",
+            isSafeRemoteRecordingField(String(fields[2])),
+            let action = RemoteRecordingAction(rawValue: fields[3].uppercased())
+        else { return nil }
+        return RemoteRecordingCommand(
+            requestID: String(fields[2]),
+            action: action,
+            connectionID: connectionID
+        )
+    }
+
+    private static func isSafeRemoteRecordingField(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 128 else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            guard scalar.value < 128 else { return false }
+            return CharacterSet.alphanumerics.contains(scalar) || "-_.".unicodeScalars.contains(scalar)
+        }
     }
 }
 

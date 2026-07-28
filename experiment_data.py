@@ -62,9 +62,14 @@ class ExperimentDataset:
     magnetic: TimedRows
     sender_transport: TimedRows
     receiver_transport: TimedRows
+    gripper: TimedRows
     video_path: Path | None
+    ultrawide_video_path: Path | None
+    gripper_path: Path | None
+    gripper_state: dict
     duration_seconds: float
     video_start_offset_seconds: float
+    ultrawide_video_start_offset_seconds: float
     is_complete: bool
 
     @property
@@ -119,10 +124,34 @@ class ExperimentDataset:
             "receiver_transport",
             ["receiver_transport.csv"],
         )
+        gripper_path = _component_path(
+            directory,
+            components,
+            "aruco_gripper",
+            ["aruco_gripper.csv"],
+        )
         video_path = _component_path(directory, components, "video", ["video.mp4", "video.mov"])
         if video_path is None:
             video_candidates = list(directory.glob("video.*")) + list(directory.glob("video__*"))
             video_path = next((path for path in video_candidates if path.suffix.lower() in {".mp4", ".mov", ".m4v"}), None)
+        ultrawide_video_path = _component_path(
+            directory,
+            components,
+            "ultrawide_video",
+            ["ultrawide_video.mp4", "ultrawide_video.mov"],
+        )
+        if ultrawide_video_path is None:
+            ultrawide_candidates = list(directory.glob("ultrawide_video.*")) + list(
+                directory.glob("ultrawide_video__*")
+            )
+            ultrawide_video_path = next(
+                (
+                    path
+                    for path in ultrawide_candidates
+                    if path.suffix.lower() in {".mp4", ".mov", ".m4v"}
+                ),
+                None,
+            )
 
         start_monotonic = _float(
             manifest.get("experimentStartMonotonicTime", manifest.get("sessionStartFrameTime", 0.0))
@@ -151,9 +180,10 @@ class ExperimentDataset:
                 max(0.0, _float(row.get("sender_time")) - start_unix)
                 for row in receiver_transport.rows
             ]
+        gripper = TimedRows.from_csv(gripper_path, ["experiment_time", "relative_time"])
 
         duration = _float(manifest.get("durationSeconds"), 0.0)
-        for table in (pose, magnetic, sender_transport, receiver_transport):
+        for table in (pose, magnetic, sender_transport, receiver_transport, gripper):
             if table.times:
                 duration = max(duration, table.times[-1])
 
@@ -164,9 +194,17 @@ class ExperimentDataset:
             magnetic=magnetic,
             sender_transport=sender_transport,
             receiver_transport=receiver_transport,
+            gripper=gripper,
             video_path=video_path,
+            ultrawide_video_path=ultrawide_video_path,
+            gripper_path=gripper_path,
+            gripper_state=_read_json(directory / "aruco_gripper_state.json"),
             duration_seconds=max(duration, 0.001),
             video_start_offset_seconds=_float(manifest.get("videoStartOffsetSeconds"), 0.0),
+            ultrawide_video_start_offset_seconds=_float(
+                manifest.get("ultraWideVideoStartOffsetSeconds"),
+                0.0,
+            ),
             is_complete=(bool(upload_state.get("complete")) if upload_state else bool(manifest)),
         )
 

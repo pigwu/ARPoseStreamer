@@ -11,11 +11,31 @@ from typing import Callable, Optional
 
 import zarr
 
-from export_capture_to_zarr import build_episode, discover_capture, write_zarr
+from export_capture_to_zarr import (
+    RDP_SOURCE_ZARR_SCHEMA_VERSION,
+    build_episode,
+    default_eef_calibration_result,
+    discover_capture,
+    make_zarr_attrs,
+    write_zarr,
+)
 
 
 ZARR_DIRECTORY_NAME = "dataset.zarr"
 ZARR_STATE_NAME = "zarr_state.json"
+REQUIRED_RDP_DATA_KEYS = (
+    "camera0_rgb",
+    "robot0_eef_pos",
+    "robot0_eef_rot_axis_angle",
+    "robot0_gripper_width",
+    "robot0_demo_start_pose",
+    "robot0_demo_end_pose",
+    "action",
+    "magnet_xyz",
+    "magnet_timestamp_ns",
+    "magnet_sample_count",
+    "timestamp",
+)
 
 
 def read_json(path: Path) -> dict:
@@ -32,11 +52,35 @@ def write_json_atomic(path: Path, value: dict) -> None:
     temp_path.replace(path)
 
 
+def is_current_rdp_source_zarr(path: Path) -> bool:
+    try:
+        root = zarr.open_group(str(path), mode="r")
+        if root.attrs.get("rdp_source_zarr_schema_version") != RDP_SOURCE_ZARR_SCHEMA_VERSION:
+            return False
+        if "data" not in root:
+            return False
+        data = root["data"]
+        if any(key not in data for key in REQUIRED_RDP_DATA_KEYS):
+            return False
+        if data["action"].ndim != 2 or data["action"].shape[-1] != 7:
+            return False
+        if data["magnet_xyz"].ndim != 4 or data["magnet_xyz"].shape[-1] != 3:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 class AutoZarrExporter:
     """Convert completed experiments sequentially without blocking uploads."""
 
-    def __init__(self, image_size: int = 224) -> None:
+    def __init__(self, image_size: int = 224, eef_calibration_result: Optional[Path] = None) -> None:
         self.image_size = image_size
+        self.eef_calibration_result = (
+            Path(eef_calibration_result).expanduser().resolve()
+            if eef_calibration_result is not None
+            else default_eef_calibration_result()
+        )
         self._queue: queue.PriorityQueue[tuple[int, int, Path, str, Optional[Callable[[dict], None]]]] = (
             queue.PriorityQueue()
         )
@@ -57,7 +101,7 @@ class AutoZarrExporter:
         output = directory / ZARR_DIRECTORY_NAME
         state_path = directory / ZARR_STATE_NAME
         state = read_json(state_path)
-        if output.is_dir() and state.get("status") == "complete":
+        if output.is_dir() and state.get("status") == "complete" and is_current_rdp_source_zarr(output):
             return False
 
         with self._lock:
@@ -70,6 +114,7 @@ class AutoZarrExporter:
                     "status": "queued",
                     "capture_id": capture_id,
                     "output": ZARR_DIRECTORY_NAME,
+                    "eef_calibration_result": str(self.eef_calibration_result or ""),
                     "updated_at": datetime.now().isoformat(timespec="milliseconds"),
                 },
             )
@@ -140,6 +185,7 @@ class AutoZarrExporter:
             "status": "running",
             "capture_id": capture_id,
             "output": ZARR_DIRECTORY_NAME,
+            "eef_calibration_result": str(self.eef_calibration_result or ""),
             "updated_at": datetime.now().isoformat(timespec="milliseconds"),
         }
         write_json_atomic(state_path, state)
@@ -149,17 +195,24 @@ class AutoZarrExporter:
             if temporary_output.exists():
                 shutil.rmtree(temporary_output)
             capture = discover_capture(directory)
-            episode = build_episode(capture, image_size=self.image_size, action_source="zero")
-            write_zarr(temporary_output, [episode])
-            root = zarr.open_group(str(temporary_output), mode="a")
-            root.attrs.update(
+            episode = build_episode(
+                capture,
+                image_size=self.image_size,
+                action_source="next_obs",
+                eef_calibration_result=self.eef_calibration_result,
+            )
+            attrs = make_zarr_attrs(self.eef_calibration_result, action_source="next_obs")
+            attrs.update(
                 {
                     "capture_id": capture_id,
                     "source_directory": directory.name,
                     "source_manifest": capture.manifest,
                     "created_by": "ARPose Experiment Monitor",
+                    "rdp_source_zarr_schema_version": RDP_SOURCE_ZARR_SCHEMA_VERSION,
+                    "magnet_key": "magnet_xyz",
                 }
             )
+            write_zarr(temporary_output, [episode], attrs=attrs)
             if output.exists():
                 shutil.rmtree(output)
             temporary_output.rename(output)
@@ -167,6 +220,8 @@ class AutoZarrExporter:
                 {
                     "status": "complete",
                     "frames": int(len(episode.timestamp)),
+                    "eef_pose_source": attrs["eef_pose_source"],
+                    "eef_calibration_result": attrs["eef_calibration_result"],
                     "updated_at": datetime.now().isoformat(timespec="milliseconds"),
                 }
             )
