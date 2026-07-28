@@ -24,6 +24,24 @@ struct ContentView: View {
                     .accessibilityHint("Double-tap to restore all controls")
 
                 VStack {
+                    HStack {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                isSidebarPresented.toggle()
+                            }
+                        } label: {
+                            Image(systemName: "line.3.horizontal")
+                                .font(.system(size: 19, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 44, height: 44)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+
                     Spacer()
 
                     RecordButton(viewModel: viewModel)
@@ -59,34 +77,35 @@ struct ContentView: View {
                     BottomDashboard(viewModel: viewModel)
                 }
 
-                if isSidebarPresented {
-                    Color.black.opacity(0.35)
-                        .ignoresSafeArea()
-                        .onTapGesture {
-                            withAnimation(.easeInOut(duration: 0.22)) {
-                                isSidebarPresented = false
-                            }
-                        }
+            }
 
-                    SidebarDrawer(
-                        viewModel: viewModel,
-                        onEnterRecordingFocusMode: {
-                            isSidebarPresented = false
-                            withAnimation(.easeInOut(duration: 0.22)) {
-                                isRecordingFocusMode = true
-                            }
-                        },
-                        onOpenHistory: {
-                            isShowingHistory = true
-                            isSidebarPresented = false
-                        },
-                        onOpenSettings: {
-                            isShowingSettings = true
+            if isSidebarPresented {
+                Color.black.opacity(0.35)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.22)) {
                             isSidebarPresented = false
                         }
-                    )
-                    .transition(.move(edge: .leading))
-                }
+                    }
+
+                SidebarDrawer(
+                    viewModel: viewModel,
+                    onEnterRecordingFocusMode: {
+                        isSidebarPresented = false
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            isRecordingFocusMode = true
+                        }
+                    },
+                    onOpenHistory: {
+                        isShowingHistory = true
+                        isSidebarPresented = false
+                    },
+                    onOpenSettings: {
+                        isShowingSettings = true
+                        isSidebarPresented = false
+                    }
+                )
+                .transition(.move(edge: .leading))
             }
         }
         .statusBarHidden(true)
@@ -115,11 +134,6 @@ struct ContentView: View {
                 viewModel.deactivatePreviewIfPossible()
             @unknown default:
                 break
-            }
-        }
-        .onChange(of: viewModel.canStopRecording) { wasStoppable, isStoppable in
-            if isRecordingFocusMode && wasStoppable && !isStoppable {
-                restoreInterface()
             }
         }
         .onDisappear {
