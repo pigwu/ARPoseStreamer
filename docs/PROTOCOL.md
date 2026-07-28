@@ -95,6 +95,24 @@ The app obtains the computer IP from the datagram source endpoint and leases it
 for five seconds. The phone does not reply because the desktop tool uses the
 same socket for APM1 receive traffic.
 
+The integrated experiment monitor can also control the phone's unified
+experiment recorder through the same UDP registration port. The command is:
+
+```text
+PC_RECORD,1,<request_id>,<START|STOP|STATUS>
+```
+
+The phone routes `START` and `STOP` through the same `PositionViewModel`
+methods used by the App button. It replies to the source socket with:
+
+```text
+PC_RECORD_ACK,1,<request_id>,<action>,<OK|REJECTED>,<idle|recording|saving|busy>
+```
+
+The desktop must not assume a command succeeded before receiving this reply or
+the existing HTTP `/experiment/control` event. `STATUS` is side-effect free and
+is used to synchronize the desktop button after startup or reconnect.
+
 ## Combined Pose and Magnetic Stream (APM1)
 
 After registration, the app sends APM1 UDP datagrams to the advertised

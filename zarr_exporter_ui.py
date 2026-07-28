@@ -25,7 +25,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from export_capture_to_zarr import build_episode, discover_capture, write_zarr
+from export_capture_to_zarr import (
+    build_episode,
+    default_eef_calibration_result,
+    discover_capture,
+    make_zarr_attrs,
+    write_zarr,
+)
 
 
 class ExportWorker(QThread):
@@ -33,13 +39,18 @@ class ExportWorker(QThread):
     finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, captures, output_path, image_size, action_source, overwrite):
+    def __init__(self, captures, output_path, image_size, action_source, overwrite, eef_calibration_result=None):
         super().__init__()
         self.captures = [Path(path) for path in captures]
         self.output_path = Path(output_path)
         self.image_size = int(image_size)
         self.action_source = action_source
         self.overwrite = bool(overwrite)
+        self.eef_calibration_result = (
+            Path(eef_calibration_result).expanduser().resolve()
+            if eef_calibration_result is not None
+            else default_eef_calibration_result()
+        )
 
     def run(self):
         try:
@@ -57,6 +68,7 @@ class ExportWorker(QThread):
                     capture,
                     image_size=self.image_size,
                     action_source=self.action_source,
+                    eef_calibration_result=self.eef_calibration_result,
                 )
                 episodes.append(episode)
                 self.log_message.emit(
@@ -65,7 +77,9 @@ class ExportWorker(QThread):
                 )
 
             self.log_message.emit(f"Writing Zarr dataset: {self.output_path}")
-            write_zarr(self.output_path, episodes)
+            attrs = make_zarr_attrs(self.eef_calibration_result, action_source=self.action_source)
+            attrs["created_by"] = "ARPose Zarr Exporter"
+            write_zarr(self.output_path, episodes, attrs=attrs)
             total_frames = sum(len(episode.timestamp) for episode in episodes)
             self.log_message.emit(f"Done. episodes={len(episodes)} frames={total_frames}")
             self.finished_ok.emit(str(self.output_path))
@@ -89,7 +103,8 @@ class MainWindow(QMainWindow):
         self.image_size_spin.setValue(224)
 
         self.action_combo = QComboBox()
-        self.action_combo.addItem("Zero action (recommended)", "zero")
+        self.action_combo.addItem("Next sampled pose action (RDP)", "next_obs")
+        self.action_combo.addItem("Zero action", "zero")
         self.action_combo.addItem("Copy force into action[:,0:6]", "force")
 
         self.overwrite_check = QCheckBox("Overwrite existing output")

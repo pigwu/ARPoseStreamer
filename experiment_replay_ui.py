@@ -5,11 +5,14 @@ import csv
 import json
 import math
 import os
+import queue
+import shutil
 import socket
 import sys
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from pathlib import Path
 
@@ -58,6 +61,15 @@ from PyQt6.QtWidgets import (
 
 from capture_upload_server import create_upload_server, get_default_upload_dir
 from experiment_data import ExperimentDataset, TimedRows, discover_experiments
+from export_capture_to_zarr import (
+    RDP_SOURCE_ZARR_SCHEMA_VERSION,
+    build_episode,
+    default_eef_calibration_result,
+    discover_capture,
+    make_zarr_attrs,
+    write_episode_visualizations,
+    write_zarr,
+)
 from offline_gripper_processor import (
     INTRINSICS_NAME,
     STATE_NAME as GRIPPER_STATE_NAME,
@@ -94,6 +106,80 @@ PC_GENERATED_EXPERIMENT_FILES = {
     "zarr_state.json",
     GRIPPER_STATE_NAME,
 }
+COMBINED_ZARR_NAME = "arpose_all_source.zarr"
+COMBINED_ZARR_STATE_NAME = "combined_zarr_state.json"
+REMOTE_RECORDING_ACTIONS = frozenset({"START", "STOP", "STATUS"})
+REMOTE_RECORDING_RESULTS = frozenset({"OK", "REJECTED"})
+REMOTE_RECORDING_STATES = frozenset({"idle", "recording", "saving", "busy"})
+
+
+def encode_remote_recording_command(request_id: str, action: str) -> bytes:
+    normalized_action = str(action).strip().upper()
+    normalized_request_id = str(request_id).strip()
+    if normalized_action not in REMOTE_RECORDING_ACTIONS:
+        raise ValueError(f"Unsupported remote recording action: {action}")
+    if not _is_safe_remote_recording_field(normalized_request_id):
+        raise ValueError("Remote recording request ID is invalid")
+    return f"PC_RECORD,1,{normalized_request_id},{normalized_action}\n".encode("ascii")
+
+
+def decode_remote_recording_ack(datagram: bytes) -> dict[str, str] | None:
+    if not datagram.startswith(b"PC_RECORD_ACK,"):
+        return None
+    try:
+        fields = datagram.decode("ascii").strip().split(",")
+    except UnicodeDecodeError:
+        return None
+    if len(fields) != 6 or fields[0].upper() != "PC_RECORD_ACK" or fields[1] != "1":
+        return None
+    request_id, action, result, state = fields[2], fields[3].upper(), fields[4].upper(), fields[5].lower()
+    if (
+        not _is_safe_remote_recording_field(request_id)
+        or action not in REMOTE_RECORDING_ACTIONS
+        or result not in REMOTE_RECORDING_RESULTS
+        or state not in REMOTE_RECORDING_STATES
+    ):
+        return None
+    return {
+        "request_id": request_id,
+        "action": action,
+        "result": result,
+        "state": state,
+    }
+
+
+def _is_safe_remote_recording_field(value: str) -> bool:
+    return bool(value) and len(value) <= 128 and all(
+        character.isascii() and (character.isalnum() or character in "-_.")
+        for character in value
+    )
+
+
+def acquire_single_instance_mutex() -> tuple[bool, object | None]:
+    """Prevent hidden/duplicate Windows monitors from sharing the UDP ports."""
+    if sys.platform != "win32":
+        return True, None
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+    handle = kernel32.CreateMutexW(None, False, "Local\\ARPoseExperimentMonitor")
+    if not handle:
+        return True, None
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return False, None
+    return True, (kernel32, handle)
+
+
+def release_single_instance_mutex(mutex: object | None) -> None:
+    if mutex is None:
+        return
+    kernel32, handle = mutex
+    kernel32.CloseHandle(handle)
 
 
 def acquire_single_instance_mutex() -> tuple[bool, object | None]:
@@ -186,8 +272,150 @@ class UploadServerBridge(QObject):
         self.status_changed.emit("Upload server stopped")
 
 
+class CombinedZarrExportThread(QThread):
+    status_changed = pyqtSignal(str)
+    completed = pyqtSignal(str, int, int)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        root: Path,
+        output: Path,
+        image_size: int = 224,
+        trim_static: bool = True,
+        static_pos_threshold: float = 1e-4,
+        static_rot_threshold: float = 1e-3,
+        write_video: bool = True,
+        video_panel_width: int = 420,
+        eef_calibration_result: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self.root = root.expanduser().resolve()
+        self.output = output.expanduser().resolve()
+        self.image_size = int(image_size)
+        self.trim_static = bool(trim_static)
+        self.static_pos_threshold = float(static_pos_threshold)
+        self.static_rot_threshold = float(static_rot_threshold)
+        self.write_video = bool(write_video)
+        self.video_panel_width = int(video_panel_width)
+        self.video_output = self.output.parent / f"{self.output.stem}_videos"
+        self.eef_calibration_result = (
+            Path(eef_calibration_result).expanduser().resolve()
+            if eef_calibration_result is not None
+            else default_eef_calibration_result()
+        )
+
+    def run(self) -> None:
+        state_path = self.root / COMBINED_ZARR_STATE_NAME
+        try:
+            datasets = [
+                dataset
+                for dataset in discover_experiments(self.root)
+                if dataset.is_complete and dataset.directory != self.output
+            ]
+            datasets.sort(key=lambda dataset: dataset.directory.name)
+            if not datasets:
+                raise RuntimeError(f"No complete capture folders found under {self.root}")
+
+            self._write_state(
+                state_path,
+                {
+                    "status": "running",
+                    "output": self.output.name,
+                    "video_output": self.video_output.name if self.write_video else "",
+                    "trim_static": self.trim_static,
+                    "eef_calibration_result": str(self.eef_calibration_result or ""),
+                    "episodes": len(datasets),
+                    "updated_at": time.time(),
+                },
+            )
+            episodes = []
+            for index, dataset in enumerate(datasets, start=1):
+                self.status_changed.emit(
+                    f"Combining {index}/{len(datasets)}: {dataset.directory.name}"
+                )
+                capture = discover_capture(dataset.directory)
+                episodes.append(
+                    build_episode(
+                        capture,
+                        image_size=self.image_size,
+                        action_source="next_obs",
+                        trim_static=self.trim_static,
+                        static_pos_threshold=self.static_pos_threshold,
+                        static_rot_threshold=self.static_rot_threshold,
+                        eef_calibration_result=self.eef_calibration_result,
+                    )
+                )
+
+            if self.output.exists():
+                if self.output.is_dir():
+                    shutil.rmtree(self.output)
+                else:
+                    self.output.unlink()
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.status_changed.emit(f"Writing {self.output.name} ...")
+            attrs = make_zarr_attrs(self.eef_calibration_result, action_source="next_obs")
+            attrs.update(
+                {
+                    "created_by": "ARPose Experiment Monitor Combined Export",
+                    "rdp_source_zarr_schema_version": RDP_SOURCE_ZARR_SCHEMA_VERSION,
+                    "source_directories": [dataset.directory.name for dataset in datasets],
+                    "magnet_key": "magnet_xyz",
+                }
+            )
+            write_zarr(self.output, episodes, attrs=attrs)
+            if self.write_video:
+                self.status_changed.emit(f"Writing synchronized videos to {self.video_output.name} ...")
+                write_episode_visualizations(
+                    self.video_output,
+                    [discover_capture(dataset.directory) for dataset in datasets],
+                    episodes,
+                    overwrite=True,
+                    panel_width=self.video_panel_width,
+                )
+
+            total_frames = sum(len(episode.timestamp) for episode in episodes)
+            self._write_state(
+                state_path,
+                {
+                    "status": "complete",
+                    "output": self.output.name,
+                    "video_output": self.video_output.name if self.write_video else "",
+                    "trim_static": self.trim_static,
+                    "eef_pose_source": attrs["eef_pose_source"],
+                    "eef_calibration_result": attrs["eef_calibration_result"],
+                    "episodes": len(episodes),
+                    "frames": total_frames,
+                    "source_directories": [dataset.directory.name for dataset in datasets],
+                    "updated_at": time.time(),
+                },
+            )
+            self.completed.emit(str(self.output), len(episodes), int(total_frames))
+        except Exception as exc:
+            self._write_state(
+                state_path,
+                {
+                    "status": "failed",
+                    "output": self.output.name,
+                    "error": str(exc),
+                    "updated_at": time.time(),
+                },
+            )
+            self.failed.emit(str(exc))
+
+    @staticmethod
+    def _write_state(path: Path, value: dict) -> None:
+        try:
+            temp_path = path.with_suffix(path.suffix + ".part")
+            temp_path.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+            temp_path.replace(path)
+        except OSError:
+            pass
+
+
 class CombinedReceiverThread(QThread):
     metrics_ready = pyqtSignal(dict)
+    recording_ack_ready = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
 
     def __init__(
@@ -207,9 +435,16 @@ class CombinedReceiverThread(QThread):
         self.running = True
         self.clock = LatencyClockCompensator()
         self.packet_times: deque[float] = deque()
+        self.recording_commands: queue.Queue[tuple[str, bytes]] = queue.Queue()
 
     def stop(self) -> None:
         self.running = False
+
+    def request_recording_action(self, action: str) -> str:
+        request_id = uuid.uuid4().hex
+        payload = encode_remote_recording_command(request_id, action)
+        self.recording_commands.put((request_id, payload))
+        return request_id
 
     def run(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -235,6 +470,16 @@ class CombinedReceiverThread(QThread):
                     except OSError:
                         pass
                     next_hello = now + 2.0
+                if self.phone_ip:
+                    while True:
+                        try:
+                            _, payload = self.recording_commands.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            sock.sendto(payload, (self.phone_ip, self.registration_port))
+                        except OSError:
+                            pass
                 try:
                     datagram, address = sock.recvfrom(65535)
                 except socket.timeout:
@@ -244,6 +489,12 @@ class CombinedReceiverThread(QThread):
 
                 receive_wall = time.time()
                 receive_mono = time.monotonic()
+                acknowledgement = decode_remote_recording_ack(datagram)
+                if acknowledgement is not None:
+                    acknowledgement["source"] = f"{address[0]}:{address[1]}"
+                    acknowledgement["received_at"] = str(receive_wall)
+                    self.recording_ack_ready.emit(acknowledgement)
+                    continue
                 try:
                     packet = decode_apm1_packet(datagram)
                 except APM1DecodeError:
@@ -446,6 +697,7 @@ class ExperimentMonitorWindow(QMainWindow):
         self.video_worker: VideoReceiverThread | None = None
         self.aruco_video_worker: VideoReceiverThread | None = None
         self.combined_worker: CombinedReceiverThread | None = None
+        self.combined_zarr_worker: CombinedZarrExportThread | None = None
         self.upload_bridge = UploadServerBridge()
         self.upload_bridge.event_received.connect(self.on_server_event)
         self.upload_bridge.status_changed.connect(self.set_service_status)
@@ -466,12 +718,21 @@ class ExperimentMonitorWindow(QMainWindow):
         self.last_combined_id = -1
         self.live_video_frames: dict[str, QImage] = {}
         self.live_video_metrics_by_camera: dict[str, dict] = {}
+        self.remote_recording_state = "disconnected"
+        self.remote_recording_requests: dict[str, tuple[str, float]] = {}
+        self.remote_recording_pending_request_id: str | None = None
+        self.remote_recording_state_updated_at = 0.0
+        self.remote_recording_last_ack_at: float | None = None
+        self.remote_recording_monitor_started_at: float | None = None
         self.plot_cursors = []
         self._build_ui()
         self.timer = QTimer(self)
         self.timer.setInterval(33)
         self.timer.timeout.connect(self.tick)
         self.timer.start()
+        self.remote_recording_poll_timer = QTimer(self)
+        self.remote_recording_poll_timer.setInterval(2000)
+        self.remote_recording_poll_timer.timeout.connect(self.poll_remote_recording_status)
         QTimer.singleShot(0, self.start_services)
 
     def _build_ui(self) -> None:
@@ -545,6 +806,21 @@ class ExperimentMonitorWindow(QMainWindow):
         layout.addLayout(camera_view, 3)
 
         side = QVBoxLayout()
+        recording_box = QGroupBox("Phone Experiment Capture")
+        recording_layout = QVBoxLayout(recording_box)
+        self.remote_recording_status = QLabel("Start the monitor to connect to the phone")
+        self.remote_recording_status.setWordWrap(True)
+        recording_layout.addWidget(self.remote_recording_status)
+        self.remote_recording_button = QPushButton("Start Experiment")
+        self.remote_recording_button.setMinimumHeight(50)
+        self.remote_recording_button.setToolTip(
+            "Starts or stops the same synchronized experiment capture as the iPhone App button"
+        )
+        self.remote_recording_button.clicked.connect(self.toggle_remote_recording)
+        recording_layout.addWidget(self.remote_recording_button)
+        side.addWidget(recording_box)
+        self._render_remote_recording_state()
+
         video_box = QGroupBox("Video / Pose Transport")
         video_form = QFormLayout(video_box)
         self.live_video_state = QLabel("Idle")
@@ -642,6 +918,12 @@ class ExperimentMonitorWindow(QMainWindow):
         self.process_gripper_button.setEnabled(False)
         self.process_gripper_button.clicked.connect(self.process_selected_gripper_video)
         uploads_layout.addWidget(self.process_gripper_button)
+        self.combine_zarr_button = QPushButton("Build Combined Source Zarr")
+        self.combine_zarr_button.clicked.connect(self.combine_all_experiments_to_zarr)
+        uploads_layout.addWidget(self.combine_zarr_button)
+        self.combined_zarr_status = QLabel("Combined zarr: not built")
+        self.combined_zarr_status.setWordWrap(True)
+        uploads_layout.addWidget(self.combined_zarr_status)
         library_layout.addWidget(uploads_box)
         splitter.addWidget(library)
 
@@ -864,8 +1146,17 @@ class ExperimentMonitorWindow(QMainWindow):
             video_port,
         )
         self.combined_worker.metrics_ready.connect(self.update_live_combined_metrics)
+        self.combined_worker.recording_ack_ready.connect(self.on_remote_recording_ack)
         self.combined_worker.status_changed.connect(self.live_sensor_status.setText)
         self.combined_worker.start()
+        self.remote_recording_requests.clear()
+        self.remote_recording_pending_request_id = None
+        self.remote_recording_state = "connecting"
+        self.remote_recording_last_ack_at = None
+        self.remote_recording_monitor_started_at = time.monotonic()
+        self._render_remote_recording_state("Waiting for phone recording status...")
+        self.remote_recording_poll_timer.start()
+        self.request_remote_recording_status()
         self.services_button.setText("Stop Monitor")
         if upload_ready:
             self.upload_health.setText(f"Upload storage: READY · listening on {bind}:{upload_port}")
@@ -887,6 +1178,13 @@ class ExperimentMonitorWindow(QMainWindow):
         QTimer.singleShot(3000, self._schedule_offline_gripper_backfill)
 
     def stop_services(self) -> None:
+        self.remote_recording_poll_timer.stop()
+        self.remote_recording_requests.clear()
+        self.remote_recording_pending_request_id = None
+        self.remote_recording_last_ack_at = None
+        self.remote_recording_monitor_started_at = None
+        self.remote_recording_state = "disconnected"
+        self._render_remote_recording_state("Monitor stopped; phone control disconnected")
         if self.video_worker is not None:
             self.video_worker.stop()
             self.video_worker.wait(1500)
@@ -903,6 +1201,152 @@ class ExperimentMonitorWindow(QMainWindow):
         self.upload_health.setText("Upload storage: stopped")
         self.upload_health.setStyleSheet("color:#616161; font-weight:700;")
         self.services_button.setText("Start Monitor")
+
+    def toggle_remote_recording(self) -> None:
+        if self.remote_recording_pending_request_id is not None:
+            return
+        if self.remote_recording_state == "idle":
+            action = "START"
+        elif self.remote_recording_state == "recording":
+            action = "STOP"
+        else:
+            return
+
+        request_id = self._queue_remote_recording_action(action)
+        if request_id is None:
+            self._render_remote_recording_state("Monitor is not connected to the phone")
+            return
+        self.remote_recording_pending_request_id = request_id
+        self._render_remote_recording_state(
+            "Requesting experiment start..." if action == "START" else "Requesting stop and save..."
+        )
+        QTimer.singleShot(
+            3000,
+            lambda pending_id=request_id: self._handle_remote_recording_timeout(pending_id),
+        )
+
+    def request_remote_recording_status(self) -> None:
+        self._queue_remote_recording_action("STATUS")
+
+    def poll_remote_recording_status(self) -> None:
+        if self.combined_worker is None:
+            return
+        now = time.monotonic()
+        self.remote_recording_requests = {
+            request_id: request
+            for request_id, request in self.remote_recording_requests.items()
+            if now - request[1] <= 10.0
+        }
+        last_contact = self.remote_recording_last_ack_at
+        started_at = self.remote_recording_monitor_started_at
+        if (
+            (last_contact is not None and now - last_contact > 5.0)
+            or (last_contact is None and started_at is not None and now - started_at > 5.0)
+        ):
+            self.remote_recording_state = "disconnected"
+            self._render_remote_recording_state(
+                "No recording-control reply from phone; open/rebuild the App and check Phone IP"
+            )
+        self.request_remote_recording_status()
+
+    def _queue_remote_recording_action(self, action: str) -> str | None:
+        worker = self.combined_worker
+        if worker is None:
+            return None
+        request_id = worker.request_recording_action(action)
+        self.remote_recording_requests[request_id] = (action, time.monotonic())
+        return request_id
+
+    def on_remote_recording_ack(self, acknowledgement: dict) -> None:
+        request_id = str(acknowledgement.get("request_id", ""))
+        request = self.remote_recording_requests.pop(request_id, None)
+        if request is None:
+            return
+        requested_action, sent_at = request
+        now = time.monotonic()
+        self.remote_recording_last_ack_at = now
+        if requested_action == "STATUS" and sent_at < self.remote_recording_state_updated_at:
+            return
+
+        pending_id = self.remote_recording_pending_request_id
+        if requested_action == "STATUS" and pending_id is not None:
+            pending_action = self.remote_recording_requests.get(pending_id, ("", 0.0))[0]
+            reached_requested_state = (
+                pending_action == "START" and acknowledgement.get("state") == "recording"
+            ) or (
+                pending_action == "STOP" and acknowledgement.get("state") in {"saving", "idle"}
+            )
+            if reached_requested_state:
+                self.remote_recording_requests.pop(pending_id, None)
+                self.remote_recording_pending_request_id = None
+
+        if request_id == self.remote_recording_pending_request_id:
+            self.remote_recording_pending_request_id = None
+        state = str(acknowledgement.get("state", "busy"))
+        result = str(acknowledgement.get("result", "REJECTED"))
+        action = str(acknowledgement.get("action", requested_action))
+        self.remote_recording_state = state
+        if action != "STATUS":
+            self.remote_recording_state_updated_at = now
+
+        if result == "OK":
+            message = {
+                "idle": "Phone ready; capture is idle",
+                "recording": "Recording synchronized experiment on phone",
+                "saving": "Phone is saving and uploading the experiment...",
+                "busy": "Phone recorder is busy",
+            }.get(state, f"Phone state: {state}")
+        else:
+            message = f"Phone rejected {action.lower()} request (state: {state})"
+        self._render_remote_recording_state(message)
+
+    def _handle_remote_recording_timeout(self, request_id: str) -> None:
+        if request_id != self.remote_recording_pending_request_id:
+            return
+        action = self.remote_recording_requests.pop(request_id, ("command", 0.0))[0]
+        self.remote_recording_pending_request_id = None
+        self._render_remote_recording_state(
+            f"Phone did not acknowledge {action.lower()}; no recording state was assumed"
+        )
+
+    def _set_remote_recording_state(self, state: str, message: str) -> None:
+        self.remote_recording_state = state
+        self.remote_recording_state_updated_at = time.monotonic()
+        self._render_remote_recording_state(message)
+
+    def _render_remote_recording_state(self, message: str | None = None) -> None:
+        if not hasattr(self, "remote_recording_button"):
+            return
+        state = self.remote_recording_state
+        pending = self.remote_recording_pending_request_id is not None
+        if pending:
+            action = self.remote_recording_requests.get(
+                self.remote_recording_pending_request_id,
+                ("", 0.0),
+            )[0]
+            self.remote_recording_button.setText(
+                "Starting..." if action == "START" else "Stopping & Saving..."
+            )
+        elif state == "recording":
+            self.remote_recording_button.setText("Stop & Save Experiment")
+        elif state == "saving":
+            self.remote_recording_button.setText("Saving...")
+        else:
+            self.remote_recording_button.setText("Start Experiment")
+
+        self.remote_recording_button.setEnabled(
+            not pending and state in {"idle", "recording"}
+        )
+        color = "#c62828" if state == "recording" else "#1565c0"
+        if pending or state not in {"idle", "recording"}:
+            color = "#616161"
+        self.remote_recording_button.setStyleSheet(
+            f"QPushButton {{ background:{color}; color:white; font-weight:700; "
+            "border:0; border-radius:6px; padding:8px; }} "
+            "QPushButton:disabled { background:#9e9e9e; color:#eeeeee; }"
+        )
+        if message is not None:
+            self.remote_recording_status.setText(message)
 
     def apply_aruco_configuration(self, _config: object) -> None:
         was_running = self.video_worker is not None
@@ -1124,6 +1568,20 @@ class ExperimentMonitorWindow(QMainWindow):
         if event.get("type") == "experiment_control":
             self.diagnostics.handle_control(event)
             self.set_service_status(f"Experiment {event.get('event')}: {event.get('experiment_id')}")
+            control_event = str(event.get("event", "")).lower()
+            experiment_id = str(event.get("experiment_id", ""))
+            if control_event == "start":
+                self.remote_recording_pending_request_id = None
+                self._set_remote_recording_state(
+                    "recording",
+                    f"Recording experiment {experiment_id}",
+                )
+            elif control_event == "stop":
+                self.remote_recording_pending_request_id = None
+                self._set_remote_recording_state(
+                    "saving",
+                    f"Saving and uploading experiment {experiment_id}...",
+                )
         if event.get("type") == "upload":
             self.set_service_status(f"Received {event.get('component')} for {event.get('capture_id')}")
         if event.get("type") == "zarr":
@@ -1147,6 +1605,7 @@ class ExperimentMonitorWindow(QMainWindow):
     def refresh_experiments(self) -> None:
         current_id = self.dataset.experiment_id if self.dataset else None
         self.datasets = discover_experiments(Path(self.root_edit.text()))
+        self._update_combined_zarr_status()
         self.experiment_list.blockSignals(True)
         self.experiment_list.clear()
         selected_row = -1
@@ -1165,6 +1624,7 @@ class ExperimentMonitorWindow(QMainWindow):
             self.dataset = None
             self._update_phone_upload_files(None)
             self._update_offline_gripper_status(None)
+            self._update_combined_zarr_status()
 
     def load_experiment(self, row: int) -> None:
         if row < 0 or row >= len(self.datasets):
@@ -1242,6 +1702,84 @@ class ExperimentMonitorWindow(QMainWindow):
         if self.dataset is None:
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.dataset.directory)))
+
+    def combine_all_experiments_to_zarr(self) -> None:
+        if self.combined_zarr_worker is not None and self.combined_zarr_worker.isRunning():
+            self.set_service_status("Combined zarr export is already running")
+            return
+        root = Path(self.root_edit.text()).expanduser().resolve()
+        output = root / COMBINED_ZARR_NAME
+        self.combine_zarr_button.setEnabled(False)
+        self.combined_zarr_status.setText(
+            f"Combined zarr: preparing {output.name} with start static trimming and videos ..."
+        )
+        self.set_service_status(f"Building combined source zarr: {output}")
+
+        worker = CombinedZarrExportThread(root=root, output=output)
+        worker.status_changed.connect(self.on_combined_zarr_status)
+        worker.completed.connect(self.on_combined_zarr_complete)
+        worker.failed.connect(self.on_combined_zarr_failed)
+        worker.finished.connect(self.on_combined_zarr_worker_finished)
+        self.combined_zarr_worker = worker
+        worker.start()
+
+    def on_combined_zarr_status(self, message: str) -> None:
+        self.combined_zarr_status.setText(f"Combined zarr: {message}")
+        self.set_service_status(message)
+
+    def on_combined_zarr_complete(self, output: str, episodes: int, frames: int) -> None:
+        video_dir = Path(output).parent / f"{Path(output).stem}_videos"
+        self.combined_zarr_status.setText(
+            f"Combined zarr: ready · {Path(output).name} · videos {video_dir.name} · "
+            f"{episodes} episodes · {frames} frames"
+        )
+        self.set_service_status(f"Combined source zarr ready: {output}")
+
+    def on_combined_zarr_failed(self, error: str) -> None:
+        self.combined_zarr_status.setText(f"Combined zarr: failed · {error}")
+        self.set_service_status(f"Combined zarr failed: {error}")
+
+    def on_combined_zarr_worker_finished(self) -> None:
+        self.combine_zarr_button.setEnabled(True)
+        self.combined_zarr_worker = None
+        self._update_combined_zarr_status()
+
+    def _update_combined_zarr_status(self) -> None:
+        if not hasattr(self, "combined_zarr_status"):
+            return
+        root = Path(self.root_edit.text()).expanduser().resolve()
+        output = root / COMBINED_ZARR_NAME
+        state_path = root / COMBINED_ZARR_STATE_NAME
+        state = {}
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        status = str(state.get("status", ""))
+        if output.is_dir() and status == "complete":
+            episodes = state.get("episodes")
+            frames = state.get("frames")
+            video_output = state.get("video_output")
+            detail = []
+            if video_output:
+                detail.append(f"videos {video_output}")
+            if episodes is not None:
+                detail.append(f"{episodes} episodes")
+            if frames is not None:
+                detail.append(f"{frames} frames")
+            suffix = " · " + " · ".join(detail) if detail else ""
+            self.combined_zarr_status.setText(f"Combined zarr: ready · {output.name}{suffix}")
+        elif status == "running":
+            self.combined_zarr_status.setText(f"Combined zarr: running · {output.name}")
+        elif status == "failed":
+            self.combined_zarr_status.setText(f"Combined zarr: failed · {state.get('error', 'unknown error')}")
+        elif output.is_dir():
+            self.combined_zarr_status.setText(f"Combined zarr: ready · {output.name}")
+        else:
+            self.combined_zarr_status.setText(f"Combined zarr: not built · output {output.name}")
 
     def _update_phone_upload_files(self, directory: Path | None) -> None:
         self.phone_upload_table.setRowCount(0)
@@ -1596,6 +2134,10 @@ class ExperimentMonitorWindow(QMainWindow):
             self.plot_cursors.append(cursor)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self.combined_zarr_worker is not None and self.combined_zarr_worker.isRunning():
+            self.set_service_status("Combined zarr export is still running; wait for it to finish before closing.")
+            event.ignore()
+            return
         self.playback.close()
         self.stop_services()
         self.diagnostics.close()

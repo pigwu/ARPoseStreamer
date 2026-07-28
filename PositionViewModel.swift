@@ -624,6 +624,40 @@ final class PositionViewModel: ObservableObject {
         activeExperiment = nil
     }
 
+    private var remoteRecordingState: String {
+        if recordingPhase.isSaving {
+            return "saving"
+        }
+        if activeExperiment != nil || canStopRecording {
+            return "recording"
+        }
+        if recordingPhase.isTerminal {
+            return "idle"
+        }
+        return "busy"
+    }
+
+    private func handleRemoteRecordingCommand(
+        _ command: RemoteRecordingCommand
+    ) -> (accepted: Bool, state: String) {
+        switch command.action {
+        case .status:
+            return (true, remoteRecordingState)
+        case .start:
+            guard canStartRecording, activeExperiment == nil else {
+                return (false, remoteRecordingState)
+            }
+            startRecording()
+            return (activeExperiment != nil, remoteRecordingState)
+        case .stop:
+            guard canStopRecording else {
+                return (false, remoteRecordingState)
+            }
+            stopRecording()
+            return (true, "saving")
+        }
+    }
+
     func resetOrigin() {
         sender?.resetOrigin()
     }
@@ -1118,6 +1152,18 @@ final class PositionViewModel: ObservableObject {
         gateway.onStatsChanged = { [weak self] stats in
             Task { @MainActor [weak self] in
                 self?.magneticStats = stats
+            }
+        }
+
+        gateway.onRemoteRecordingCommand = { [weak self, weak gateway] command in
+            Task { @MainActor [weak self, weak gateway] in
+                guard let self else { return }
+                let response = self.handleRemoteRecordingCommand(command)
+                gateway?.acknowledgeRemoteRecordingCommand(
+                    command,
+                    accepted: response.accepted,
+                    state: response.state
+                )
             }
         }
 
