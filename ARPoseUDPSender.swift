@@ -18,6 +18,7 @@ private final class ExperimentRecordingContext {
         expectedFrameRate: 10
     )
     let poseSessionRecorder = PoseDataSessionRecorder()
+    var isDiscarded = false
 }
 
 final class ARPoseUDPSender: NSObject, ARSessionDelegate {
@@ -700,10 +701,30 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         }
     }
 
+    func discardRecording() {
+        arQueue.async { [weak self] in
+            guard let self, let context = self.activeRecordingContext else { return }
+
+            context.isDiscarded = true
+            self.activeRecordingContext = nil
+            self.isRecordingEnabled = false
+            context.videoRecorder.discardRecording()
+            context.ultraWideVideoRecorder.discardRecording()
+            context.poseSessionRecorder.discardSession()
+
+            if !self.isStreamingEnabled {
+                self.pauseSessionIfNeeded()
+            }
+        }
+    }
+
     private func configureRecordingCallbacks(for context: ExperimentRecordingContext) {
         context.videoRecorder.onStatusChange = { [weak self, weak context] status in
             self?.arQueue.async { [weak self, weak context] in
                 guard let self, let context else { return }
+                if context.isDiscarded {
+                    guard case .discarded = status else { return }
+                }
                 let isCurrentContext = self.activeRecordingContext === context
 
                 if case .failed(let message) = status, isCurrentContext {
@@ -738,6 +759,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
         context.ultraWideVideoRecorder.onStatusChange = { [weak self, weak context] status in
             self?.arQueue.async { [weak self, weak context] in
                 guard let self, let context else { return }
+                if context.isDiscarded {
+                    guard case .discarded = status else { return }
+                }
                 guard
                     self.activeRecordingContext === context ||
                     self.activeRecordingContext == nil

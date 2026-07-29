@@ -4,6 +4,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -165,6 +166,48 @@ def resolve_experiment_directory(
             existing.mkdir(parents=True, exist_ok=True)
         _claim_experiment_directory(existing, capture_id, start_unix)
         return existing
+
+
+def discard_experiment_directory(
+    root: Path,
+    capture_id: str,
+    directory: Path | None = None,
+) -> bool:
+    root = root.expanduser().resolve()
+    with EXPERIMENT_DIRECTORY_LOCK:
+        if directory is None:
+            try:
+                directory = find_experiment_directory(root, capture_id)
+            except OSError:
+                return False
+        if directory is None:
+            return True
+        try:
+            directory = directory.expanduser().resolve()
+            if directory.parent != root:
+                return False
+            if not directory.exists():
+                return True
+            identity = experiment_directory_identity(directory)
+            if identity not in ("", capture_id):
+                return False
+            shutil.rmtree(directory)
+        except OSError:
+            return False
+        return not directory.exists()
+
+
+def retry_discard_experiment_directory(
+    root: Path,
+    capture_id: str,
+    directory: Path | None = None,
+    attempts: int = 30,
+    delay_seconds: float = 0.1,
+) -> None:
+    for _ in range(max(1, attempts)):
+        if discard_experiment_directory(root, capture_id, directory):
+            return
+        time.sleep(max(0.01, delay_seconds))
 
 
 def _claim_experiment_directory(directory: Path, capture_id: str, start_unix: float | None) -> None:
@@ -547,8 +590,34 @@ class UploadHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Invalid experiment control payload")
             return
 
-        if event not in {"start", "stop"}:
-            self.send_error(400, "Experiment event must be start or stop")
+        if event not in {"start", "stop", "discard"}:
+            self.send_error(400, "Experiment event must be start, stop, or discard")
+            return
+
+        if event == "discard":
+            existing_directory = find_experiment_directory(self.upload_root, experiment_id)
+            target_dir = existing_directory or (self.upload_root / experiment_id)
+            event_payload = {
+                "type": "experiment_control",
+                "event": event,
+                "experiment_id": experiment_id,
+                "event_unix_time": event_unix_time,
+                "event_monotonic_time": event_monotonic_time,
+                "directory": str(target_dir.resolve()),
+            }
+            self.emit_event(event_payload)
+            discarded = discard_experiment_directory(
+                self.upload_root,
+                experiment_id,
+                target_dir,
+            )
+            if not discarded:
+                threading.Thread(
+                    target=retry_discard_experiment_directory,
+                    args=(self.upload_root, experiment_id, target_dir),
+                    daemon=True,
+                ).start()
+            self.send_json(200, {"ok": True, "discarded": discarded, **event_payload})
             return
 
         target_dir = resolve_experiment_directory(

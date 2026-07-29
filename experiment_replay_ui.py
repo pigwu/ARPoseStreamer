@@ -60,7 +60,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from capture_upload_server import create_upload_server, get_default_upload_dir
+from capture_upload_server import (
+    create_upload_server,
+    discard_experiment_directory,
+    get_default_upload_dir,
+)
 from experiment_data import ExperimentDataset, TimedRows, discover_experiments
 from export_capture_to_zarr import (
     RDP_SOURCE_ZARR_SCHEMA_VERSION,
@@ -580,6 +584,8 @@ class ReceiverDiagnosticsRecorder:
             )
         elif event.get("event") == "stop":
             self._stop(experiment_id, float(event.get("event_unix_time", 0.0)))
+        elif event.get("event") == "discard":
+            self._discard(experiment_id)
 
     def _start(self, experiment_id: str, start_unix: float, directory: Path) -> None:
         if experiment_id in self.active:
@@ -624,6 +630,14 @@ class ReceiverDiagnosticsRecorder:
                     writer.writerow(row)
         part_path.unlink(missing_ok=True)
         self._register_component(Path(session["directory"]), target_path.name)
+
+    def _discard(self, experiment_id: str) -> None:
+        session = self.active.pop(experiment_id, None)
+        directory = None
+        if session is not None:
+            session["handle"].close()
+            directory = Path(session["directory"])
+        discard_experiment_directory(self.root, experiment_id, directory)
 
     @staticmethod
     def _write_row(session: dict[str, object], row: dict[str, object]) -> None:
@@ -1602,7 +1616,7 @@ class ExperimentMonitorWindow(QMainWindow):
                     "recording",
                     f"Recording experiment {experiment_id}",
                 )
-            elif control_event == "stop":
+            elif control_event in {"stop", "discard"}:
                 if (
                     (
                         self.remote_recording_experiment_id is not None
@@ -1618,7 +1632,11 @@ class ExperimentMonitorWindow(QMainWindow):
                 self.remote_recording_pending_request_id = None
                 self._set_remote_recording_state(
                     "idle",
-                    f"Experiment {experiment_id} is saving in background; ready for the next one",
+                    (
+                        f"Experiment {experiment_id} was deleted; ready for the next one"
+                        if control_event == "discard"
+                        else f"Experiment {experiment_id} is saving in background; ready for the next one"
+                    ),
                 )
         if event.get("type") == "upload":
             self.set_service_status(f"Received {event.get('component')} for {event.get('capture_id')}")

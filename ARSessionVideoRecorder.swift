@@ -8,6 +8,7 @@ enum VideoRecordingStatus {
     case recording
     case saving
     case saved(URL)
+    case discarded
     case failed(String)
 
     var isIdle: Bool {
@@ -46,7 +47,7 @@ enum VideoRecordingStatus {
         switch self {
         case .preparing, .recording:
             return true
-        case .idle, .saving, .saved, .failed:
+        case .idle, .saving, .saved, .discarded, .failed:
             return false
         }
     }
@@ -55,14 +56,14 @@ enum VideoRecordingStatus {
         switch self {
         case .preparing, .recording, .saving:
             return true
-        case .idle, .saved, .failed:
+        case .idle, .saved, .discarded, .failed:
             return false
         }
     }
 
     var isTerminal: Bool {
         switch self {
-        case .idle, .saved, .failed:
+        case .idle, .saved, .discarded, .failed:
             return true
         case .preparing, .recording, .saving:
             return false
@@ -81,6 +82,8 @@ enum VideoRecordingStatus {
             return "Saving..."
         case .saved(let url):
             return "Saved: \(url.lastPathComponent)"
+        case .discarded:
+            return "Experiment deleted"
         case .failed(let message):
             return "Record failed: \(message)"
         }
@@ -125,13 +128,14 @@ final class ARSessionVideoRecorder {
                 let pixelBufferAdaptor
             else {
                 updateStatus(.failed("Recorder was not configured correctly"))
+                resetWriterState(deleteOutputFile: true)
                 return
             }
 
             if assetWriter.status == .unknown {
                 guard assetWriter.startWriting() else {
                     updateStatus(.failed(assetWriter.error?.localizedDescription ?? "Failed to start writing"))
-                    resetWriterState()
+                    resetWriterState(deleteOutputFile: true)
                     return
                 }
 
@@ -141,7 +145,7 @@ final class ARSessionVideoRecorder {
             guard assetWriter.status == .writing else {
                 if assetWriter.status == .failed {
                     updateStatus(.failed(assetWriter.error?.localizedDescription ?? "Writer failed"))
-                    resetWriterState()
+                    resetWriterState(deleteOutputFile: true)
                 }
                 return
             }
@@ -155,11 +159,11 @@ final class ARSessionVideoRecorder {
                 }
             } else if isStartingFirstFrame {
                 updateStatus(.failed("Could not write first frame"))
-                resetWriterState()
+                resetWriterState(deleteOutputFile: true)
             }
         } catch {
             updateStatus(.failed(error.localizedDescription))
-            resetWriterState()
+            resetWriterState(deleteOutputFile: true)
         }
     }
 
@@ -167,7 +171,7 @@ final class ARSessionVideoRecorder {
         if recordingStatus.isPreparing {
             let status = VideoRecordingStatus.failed("No valid frame was recorded")
             assetWriter?.cancelWriting()
-            resetWriterState()
+            resetWriterState(deleteOutputFile: true)
             updateStatus(status)
             completion(status)
             return
@@ -182,7 +186,7 @@ final class ARSessionVideoRecorder {
             let status = VideoRecordingStatus.failed("No active recording to stop")
             updateStatus(status)
             completion(status)
-            resetWriterState()
+            resetWriterState(deleteOutputFile: true)
             return
         }
 
@@ -205,7 +209,11 @@ final class ARSessionVideoRecorder {
                 finalStatus = .failed(assetWriter.error?.localizedDescription ?? "Failed to finish recording")
             }
 
-            self.resetWriterState()
+            if case .saved = finalStatus {
+                self.resetWriterState()
+            } else {
+                self.resetWriterState(deleteOutputFile: true)
+            }
             self.updateStatus(finalStatus)
             completion(finalStatus)
         }
@@ -215,15 +223,21 @@ final class ARSessionVideoRecorder {
         guard recordingStatus.isActive else { return }
 
         assetWriter?.cancelWriting()
-        resetWriterState()
+        resetWriterState(deleteOutputFile: true)
         updateStatus(.failed(reason))
+    }
+
+    func discardRecording() {
+        assetWriter?.cancelWriting()
+        resetWriterState(deleteOutputFile: true)
+        updateStatus(.discarded)
     }
 
     func failPreparing(_ message: String) {
         guard recordingStatus.isPreparing else { return }
 
         assetWriter?.cancelWriting()
-        resetWriterState()
+        resetWriterState(deleteOutputFile: true)
         updateStatus(.failed(message))
     }
 
@@ -238,6 +252,7 @@ final class ARSessionVideoRecorder {
         }
 
         let assetWriter = try AVAssetWriter(url: outputURL, fileType: .mp4)
+        self.outputURL = outputURL
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
@@ -277,11 +292,15 @@ final class ARSessionVideoRecorder {
         self.outputURL = outputURL
     }
 
-    private func resetWriterState() {
+    private func resetWriterState(deleteOutputFile: Bool = false) {
+        let previousOutputURL = outputURL
         assetWriter = nil
         writerInput = nil
         pixelBufferAdaptor = nil
         outputURL = nil
+        if deleteOutputFile, let previousOutputURL {
+            try? FileManager.default.removeItem(at: previousOutputURL)
+        }
     }
 
     private func updateStatus(_ status: VideoRecordingStatus) {

@@ -319,6 +319,66 @@ class ExperimentWorkflowTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(float(rows[0]["experiment_time"]), 0.125)
 
+    def test_receiver_diagnostics_discard_removes_active_experiment(self) -> None:
+        experiment_id = "discard-diagnostics-session"
+        folder = self.root / experiment_id
+        recorder = ReceiverDiagnosticsRecorder(self.root)
+        recorder.handle_control(
+            {
+                "event": "start",
+                "experiment_id": experiment_id,
+                "event_unix_time": 100.0,
+                "directory": str(folder),
+            }
+        )
+        recorder.record(
+            {
+                "kind": "pose",
+                "identifier": 1,
+                "sender_time": 100.1,
+            }
+        )
+
+        recorder.handle_control(
+            {
+                "event": "discard",
+                "experiment_id": experiment_id,
+                "event_unix_time": 100.2,
+            }
+        )
+
+        self.assertFalse(folder.exists())
+        self.assertNotIn(experiment_id, recorder.active)
+
+    def test_discard_control_removes_server_experiment_directory(self) -> None:
+        experiment_id = "ABCDEF12-3456-7890-ABCD-EF1234567890"
+        start_unix = 1_700_000_050.0
+        self._post_json(
+            "/experiment/control",
+            {
+                "event": "start",
+                "experimentID": experiment_id,
+                "eventUnixTime": start_unix,
+                "eventMonotonicTime": 100.0,
+            },
+        )
+        folder = self.root / readable_experiment_name(start_unix)
+        (folder / "receiver_transport.part.csv").write_text("partial", encoding="utf-8")
+
+        response = self._post_json(
+            "/experiment/control",
+            {
+                "event": "discard",
+                "experimentID": experiment_id,
+                "eventUnixTime": start_unix + 0.5,
+                "eventMonotonicTime": 100.5,
+            },
+        )
+
+        self.assertTrue(response["discarded"])
+        self.assertFalse(folder.exists())
+        self.assertEqual(self.events[-1]["event"], "discard")
+
     def test_uuid_folder_is_migrated_to_readable_timestamp(self) -> None:
         experiment_id = "ABCDEF12-1234-5678-9ABC-DEF012345678"
         folder = self.root / experiment_id

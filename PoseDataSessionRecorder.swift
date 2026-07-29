@@ -310,6 +310,10 @@ final class PoseDataSessionRecorder {
         reset()
     }
 
+    func discardSession() {
+        reset(deleteSessionDirectory: true)
+    }
+
     private func ensureMagneticFile() -> FileHandle? {
         if let magneticFileHandle {
             return magneticFileHandle

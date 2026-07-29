@@ -250,7 +250,14 @@ The app sends JSON control events to `POST /experiment/control` on the upload se
 }
 ```
 
-`stop` uses the same shape and UUID. After the MP4 is finalized, the app uploads all available components with `X-Upload-Kind: experiment`, the shared UUID as `X-Capture-ID`, and the start time as `X-Experiment-Start-Unix-Time`. The computer stores one timestamp-named directory per experiment (for example `20260714-205900`); the UUID remains in its metadata. Each directory contains:
+`stop` uses the same shape and UUID. The App's **End & Delete** action sends
+`discard` instead; both phone-side capture files and the matching incomplete
+computer-side experiment directory are removed, and no capture is uploaded.
+After a normal stop finalizes the MP4, the app uploads all available components
+with `X-Upload-Kind: experiment`, the shared UUID as `X-Capture-ID`, and the
+start time as `X-Experiment-Start-Unix-Time`. The computer stores one
+timestamp-named directory per experiment (for example `20260714-205900`); the
+UUID remains in its metadata. Each directory contains:
 
 - `pose.csv`
 - `magnetic.csv` when sensor samples were available

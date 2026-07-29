@@ -620,6 +620,23 @@ final class PositionViewModel: ObservableObject {
         activeExperiment = nil
     }
 
+    func discardRecording() {
+        guard canStopRecording else { return }
+
+        let stopUnixTime = Date().timeIntervalSince1970
+        let stopMonotonicTime = ProcessInfo.processInfo.systemUptime
+        sender?.discardRecording()
+        if let activeExperiment {
+            sendExperimentControlEvent(
+                experimentID: activeExperiment.id,
+                event: "discard",
+                unixTime: stopUnixTime,
+                monotonicTime: stopMonotonicTime
+            )
+        }
+        activeExperiment = nil
+    }
+
     private var remoteRecordingState: String {
         if activeExperiment != nil || canStopRecording {
             return "recording"

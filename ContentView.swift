@@ -312,12 +312,9 @@ private struct MagneticMetricsRow: View {
 
 private struct RecordButton: View {
     @ObservedObject var viewModel: PositionViewModel
+    @State private var isConfirmingDiscard = false
 
     private var title: String {
-        if viewModel.canStopRecording {
-            return "Stop & Save Experiment"
-        }
-
         if viewModel.canStartRecording {
             return "Start Experiment"
         }
@@ -329,44 +326,77 @@ private struct RecordButton: View {
         return "Start Experiment"
     }
 
-    private var systemImage: String {
-        if viewModel.canStopRecording {
-            return "stop.fill"
-        }
-
-        return "record.circle"
-    }
-
     private var isDisabled: Bool {
         !viewModel.canStartRecording && !viewModel.canStopRecording
     }
 
     var body: some View {
-        Button {
+        Group {
             if viewModel.canStopRecording {
-                viewModel.stopRecording()
+                HStack(spacing: 8) {
+                    recordingActionButton(
+                        title: "Stop & Save",
+                        systemImage: "stop.fill",
+                        background: .red
+                    ) {
+                        viewModel.stopRecording()
+                    }
+
+                    recordingActionButton(
+                        title: "Stop & Delete",
+                        systemImage: "trash.fill",
+                        background: Color.black.opacity(0.72)
+                    ) {
+                        isConfirmingDiscard = true
+                    }
+                }
             } else {
-                viewModel.startRecording()
+                Button {
+                    viewModel.startRecording()
+                } label: {
+                    Label(title, systemImage: "record.circle")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 54)
+                        .background(Color.blue, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(isDisabled)
+                .opacity(isDisabled ? 0.65 : 1)
             }
-        } label: {
+        }
+        .confirmationDialog(
+            "Delete this experiment?",
+            isPresented: $isConfirmingDiscard,
+            titleVisibility: .visible
+        ) {
+            Button("End & Delete", role: .destructive) {
+                viewModel.discardRecording()
+            }
+            Button("Continue Recording", role: .cancel) {}
+        } message: {
+            Text("The current videos and captured data will be permanently deleted and will not be uploaded.")
+        }
+    }
+
+    private func recordingActionButton(
+        title: String,
+        systemImage: String,
+        background: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
             Label(title, systemImage: systemImage)
-                .font(.headline.weight(.semibold))
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)
                 .frame(height: 54)
-                .background(buttonBackground, in: Capsule())
+                .background(background, in: Capsule())
         }
         .buttonStyle(.plain)
-        .disabled(isDisabled)
-        .opacity(isDisabled ? 0.65 : 1)
-    }
-
-    private var buttonBackground: Color {
-        if viewModel.canStopRecording {
-            return .red
-        }
-
-        return .blue
     }
 }
 
