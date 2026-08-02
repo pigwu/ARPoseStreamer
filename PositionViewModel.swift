@@ -177,6 +177,15 @@ final class PositionViewModel: ObservableObject {
             applyMagneticConfigurationIfNeeded()
         }
     }
+    @Published var leftMagneticListenPort: String {
+        didSet {
+            UserDefaults.standard.set(
+                leftMagneticListenPort,
+                forKey: Self.leftMagneticListenPortKey
+            )
+            applyMagneticConfigurationIfNeeded()
+        }
+    }
     @Published var computerRegistrationPort: String {
         didSet {
             UserDefaults.standard.set(computerRegistrationPort, forKey: Self.computerRegistrationPortKey)
@@ -263,13 +272,20 @@ final class PositionViewModel: ObservableObject {
     @Published private(set) var sensorPosition: SIMD3<Float> = .zero
     @Published private(set) var positionHistory: [PositionHistorySample] = []
     @Published private(set) var magneticHistory: [MagneticHistorySample] = []
+    @Published private(set) var leftMagneticHistory: [MagneticHistorySample] = []
     @Published private(set) var latestMagneticChips: [MagneticSensorChipValues] = Array(
+        repeating: MagneticSensorChipValues(t: 0, x: 0, y: 0, z: 0),
+        count: MagneticSensorSample.chipCount
+    )
+    @Published private(set) var latestLeftMagneticChips: [MagneticSensorChipValues] = Array(
         repeating: MagneticSensorChipValues(t: 0, x: 0, y: 0, z: 0),
         count: MagneticSensorSample.chipCount
     )
     @Published private(set) var sendStatus = "Idle"
     @Published private(set) var sensorStatus = "Sensor idle"
     @Published private(set) var magneticStatus = "Magnetic sensor idle"
+    @Published private(set) var rightMagneticStatus = "Right board idle"
+    @Published private(set) var leftMagneticStatus = "Left board idle"
     @Published private(set) var computerGatewayStatus = "Computer offline; recording locally"
     @Published private(set) var uploadStatus = "Upload idle"
     @Published private(set) var trackingStatus = "AR tracking idle"
@@ -373,7 +389,7 @@ final class PositionViewModel: ObservableObject {
     }
 
     var magneticListenSummary: String {
-        "Phone hotspot gateway listens on UDP \(magneticListenPort)"
+        "Right board UDP \(magneticListenPort); left board UDP \(leftMagneticListenPort)"
     }
 
     var combinedReceiverCommand: String {
@@ -412,6 +428,31 @@ final class PositionViewModel: ObservableObject {
         return String(format: "%.3f", magnitude)
     }
 
+    var selectedLeftMagneticValues: MagneticSensorChipValues {
+        guard latestLeftMagneticChips.indices.contains(selectedMagneticChip) else {
+            return MagneticSensorChipValues(t: 0, x: 0, y: 0, z: 0)
+        }
+        return latestLeftMagneticChips[selectedMagneticChip]
+    }
+
+    var selectedLeftMagneticMagnitudeText: String {
+        let value = selectedLeftMagneticValues
+        let magnitude = sqrt(Double(value.x * value.x + value.y * value.y + value.z * value.z))
+        return String(format: "%.3f", magnitude)
+    }
+
+    func magneticReceiveRateText(for side: MagneticBoardSide) -> String {
+        String(format: "%.1f", magneticStats[side].receiveRateHz)
+    }
+
+    func magneticLossText(for side: MagneticBoardSide) -> String {
+        String(format: "%.2f%%", magneticStats[side].lossPercent)
+    }
+
+    func magneticSequenceText(for side: MagneticBoardSide) -> String {
+        magneticStats[side].lastSequence.map(String.init) ?? "--"
+    }
+
     init() {
         let defaults = UserDefaults.standard
         hostIP = defaults.string(forKey: Self.hostIPKey) ?? "192.168.1.10"
@@ -421,6 +462,7 @@ final class PositionViewModel: ObservableObject {
         sensorPort = defaults.string(forKey: Self.sensorPortKey) ?? "5556"
         sensorAccessoryProtocol = defaults.string(forKey: Self.sensorAccessoryProtocolKey) ?? "com.example.sensor.pose"
         magneticListenPort = defaults.string(forKey: Self.magneticListenPortKey) ?? "5557"
+        leftMagneticListenPort = defaults.string(forKey: Self.leftMagneticListenPortKey) ?? "5562"
         computerRegistrationPort = defaults.string(forKey: Self.computerRegistrationPortKey) ?? "5559"
         combinedStreamPort = defaults.string(forKey: Self.combinedStreamPortKey) ?? "5558"
         autoStartMagneticSensor = Self.storedBool(defaults, key: Self.autoStartMagneticSensorKey, fallback: true)
@@ -540,10 +582,15 @@ final class PositionViewModel: ObservableObject {
 
     func startMagneticSensor() {
         guard
-            let listenPort = normalizedPort(magneticListenPort),
+            let rightListenPort = normalizedPort(magneticListenPort),
+            let leftListenPort = normalizedPort(leftMagneticListenPort),
             let registrationPort = normalizedPort(computerRegistrationPort)
         else {
-            magneticStatus = "Invalid magnetic or computer registration port"
+            magneticStatus = "Invalid right, left, or computer registration port"
+            return
+        }
+        guard Set([rightListenPort, leftListenPort, registrationPort]).count == 3 else {
+            magneticStatus = "Right, left, and computer ports must be different"
             return
         }
 
@@ -551,8 +598,14 @@ final class PositionViewModel: ObservableObject {
             configureMagneticGateway()
         }
 
-        magneticGateway?.start(sensorPort: listenPort, computerPort: registrationPort)
-        magneticStatus = "Starting hotspot magnetic listener"
+        magneticGateway?.start(
+            rightSensorPort: rightListenPort,
+            leftSensorPort: leftListenPort,
+            computerPort: registrationPort
+        )
+        magneticStatus = "Starting right and left hotspot listeners"
+        rightMagneticStatus = "Starting UDP \(rightListenPort)"
+        leftMagneticStatus = "Starting UDP \(leftListenPort)"
     }
 
     func stopMagneticSensor() {
@@ -560,6 +613,8 @@ final class PositionViewModel: ObservableObject {
         isMagneticListening = false
         isComputerConnected = false
         magneticStatus = "Magnetic sensor idle"
+        rightMagneticStatus = "Right board idle"
+        leftMagneticStatus = "Left board idle"
         computerGatewayStatus = "Computer offline; recording locally"
     }
 
@@ -804,7 +859,14 @@ final class PositionViewModel: ObservableObject {
                 UploadDescriptor(fileURL: captureLibraryStore.urlForPoseCSV(record: record), component: "pose_csv")
             ]
             if let magneticURL = captureLibraryStore.urlForMagneticCSV(record: record) {
-                dataDescriptors.append(UploadDescriptor(fileURL: magneticURL, component: "magnetic_csv"))
+                dataDescriptors.append(
+                    UploadDescriptor(fileURL: magneticURL, component: "magnetic_right_csv")
+                )
+            }
+            if let magneticURL = captureLibraryStore.urlForLeftMagneticCSV(record: record) {
+                dataDescriptors.append(
+                    UploadDescriptor(fileURL: magneticURL, component: "magnetic_left_csv")
+                )
             }
             dataDescriptors.append(
                 UploadDescriptor(fileURL: captureLibraryStore.urlForManifest(record: record), component: "manifest")
@@ -815,7 +877,14 @@ final class PositionViewModel: ObservableObject {
                 UploadDescriptor(fileURL: captureLibraryStore.urlForPoseCSV(record: record), component: "pose_csv")
             ]
             if let magneticURL = captureLibraryStore.urlForMagneticCSV(record: record) {
-                experimentDescriptors.append(UploadDescriptor(fileURL: magneticURL, component: "magnetic_csv"))
+                experimentDescriptors.append(
+                    UploadDescriptor(fileURL: magneticURL, component: "magnetic_right_csv")
+                )
+            }
+            if let magneticURL = captureLibraryStore.urlForLeftMagneticCSV(record: record) {
+                experimentDescriptors.append(
+                    UploadDescriptor(fileURL: magneticURL, component: "magnetic_left_csv")
+                )
             }
             if let senderTransportURL = captureLibraryStore.urlForSenderTransportCSV(record: record) {
                 experimentDescriptors.append(UploadDescriptor(fileURL: senderTransportURL, component: "sender_transport"))
@@ -1127,13 +1196,20 @@ final class PositionViewModel: ObservableObject {
     private func bindMagneticGatewayCallbacks() {
         guard let gateway = magneticGateway else { return }
         let currentSender = sender
-        var lastUIPublishTime: TimeInterval = 0
+        var lastRightUIPublishTime: TimeInterval = 0
+        var lastLeftUIPublishTime: TimeInterval = 0
 
         gateway.onSampleReceived = { [weak currentSender, weak self] sample in
             currentSender?.appendMagneticSample(sample)
 
-            guard sample.receivedMonotonicTime - lastUIPublishTime >= 0.05 else { return }
-            lastUIPublishTime = sample.receivedMonotonicTime
+            switch sample.boardSide {
+            case .right:
+                guard sample.receivedMonotonicTime - lastRightUIPublishTime >= 0.05 else { return }
+                lastRightUIPublishTime = sample.receivedMonotonicTime
+            case .left:
+                guard sample.receivedMonotonicTime - lastLeftUIPublishTime >= 0.05 else { return }
+                lastLeftUIPublishTime = sample.receivedMonotonicTime
+            }
             Task { @MainActor [weak self] in
                 self?.updateMagneticUI(with: sample)
             }
@@ -1142,6 +1218,17 @@ final class PositionViewModel: ObservableObject {
         gateway.onSensorStatusChanged = { [weak self] status in
             Task { @MainActor [weak self] in
                 self?.magneticStatus = status
+            }
+        }
+
+        gateway.onBoardStatusChanged = { [weak self] side, status in
+            Task { @MainActor [weak self] in
+                switch side {
+                case .right:
+                    self?.rightMagneticStatus = status
+                case .left:
+                    self?.leftMagneticStatus = status
+                }
             }
         }
 
@@ -1208,19 +1295,24 @@ final class PositionViewModel: ObservableObject {
     private func applyMagneticConfigurationIfNeeded() {
         guard
             isMagneticListening,
-            let listenPort = normalizedPort(magneticListenPort),
+            let rightListenPort = normalizedPort(magneticListenPort),
+            let leftListenPort = normalizedPort(leftMagneticListenPort),
             let registrationPort = normalizedPort(computerRegistrationPort)
         else { return }
 
-        magneticGateway?.start(sensorPort: listenPort, computerPort: registrationPort)
+        magneticGateway?.start(
+            rightSensorPort: rightListenPort,
+            leftSensorPort: leftListenPort,
+            computerPort: registrationPort
+        )
     }
 
     private func updateMagneticUI(with sample: MagneticSensorSample) {
-        latestMagneticChips = sample.chips
         let selectedIndex = min(max(selectedMagneticChip, 0), sample.chips.count - 1)
         let selected = sample.chips[selectedIndex]
         latestMagneticSummary = String(
-            format: "#%u  S%d  t=%.3f  x=%.3f  y=%.3f  z=%.3f",
+            format: "%@ #%u  S%d  t=%.3f  x=%.3f  y=%.3f  z=%.3f",
+            sample.boardSide.displayName,
             sample.sequence,
             selectedIndex,
             selected.t,
@@ -1232,18 +1324,28 @@ final class PositionViewModel: ObservableObject {
         let magnitudes = sample.chips.map { chip in
             sqrt(Double(chip.x * chip.x + chip.y * chip.y + chip.z * chip.z))
         }
-        magneticHistory.append(
+        let historySample =
             MagneticHistorySample(
                 timestamp: sample.receivedMonotonicTime,
                 sequence: sample.sequence,
                 magnitudes: magnitudes
             )
-        )
-
         let cutoff = sample.receivedMonotonicTime - 5
-        magneticHistory.removeAll { $0.timestamp < cutoff }
-        if magneticHistory.count > maxMagneticHistorySamples {
-            magneticHistory.removeFirst(magneticHistory.count - maxMagneticHistorySamples)
+        switch sample.boardSide {
+        case .right:
+            latestMagneticChips = sample.chips
+            magneticHistory.append(historySample)
+            magneticHistory.removeAll { $0.timestamp < cutoff }
+            if magneticHistory.count > maxMagneticHistorySamples {
+                magneticHistory.removeFirst(magneticHistory.count - maxMagneticHistorySamples)
+            }
+        case .left:
+            latestLeftMagneticChips = sample.chips
+            leftMagneticHistory.append(historySample)
+            leftMagneticHistory.removeAll { $0.timestamp < cutoff }
+            if leftMagneticHistory.count > maxMagneticHistorySamples {
+                leftMagneticHistory.removeFirst(leftMagneticHistory.count - maxMagneticHistorySamples)
+            }
         }
     }
 
@@ -1349,6 +1451,7 @@ final class PositionViewModel: ObservableObject {
     private static let sensorPortKey = "ARPoseStreamer.sensorPort"
     private static let sensorAccessoryProtocolKey = "ARPoseStreamer.sensorAccessoryProtocol"
     private static let magneticListenPortKey = "ARPoseStreamer.magnetic.listenPort"
+    private static let leftMagneticListenPortKey = "ARPoseStreamer.magnetic.leftListenPort"
     private static let computerRegistrationPortKey = "ARPoseStreamer.magnetic.computerRegistrationPort"
     private static let combinedStreamPortKey = "ARPoseStreamer.magnetic.combinedStreamPort"
     private static let autoStartMagneticSensorKey = "ARPoseStreamer.magnetic.autoStart"

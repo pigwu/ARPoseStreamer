@@ -17,6 +17,8 @@ UPLOAD_CHUNK_SIZE = 64 * 1024
 COMPONENT_FILENAMES = {
     "pose_csv": "pose.csv",
     "magnetic_csv": "magnetic.csv",
+    "magnetic_right_csv": "magnetic_right.csv",
+    "magnetic_left_csv": "magnetic_left.csv",
     "sender_transport": "sender_transport.csv",
     "receiver_transport": "receiver_transport.csv",
     "manifest": "capture_manifest.json",
@@ -24,6 +26,14 @@ COMPONENT_FILENAMES = {
 PHONE_COMPONENT_CANDIDATES = {
     "pose_csv": ("pose.csv", "pose_csv__pose.csv"),
     "magnetic_csv": ("magnetic.csv", "magnetic_csv__magnetic.csv"),
+    "magnetic_right_csv": (
+        "magnetic_right.csv",
+        "magnetic_right_csv__magnetic_right.csv",
+    ),
+    "magnetic_left_csv": (
+        "magnetic_left.csv",
+        "magnetic_left_csv__magnetic_left.csv",
+    ),
     "sender_transport": ("sender_transport.csv", "sender_transport__sender_transport.csv"),
     "video": ("video.mp4", "video.mov", "video.m4v"),
     "ultrawide_video": ("ultrawide_video.mp4", "ultrawide_video.mov", "ultrawide_video.m4v"),

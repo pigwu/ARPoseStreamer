@@ -13,18 +13,15 @@ struct RemoteRecordingCommand {
     fileprivate let connectionID: UUID
 }
 
-struct MagneticGatewayStats: Equatable, Sendable {
+struct MagneticBoardStats: Equatable, Sendable {
     var receivedPackets: UInt64 = 0
     var invalidPackets: UInt64 = 0
     var droppedPackets: UInt64 = 0
     var duplicatePackets: UInt64 = 0
     var outOfOrderPackets: UInt64 = 0
-    var pendingOverflows: UInt64 = 0
-    var combinedPacketsSent: UInt64 = 0
     var receiveRateHz: Double = 0
     var lastSequence: UInt32?
-    var boardEndpoint = ""
-    var computerEndpoint = ""
+    var endpoint = ""
 
     var lossPercent: Double {
         let expected = receivedPackets + droppedPackets
@@ -33,12 +30,68 @@ struct MagneticGatewayStats: Equatable, Sendable {
     }
 }
 
+struct MagneticGatewayStats: Equatable, Sendable {
+    var rightBoard = MagneticBoardStats()
+    var leftBoard = MagneticBoardStats()
+    var pendingOverflows: UInt64 = 0
+    var combinedPacketsSent: UInt64 = 0
+    var computerEndpoint = ""
+
+    subscript(side: MagneticBoardSide) -> MagneticBoardStats {
+        get {
+            switch side {
+            case .right:
+                return rightBoard
+            case .left:
+                return leftBoard
+            }
+        }
+        set {
+            switch side {
+            case .right:
+                rightBoard = newValue
+            case .left:
+                leftBoard = newValue
+            }
+        }
+    }
+
+    var receivedPackets: UInt64 { rightBoard.receivedPackets + leftBoard.receivedPackets }
+    var invalidPackets: UInt64 { rightBoard.invalidPackets + leftBoard.invalidPackets }
+    var droppedPackets: UInt64 { rightBoard.droppedPackets + leftBoard.droppedPackets }
+    var duplicatePackets: UInt64 { rightBoard.duplicatePackets + leftBoard.duplicatePackets }
+    var outOfOrderPackets: UInt64 { rightBoard.outOfOrderPackets + leftBoard.outOfOrderPackets }
+    var receiveRateHz: Double { rightBoard.receiveRateHz + leftBoard.receiveRateHz }
+    var lastSequence: UInt32? { rightBoard.lastSequence }
+    var boardEndpoint: String {
+        [
+            rightBoard.endpoint.isEmpty ? nil : "Right: \(rightBoard.endpoint)",
+            leftBoard.endpoint.isEmpty ? nil : "Left: \(leftBoard.endpoint)"
+        ]
+        .compactMap { $0 }
+        .joined(separator: "; ")
+    }
+
+    var lossPercent: Double {
+        let expected = receivedPackets + droppedPackets
+        guard expected > 0 else { return 0 }
+        return Double(droppedPackets) * 100 / Double(expected)
+    }
+}
+
+private struct MagneticSensorConnection {
+    let connection: NWConnection
+    let side: MagneticBoardSide
+    let listenPort: UInt16
+}
+
 /// Receives ASKN datagrams from a board connected to the iPhone Personal
 /// Hotspot, keeps local collection independent from computer availability, and
-/// forwards APM1 packets after a computer registers with PC_HELLO.
+/// forwards APM2 packets after a computer registers with PC_HELLO.
 final class MagneticSensorHotspotGateway {
     var onSampleReceived: ((MagneticSensorSample) -> Void)?
     var onSensorStatusChanged: ((String) -> Void)?
+    var onBoardStatusChanged: ((MagneticBoardSide, String) -> Void)?
     var onComputerStatusChanged: ((String) -> Void)?
     var onComputerAvailabilityChanged: ((Bool) -> Void)?
     var onListeningChanged: ((Bool) -> Void)?
@@ -52,35 +105,44 @@ final class MagneticSensorHotspotGateway {
     private let computerOfflineTimeout: TimeInterval = 5.0
     private let poseSilenceFlushInterval: TimeInterval = 0.05
 
-    private var sensorListener: NWListener?
+    private var sensorListeners: [MagneticBoardSide: NWListener] = [:]
     private var computerListener: NWListener?
-    private var sensorConnections: [UUID: NWConnection] = [:]
+    private var sensorConnections: [UUID: MagneticSensorConnection] = [:]
     private var computerConnections: [UUID: NWConnection] = [:]
     private var acknowledgedSensorConnections: Set<UUID> = []
     private var combinedConnection: NWConnection?
     private var combinedConnectionReady = false
     private var timer: DispatchSourceTimer?
 
-    private var sensorListenPort: UInt16 = 5557
+    private var rightSensorListenPort: UInt16 = 5557
+    private var leftSensorListenPort: UInt16 = 5562
     private var computerRegistrationPort: UInt16 = 5559
     private var registeredComputerHost: NWEndpoint.Host?
     private var registeredCombinedPort: UInt16?
     private var registeredVideoPort: UInt16?
-    private var lastSensorMessageTime: TimeInterval?
+    private var lastSensorMessageTimes: [MagneticBoardSide: TimeInterval] = [:]
     private var lastComputerHeartbeatTime: TimeInterval?
     private var lastPoseArrivalTime: TimeInterval?
     private var pendingMagneticSamples: [MagneticSensorSample] = []
-    private var receiveTimes: [TimeInterval] = []
+    private var receiveTimes: [MagneticBoardSide: [TimeInterval]] = [:]
     private var lastStatsPublishTime: TimeInterval = 0
-    private var lastMCUTimeUs: UInt64?
+    private var lastMCUTimesUs: [MagneticBoardSide: UInt64] = [:]
     private var stats = MagneticGatewayStats()
     private var sessionID = UUID()
     private var combinedPacketSequence: UInt32 = 0
     private var isRunning = false
 
-    func start(sensorPort: UInt16 = 5557, computerPort: UInt16 = 5559) {
+    func start(
+        rightSensorPort: UInt16 = 5557,
+        leftSensorPort: UInt16 = 5562,
+        computerPort: UInt16 = 5559
+    ) {
         queue.async { [weak self] in
-            self?.startLocked(sensorPort: sensorPort, computerPort: computerPort)
+            self?.startLocked(
+                rightSensorPort: rightSensorPort,
+                leftSensorPort: leftSensorPort,
+                computerPort: computerPort
+            )
         }
     }
 
@@ -119,13 +181,30 @@ final class MagneticSensorHotspotGateway {
         }
     }
 
-    private func startLocked(sensorPort: UInt16, computerPort: UInt16) {
-        if isRunning, sensorListenPort == sensorPort, computerRegistrationPort == computerPort {
+    private func startLocked(
+        rightSensorPort: UInt16,
+        leftSensorPort: UInt16,
+        computerPort: UInt16
+    ) {
+        if
+            isRunning,
+            rightSensorListenPort == rightSensorPort,
+            leftSensorListenPort == leftSensorPort,
+            computerRegistrationPort == computerPort
+        {
             return
         }
 
         stopLocked(publishStoppedState: false)
-        sensorListenPort = sensorPort
+        guard Set([rightSensorPort, leftSensorPort, computerPort]).count == 3 else {
+            let error = MagneticGatewayError.duplicatePorts
+            onError?(error)
+            onSensorStatusChanged?(error.localizedDescription)
+            onListeningChanged?(false)
+            return
+        }
+        rightSensorListenPort = rightSensorPort
+        leftSensorListenPort = leftSensorPort
         computerRegistrationPort = computerPort
         stats = MagneticGatewayStats()
         lastStatsPublishTime = 0
@@ -133,23 +212,36 @@ final class MagneticSensorHotspotGateway {
         combinedPacketSequence = 0
 
         do {
-            let sensorParameters = NWParameters.udp
-            sensorParameters.allowLocalEndpointReuse = true
-            sensorParameters.includePeerToPeer = true
-            let sensorNWPort = try Self.port(sensorPort)
-            let sensorListener = try NWListener(using: sensorParameters, on: sensorNWPort)
-            self.sensorListener = sensorListener
+            for (side, listenPort) in [
+                (MagneticBoardSide.right, rightSensorPort),
+                (MagneticBoardSide.left, leftSensorPort)
+            ] {
+                let sensorParameters = NWParameters.udp
+                sensorParameters.allowLocalEndpointReuse = true
+                sensorParameters.includePeerToPeer = true
+                let sensorNWPort = try Self.port(listenPort)
+                let sensorListener = try NWListener(using: sensorParameters, on: sensorNWPort)
+                sensorListeners[side] = sensorListener
 
-            sensorListener.stateUpdateHandler = { [weak self, weak sensorListener] state in
-                guard let self, let sensorListener, self.sensorListener === sensorListener else { return }
-                self.handleSensorListenerState(state)
-            }
-            sensorListener.newConnectionHandler = { [weak self, weak sensorListener] connection in
-                guard let self, let sensorListener, self.sensorListener === sensorListener else {
-                    connection.cancel()
-                    return
+                sensorListener.stateUpdateHandler = { [weak self, weak sensorListener] state in
+                    guard
+                        let self,
+                        let sensorListener,
+                        self.sensorListeners[side] === sensorListener
+                    else { return }
+                    self.handleSensorListenerState(state, side: side, port: listenPort)
                 }
-                self.acceptSensorConnection(connection)
+                sensorListener.newConnectionHandler = { [weak self, weak sensorListener] connection in
+                    guard
+                        let self,
+                        let sensorListener,
+                        self.sensorListeners[side] === sensorListener
+                    else {
+                        connection.cancel()
+                        return
+                    }
+                    self.acceptSensorConnection(connection, side: side, listenPort: listenPort)
+                }
             }
 
             let computerParameters = NWParameters.udp
@@ -172,7 +264,7 @@ final class MagneticSensorHotspotGateway {
             }
 
             isRunning = true
-            sensorListener.start(queue: queue)
+            sensorListeners.values.forEach { $0.start(queue: queue) }
             computerListener.start(queue: queue)
             startTimerLocked()
             onListeningChanged?(true)
@@ -190,12 +282,12 @@ final class MagneticSensorHotspotGateway {
         timer?.cancel()
         timer = nil
 
-        sensorListener?.cancel()
+        sensorListeners.values.forEach { $0.cancel() }
         computerListener?.cancel()
-        sensorListener = nil
+        sensorListeners.removeAll()
         computerListener = nil
 
-        sensorConnections.values.forEach { $0.cancel() }
+        sensorConnections.values.forEach { $0.connection.cancel() }
         computerConnections.values.forEach { $0.cancel() }
         sensorConnections.removeAll()
         computerConnections.removeAll()
@@ -204,7 +296,8 @@ final class MagneticSensorHotspotGateway {
         disconnectCombinedLocked()
         pendingMagneticSamples.removeAll(keepingCapacity: false)
         receiveTimes.removeAll(keepingCapacity: false)
-        lastSensorMessageTime = nil
+        lastSensorMessageTimes.removeAll(keepingCapacity: false)
+        lastMCUTimesUs.removeAll(keepingCapacity: false)
         lastComputerHeartbeatTime = nil
         lastPoseArrivalTime = nil
         registeredComputerHost = nil
@@ -213,22 +306,30 @@ final class MagneticSensorHotspotGateway {
 
         if publishStoppedState {
             onSensorStatusChanged?("Magnetic sensor listener stopped")
+            onBoardStatusChanged?(.right, "Right board idle")
+            onBoardStatusChanged?(.left, "Left board idle")
             onComputerStatusChanged?("Computer offline")
             onComputerAvailabilityChanged?(false)
             onListeningChanged?(false)
         }
     }
 
-    private func handleSensorListenerState(_ state: NWListener.State) {
+    private func handleSensorListenerState(
+        _ state: NWListener.State,
+        side: MagneticBoardSide,
+        port: UInt16
+    ) {
         switch state {
         case .ready:
-            onSensorStatusChanged?("Waiting for sensor on hotspot UDP \(sensorListenPort)")
+            let message = "Waiting on hotspot UDP \(port)"
+            onBoardStatusChanged?(side, message)
+            onSensorStatusChanged?("Waiting for right and left magnetic boards")
         case .failed(let error):
             onError?(error)
-            stopLocked(publishStoppedState: false)
-            onSensorStatusChanged?("Magnetic listener failed: \(error.localizedDescription)")
-            onListeningChanged?(false)
-            onComputerAvailabilityChanged?(false)
+            sensorListeners[side]?.cancel()
+            sensorListeners.removeValue(forKey: side)
+            onBoardStatusChanged?(side, "Listener failed: \(error.localizedDescription)")
+            onSensorStatusChanged?("\(side.displayName) magnetic listener failed")
         case .cancelled:
             break
         default:
@@ -253,9 +354,17 @@ final class MagneticSensorHotspotGateway {
         }
     }
 
-    private func acceptSensorConnection(_ connection: NWConnection) {
+    private func acceptSensorConnection(
+        _ connection: NWConnection,
+        side: MagneticBoardSide,
+        listenPort: UInt16
+    ) {
         let id = UUID()
-        sensorConnections[id] = connection
+        sensorConnections[id] = MagneticSensorConnection(
+            connection: connection,
+            side: side,
+            listenPort: listenPort
+        )
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection else { return }
             if case .failed(let error) = state {
@@ -289,6 +398,8 @@ final class MagneticSensorHotspotGateway {
     }
 
     private func processSensorDatagram(_ data: Data, from connection: NWConnection, connectionID: UUID) {
+        guard let sensorConnection = sensorConnections[connectionID] else { return }
+        let side = sensorConnection.side
         let wallTime = Date().timeIntervalSince1970
         let monotonicTime = ProcessInfo.processInfo.systemUptime
 
@@ -296,71 +407,91 @@ final class MagneticSensorHotspotGateway {
             let sample = try ASKNPacketDecoder.decode(
                 data,
                 receivedWallTime: wallTime,
-                receivedMonotonicTime: monotonicTime
+                receivedMonotonicTime: monotonicTime,
+                boardSide: side
             )
 
             let endpoint = Self.endpointDescription(connection.endpoint)
-            let shouldPublishConnectedStatus = lastSensorMessageTime == nil || stats.boardEndpoint != endpoint
-            lastSensorMessageTime = monotonicTime
-            stats.boardEndpoint = endpoint
+            var boardStats = stats[side]
+            let shouldPublishConnectedStatus =
+                lastSensorMessageTimes[side] == nil || boardStats.endpoint != endpoint
+            lastSensorMessageTimes[side] = monotonicTime
+            boardStats.endpoint = endpoint
+            stats[side] = boardStats
             updateSequenceStats(with: sample)
-            updateReceiveRate(at: monotonicTime)
+            updateReceiveRate(at: monotonicTime, side: side)
             appendPending(sample)
 
             if acknowledgedSensorConnections.insert(connectionID).inserted {
-                let ack = Data("APP_ACK,1,\(sensorListenPort)\n".utf8)
+                let ack = Data("APP_ACK,1,\(sensorConnection.listenPort)\n".utf8)
                 connection.send(content: ack, completion: .contentProcessed { _ in })
             }
 
             onSampleReceived?(sample)
             if shouldPublishConnectedStatus {
-                onSensorStatusChanged?("Magnetic sensor receiving from \(endpoint)")
+                let message = "Receiving from \(endpoint)"
+                onBoardStatusChanged?(side, message)
+                onSensorStatusChanged?("Magnetic boards active")
             }
             publishStatsIfNeeded(at: monotonicTime)
         } catch {
-            stats.invalidPackets &+= 1
+            var boardStats = stats[side]
+            boardStats.invalidPackets &+= 1
+            stats[side] = boardStats
             onError?(error)
             publishStatsIfNeeded(at: monotonicTime, force: true)
         }
     }
 
     private func updateSequenceStats(with sample: MagneticSensorSample) {
-        stats.receivedPackets &+= 1
-        guard let previous = stats.lastSequence, let previousMCUTimeUs = lastMCUTimeUs else {
-            stats.lastSequence = sample.sequence
-            lastMCUTimeUs = sample.mcuTimeUs
+        let side = sample.boardSide
+        var boardStats = stats[side]
+        boardStats.receivedPackets &+= 1
+        guard
+            let previous = boardStats.lastSequence,
+            let previousMCUTimeUs = lastMCUTimesUs[side]
+        else {
+            boardStats.lastSequence = sample.sequence
+            lastMCUTimesUs[side] = sample.mcuTimeUs
+            stats[side] = boardStats
             return
         }
         if sample.mcuTimeUs < previousMCUTimeUs {
-            stats.lastSequence = sample.sequence
-            lastMCUTimeUs = sample.mcuTimeUs
+            boardStats.lastSequence = sample.sequence
+            lastMCUTimesUs[side] = sample.mcuTimeUs
+            stats[side] = boardStats
             return
         }
 
         let delta = sample.sequence &- previous
         if delta == 0 {
-            stats.duplicatePackets &+= 1
+            boardStats.duplicatePackets &+= 1
         } else if delta < UInt32.max / 2 {
             if delta > 1 {
-                stats.droppedPackets &+= UInt64(delta - 1)
+                boardStats.droppedPackets &+= UInt64(delta - 1)
             }
-            stats.lastSequence = sample.sequence
-            lastMCUTimeUs = sample.mcuTimeUs
+            boardStats.lastSequence = sample.sequence
+            lastMCUTimesUs[side] = sample.mcuTimeUs
         } else {
-            stats.outOfOrderPackets &+= 1
+            boardStats.outOfOrderPackets &+= 1
         }
+        stats[side] = boardStats
     }
 
-    private func updateReceiveRate(at time: TimeInterval) {
-        receiveTimes.append(time)
+    private func updateReceiveRate(at time: TimeInterval, side: MagneticBoardSide) {
+        var times = receiveTimes[side] ?? []
+        times.append(time)
         let cutoff = time - 5
-        if let firstValid = receiveTimes.firstIndex(where: { $0 >= cutoff }), firstValid > 0 {
-            receiveTimes.removeFirst(firstValid)
+        if let firstValid = times.firstIndex(where: { $0 >= cutoff }), firstValid > 0 {
+            times.removeFirst(firstValid)
         }
 
-        if let first = receiveTimes.first, let last = receiveTimes.last, last > first {
-            stats.receiveRateHz = Double(receiveTimes.count - 1) / (last - first)
+        var boardStats = stats[side]
+        if let first = times.first, let last = times.last, last > first {
+            boardStats.receiveRateHz = Double(times.count - 1) / (last - first)
         }
+        receiveTimes[side] = times
+        stats[side] = boardStats
     }
 
     private func appendPending(_ sample: MagneticSensorSample) {
@@ -373,7 +504,7 @@ final class MagneticSensorHotspotGateway {
     }
 
     private func removeSensorConnection(_ id: UUID, connection: NWConnection) {
-        guard sensorConnections[id] === connection else { return }
+        guard sensorConnections[id]?.connection === connection else { return }
         sensorConnections.removeValue(forKey: id)
         acknowledgedSensorConnections.remove(id)
         connection.cancel()
@@ -550,7 +681,7 @@ final class MagneticSensorHotspotGateway {
         var index = 0
         var poseForNextPacket = pose
         while index < samples.count {
-            let end = min(index + APM1PacketEncoder.maximumMagneticSampleCount, samples.count)
+            let end = min(index + APM2PacketEncoder.maximumMagneticSampleCount, samples.count)
             sendCombinedPacket(pose: poseForNextPacket, samples: Array(samples[index..<end]))
             poseForNextPacket = nil
             index = end
@@ -562,7 +693,7 @@ final class MagneticSensorHotspotGateway {
         combinedPacketSequence &+= 1
 
         do {
-            let payload = try APM1PacketEncoder.encode(
+            let payload = try APM2PacketEncoder.encode(
                 packetSequence: combinedPacketSequence,
                 sessionID: sessionID,
                 phoneSendUnixTime: Date().timeIntervalSince1970,
@@ -602,11 +733,22 @@ final class MagneticSensorHotspotGateway {
     private func timerFiredLocked() {
         let now = ProcessInfo.processInfo.systemUptime
 
-        if let lastSensorMessageTime, now - lastSensorMessageTime > sensorOfflineTimeout {
-            onSensorStatusChanged?("Waiting for magnetic sensor on phone hotspot")
-            self.lastSensorMessageTime = nil
-            receiveTimes.removeAll(keepingCapacity: true)
-            stats.receiveRateHz = 0
+        for side in MagneticBoardSide.allCases {
+            if
+                let lastMessageTime = lastSensorMessageTimes[side],
+                now - lastMessageTime > sensorOfflineTimeout
+            {
+                onBoardStatusChanged?(
+                    side,
+                    "Waiting on hotspot UDP \(listenPort(for: side))"
+                )
+                lastSensorMessageTimes.removeValue(forKey: side)
+                receiveTimes[side] = []
+                var boardStats = stats[side]
+                boardStats.receiveRateHz = 0
+                boardStats.endpoint = ""
+                stats[side] = boardStats
+            }
         }
 
         if let lastComputerHeartbeatTime, now - lastComputerHeartbeatTime > computerOfflineTimeout {
@@ -648,6 +790,15 @@ final class MagneticSensorHotspotGateway {
             throw MagneticGatewayError.invalidPort(value)
         }
         return port
+    }
+
+    private func listenPort(for side: MagneticBoardSide) -> UInt16 {
+        switch side {
+        case .right:
+            return rightSensorListenPort
+        case .left:
+            return leftSensorListenPort
+        }
     }
 
     private static func endpointDescription(_ endpoint: NWEndpoint) -> String {
@@ -704,11 +855,14 @@ final class MagneticSensorHotspotGateway {
 
 enum MagneticGatewayError: LocalizedError {
     case invalidPort(UInt16)
+    case duplicatePorts
 
     var errorDescription: String? {
         switch self {
         case .invalidPort(let port):
             return "Invalid UDP port \(port)."
+        case .duplicatePorts:
+            return "Right board, left board, and computer registration ports must be different."
         }
     }
 }

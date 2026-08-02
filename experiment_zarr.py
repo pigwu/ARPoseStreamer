@@ -34,6 +34,10 @@ REQUIRED_RDP_DATA_KEYS = (
     "magnet_xyz",
     "magnet_timestamp_ns",
     "magnet_sample_count",
+    "magnetic_txyz",
+    "magnetic_valid",
+    "magnetic_left_txyz",
+    "magnetic_left_valid",
     "timestamp",
 )
 
@@ -64,7 +68,11 @@ def is_current_rdp_source_zarr(path: Path) -> bool:
             return False
         if data["action"].ndim != 2 or data["action"].shape[-1] != 7:
             return False
-        if data["magnet_xyz"].ndim != 4 or data["magnet_xyz"].shape[-1] != 3:
+        if (
+            data["magnet_xyz"].ndim != 4
+            or data["magnet_xyz"].shape[1] != 2
+            or data["magnet_xyz"].shape[-1] != 3
+        ):
             return False
         return True
     except Exception:

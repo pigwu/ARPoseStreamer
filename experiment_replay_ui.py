@@ -82,7 +82,7 @@ from offline_gripper_processor import (
     intrinsics_to_dict,
     save_ultrawide_intrinsics,
 )
-from pose_magnetic_receiver import APM1DecodeError, decode_apm1_packet
+from pose_magnetic_receiver import APM1DecodeError, SequenceTracker, decode_apm_packet
 from udp_video_debug_ui import LatencyClockCompensator, VideoReceiverThread, get_app_base_dir
 from aruco_config_ui import ArucoConfigWidget
 
@@ -150,6 +150,30 @@ def decode_remote_recording_ack(datagram: bytes) -> dict[str, str] | None:
         "action": action,
         "result": result,
         "state": state,
+    }
+
+
+def magnetic_metrics_by_side(
+    samples,
+    latest_by_side: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Split a mixed APM2 sample batch without losing the last value per side."""
+    latest = latest_by_side if latest_by_side is not None else {}
+    counts = {"right": 0, "left": 0}
+    for sample in samples:
+        counts[sample.side] = counts.get(sample.side, 0) + 1
+        latest[sample.side] = sample
+    right = latest.get("right")
+    left = latest.get("left")
+    return {
+        "right_magnetic_count": counts["right"],
+        "left_magnetic_count": counts["left"],
+        "right_chips": right.sensors() if right else (),
+        "left_chips": left.sensors() if left else (),
+        "right_magnetic_sequence": right.sequence if right else None,
+        "left_magnetic_sequence": left.sequence if left else None,
+        "chips": right.sensors() if right else (),
+        "magnetic_sequence": right.sequence if right else None,
     }
 
 
@@ -440,6 +464,15 @@ class CombinedReceiverThread(QThread):
         self.running = True
         self.clock = LatencyClockCompensator()
         self.packet_times: deque[float] = deque()
+        self.latest_magnetic_by_side: dict[str, object] = {}
+        self.magnetic_trackers = {
+            "right": SequenceTracker(),
+            "left": SequenceTracker(),
+        }
+        self.magnetic_times = {
+            "right": deque(),
+            "left": deque(),
+        }
         self.recording_commands: queue.Queue[tuple[str, bytes]] = queue.Queue()
 
     def stop(self) -> None:
@@ -518,7 +551,7 @@ class CombinedReceiverThread(QThread):
                         self.recording_ack_ready.emit(acknowledgement)
                         continue
                     try:
-                        packet = decode_apm1_packet(datagram)
+                        packet = decode_apm_packet(datagram)
                     except APM1DecodeError:
                         continue
 
@@ -532,7 +565,18 @@ class CombinedReceiverThread(QThread):
                     while self.packet_times and receive_mono - self.packet_times[0] > 1.0:
                         self.packet_times.popleft()
                     offset = self.clock.offset_seconds
-                    latest_magnetic = packet.magnetic_samples[-1] if packet.magnetic_samples else None
+                    magnetic_metrics = magnetic_metrics_by_side(
+                        packet.magnetic_samples,
+                        self.latest_magnetic_by_side,
+                    )
+                    for sample in packet.magnetic_samples:
+                        tracker = self.magnetic_trackers[sample.side]
+                        tracker.observe(sample.sequence)
+                        side_times = self.magnetic_times[sample.side]
+                        side_times.append(receive_mono)
+                    for side_times in self.magnetic_times.values():
+                        while side_times and receive_mono - side_times[0] > 1.0:
+                            side_times.popleft()
                     metrics = {
                         "status": f"Combined from {address[0]}:{address[1]}",
                         "session_id": str(packet.session_id),
@@ -544,8 +588,11 @@ class CombinedReceiverThread(QThread):
                         "clock_offset_ms": offset * 1000.0 if offset is not None else None,
                         "fps": float(len(self.packet_times)),
                         "magnetic_count": len(packet.magnetic_samples),
-                        "chips": latest_magnetic.sensors() if latest_magnetic else (),
-                        "magnetic_sequence": latest_magnetic.sequence if latest_magnetic else None,
+                        **magnetic_metrics,
+                        "right_magnetic_rate_hz": float(len(self.magnetic_times["right"])),
+                        "left_magnetic_rate_hz": float(len(self.magnetic_times["left"])),
+                        "right_magnetic_loss_percent": self.magnetic_trackers["right"].loss_percent,
+                        "left_magnetic_loss_percent": self.magnetic_trackers["left"].loss_percent,
                     }
                     self.metrics_ready.emit(metrics)
         finally:
@@ -900,8 +947,12 @@ class ExperimentMonitorWindow(QMainWindow):
         self.live_sensor_latency = QLabel("--")
         sensor_layout.addWidget(self.live_sensor_status)
         sensor_layout.addWidget(self.live_sensor_latency)
+        sensor_layout.addWidget(QLabel("Right board (UDP 5557)"))
         self.live_sensor_table = self._make_sensor_table()
         sensor_layout.addWidget(self.live_sensor_table)
+        sensor_layout.addWidget(QLabel("Left board (UDP 5562)"))
+        self.live_left_sensor_table = self._make_sensor_table()
+        sensor_layout.addWidget(self.live_left_sensor_table)
         side.addWidget(sensor_box, 1)
         layout.addLayout(side, 1)
         return tab
@@ -1028,9 +1079,12 @@ class ExperimentMonitorWindow(QMainWindow):
         gripper_form.addRow("Calibrated", self.gripper_values["calibrated"])
         gripper_form.addRow("Offline stable", self.gripper_values["smoothed"])
         values.addWidget(gripper_box)
-        values.addWidget(QLabel("Magnetic sensor values"))
+        values.addWidget(QLabel("Right magnetic sensor values"))
         self.replay_sensor_table = self._make_sensor_table()
         values.addWidget(self.replay_sensor_table)
+        values.addWidget(QLabel("Left magnetic sensor values"))
+        self.replay_left_sensor_table = self._make_sensor_table()
+        values.addWidget(self.replay_left_sensor_table)
         values.addStretch(1)
         values_scroll = QScrollArea()
         values_scroll.setWidgetResizable(True)
@@ -1574,9 +1628,20 @@ class ExperimentMonitorWindow(QMainWindow):
     def update_live_combined_metrics(self, metrics: dict) -> None:
         self.live_sensor_status.setText(str(metrics.get("status", "--")))
         self.live_sensor_latency.setText(
-            f"Latency {metric_text(metrics.get('latency_ms'), ' ms')}  Rate {metric_text(metrics.get('fps'), ' Hz')}"
+            f"Latency {metric_text(metrics.get('latency_ms'), ' ms')}  "
+            f"APM {metric_text(metrics.get('fps'), ' Hz')}\n"
+            f"Right seq {metrics.get('right_magnetic_sequence', '--')} / "
+            f"{metric_text(metrics.get('right_magnetic_rate_hz'), ' Hz')} / "
+            f"loss {metric_text(metrics.get('right_magnetic_loss_percent'), '%', 2)}\n"
+            f"Left seq {metrics.get('left_magnetic_sequence', '--')} / "
+            f"{metric_text(metrics.get('left_magnetic_rate_hz'), ' Hz')} / "
+            f"loss {metric_text(metrics.get('left_magnetic_loss_percent'), '%', 2)}"
         )
-        self._update_sensor_table(self.live_sensor_table, metrics.get("chips") or ())
+        self._update_sensor_table(self.live_sensor_table, metrics.get("right_chips") or ())
+        self._update_sensor_table(
+            self.live_left_sensor_table,
+            metrics.get("left_chips") or (),
+        )
         identifier = int(metrics.get("packet_sequence", 0))
         if identifier > self.last_combined_id:
             self.last_combined_id = identifier
@@ -1927,6 +1992,10 @@ class ExperimentMonitorWindow(QMainWindow):
         lowered = filename.lower()
         if lowered.startswith("pose"):
             return "pose_csv"
+        if lowered.startswith("magnetic_right"):
+            return "magnetic_right_csv"
+        if lowered.startswith("magnetic_left"):
+            return "magnetic_left_csv"
         if lowered.startswith("magnetic"):
             return "magnetic_csv"
         if lowered.startswith("sender_transport"):
@@ -1946,6 +2015,8 @@ class ExperimentMonitorWindow(QMainWindow):
         return {
             "pose_csv": "Pose",
             "magnetic_csv": "Magnetic",
+            "magnetic_right_csv": "Right magnetic",
+            "magnetic_left_csv": "Left magnetic",
             "sender_transport": "Sender stats",
             "video": "Video",
             "ultrawide_video": "0.5× video",
@@ -1962,9 +2033,11 @@ class ExperimentMonitorWindow(QMainWindow):
             "aruco_gripper": 2,
             "pose_csv": 3,
             "magnetic_csv": 4,
-            "sender_transport": 5,
-            "manifest": 6,
-        }.get(inferred, 7)
+            "magnetic_right_csv": 4,
+            "magnetic_left_csv": 5,
+            "sender_transport": 6,
+            "manifest": 7,
+        }.get(inferred, 8)
 
     def toggle_playback(self) -> None:
         if self.dataset is None:
@@ -2035,6 +2108,18 @@ class ExperimentMonitorWindow(QMainWindow):
             self._update_sensor_table(self.replay_sensor_table, chips)
         else:
             self._update_sensor_table(self.replay_sensor_table, ())
+        magnetic_left = dataset.magnetic_left.nearest(self.play_time)
+        if magnetic_left:
+            chips = [
+                tuple(
+                    _safe_float(magnetic_left.get(f"s{index}_{axis}"))
+                    for axis in ("t", "x", "y", "z")
+                )
+                for index in range(5)
+            ]
+            self._update_sensor_table(self.replay_left_sensor_table, chips)
+        else:
+            self._update_sensor_table(self.replay_left_sensor_table, ())
 
         video_transport = self._nearest_kind(dataset.receiver_transport, self.play_time, "video")
         pose_transport = self._nearest_kind(dataset.receiver_transport, self.play_time, "pose")
@@ -2120,7 +2205,13 @@ class ExperimentMonitorWindow(QMainWindow):
                 dataset.magnetic.times,
                 _relative_magnetic_magnitudes(dataset.magnetic.rows, chip),
                 pen=pg.mkPen(colors[chip], width=1.5),
-                name=f"S{chip}",
+                name=f"R-S{chip}",
+            )
+            self.magnetic_plot.plot(
+                dataset.magnetic_left.times,
+                _relative_magnetic_magnitudes(dataset.magnetic_left.rows, chip),
+                pen=pg.mkPen(colors[chip], width=1.5, style=Qt.PenStyle.DashLine),
+                name=f"L-S{chip}",
             )
         for plot in (self.pose_plot, self.magnetic_plot):
             cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff", width=1))

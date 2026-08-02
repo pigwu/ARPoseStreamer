@@ -75,13 +75,16 @@ struct AppSettingsView: View {
                 Section("Phone Hotspot Magnetic Sensor") {
                     Toggle("Start Listener Automatically", isOn: $viewModel.autoStartMagneticSensor)
 
-                    TextField("Board -> Phone UDP Port", text: $viewModel.magneticListenPort)
+                    TextField("Right Board -> Phone UDP Port", text: $viewModel.magneticListenPort)
+                        .keyboardType(.numberPad)
+
+                    TextField("Left Board -> Phone UDP Port", text: $viewModel.leftMagneticListenPort)
                         .keyboardType(.numberPad)
 
                     TextField("Computer Registration Port", text: $viewModel.computerRegistrationPort)
                         .keyboardType(.numberPad)
 
-                    TextField("Phone -> Computer APM1 Port", text: $viewModel.combinedStreamPort)
+                    TextField("Phone -> Computer APM2 Port", text: $viewModel.combinedStreamPort)
                         .keyboardType(.numberPad)
 
                     Picker("Displayed Chip", selection: $viewModel.selectedMagneticChip) {
@@ -100,7 +103,17 @@ struct AppSettingsView: View {
                         }
                     }
 
-                    LabeledContent("Sensor") {
+                    LabeledContent("Right Board") {
+                        Text(viewModel.rightMagneticStatus)
+                            .multilineTextAlignment(.trailing)
+                    }
+
+                    LabeledContent("Left Board") {
+                        Text(viewModel.leftMagneticStatus)
+                            .multilineTextAlignment(.trailing)
+                    }
+
+                    LabeledContent("Sensor Summary") {
                         Text(viewModel.magneticStatus)
                             .multilineTextAlignment(.trailing)
                     }
@@ -114,32 +127,32 @@ struct AppSettingsView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
 
-                    Text("The magnetic board is optional during experiments. Pose/video recording and computer output continue normally while the app is waiting for the first magnetic packet.")
+                    Text("Both magnetic boards are optional during experiments. The right board sends ASKN to UDP 5557 and the left board to UDP 5562. Pose/video recording and computer output continue normally while either board is offline.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
 
                 Section("Magnetic Diagnostics") {
-                    LabeledContent("Receive Rate") {
-                        Text("\(viewModel.magneticReceiveRateText) Hz")
-                    }
-                    LabeledContent("Packets") {
-                        Text("\(viewModel.magneticStats.receivedPackets)")
-                    }
-                    LabeledContent("Missing") {
-                        Text("\(viewModel.magneticStats.droppedPackets)")
-                    }
-                    LabeledContent("Invalid") {
-                        Text("\(viewModel.magneticStats.invalidPackets)")
+                    ForEach(MagneticBoardSide.allCases, id: \.self) { side in
+                        let stats = viewModel.magneticStats[side]
+                        LabeledContent("\(side.displayName) Rate / Loss") {
+                            Text("\(viewModel.magneticReceiveRateText(for: side)) Hz / \(viewModel.magneticLossText(for: side))")
+                        }
+                        LabeledContent("\(side.displayName) Packets / Missing") {
+                            Text("\(stats.receivedPackets) / \(stats.droppedPackets)")
+                        }
+                        LabeledContent("\(side.displayName) Sequence / Invalid") {
+                            Text("\(viewModel.magneticSequenceText(for: side)) / \(stats.invalidPackets)")
+                        }
+                        if !stats.endpoint.isEmpty {
+                            LabeledContent("\(side.displayName) Endpoint") {
+                                Text(stats.endpoint)
+                                    .multilineTextAlignment(.trailing)
+                            }
+                        }
                     }
                     LabeledContent("Forwarded") {
                         Text("\(viewModel.magneticStats.combinedPacketsSent)")
-                    }
-                    if !viewModel.magneticStats.boardEndpoint.isEmpty {
-                        LabeledContent("Board") {
-                            Text(viewModel.magneticStats.boardEndpoint)
-                                .multilineTextAlignment(.trailing)
-                        }
                     }
                     if !viewModel.magneticStats.computerEndpoint.isEmpty {
                         LabeledContent("Computer") {
@@ -148,12 +161,17 @@ struct AppSettingsView: View {
                         }
                     }
 
-                    ForEach(0..<viewModel.latestMagneticChips.count, id: \.self) { index in
-                        let chip = viewModel.latestMagneticChips[index]
-                        LabeledContent("S\(index)") {
-                            Text(String(format: "t %.3f  x %.3f  y %.3f  z %.3f", chip.t, chip.x, chip.y, chip.z))
-                                .font(.footnote.monospacedDigit())
-                                .multilineTextAlignment(.trailing)
+                    ForEach(MagneticBoardSide.allCases, id: \.self) { side in
+                        let chips = side == .right
+                            ? viewModel.latestMagneticChips
+                            : viewModel.latestLeftMagneticChips
+                        ForEach(0..<chips.count, id: \.self) { index in
+                            let chip = chips[index]
+                            LabeledContent("\(side.displayName) S\(index)") {
+                                Text(String(format: "t %.3f  x %.3f  y %.3f  z %.3f", chip.t, chip.x, chip.y, chip.z))
+                                    .font(.footnote.monospacedDigit())
+                                    .multilineTextAlignment(.trailing)
+                            }
                         }
                     }
                 }

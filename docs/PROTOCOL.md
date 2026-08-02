@@ -57,9 +57,11 @@ If you change the sender to ARKit-native output, update the documentation and th
 
 ## Phone-Hotspot Magnetic Sensor Input
 
-The sensor board joins the iPhone Personal Hotspot and sends UDP datagrams to
-the DHCP gateway address on port `5557`. The board must discover the gateway
-from DHCP rather than hard-code `172.20.10.1`.
+Both sensor boards join the iPhone Personal Hotspot and send UDP datagrams to
+the DHCP gateway address. The right-gripper board sends to port `5557`; the
+left-gripper board sends to port `5562`. Each board must discover the gateway
+from DHCP rather than hard-code `172.20.10.1`. The input port assigns the board
+side; the ASKN payload itself is unchanged.
 
 ASKN v1 input is exactly 96 bytes and uses little-endian values:
 
@@ -79,6 +81,8 @@ The app replies once per UDP flow with the optional UTF-8 acknowledgement:
 APP_ACK,1,5557\n
 ```
 
+The left listener replies with `APP_ACK,1,5562\n`.
+
 The app records every valid sample locally. Computer availability never gates
 local recording.
 
@@ -93,7 +97,7 @@ PC_HELLO,1,combined_port,video_port\n
 
 The app obtains the computer IP from the datagram source endpoint and leases it
 for five seconds. The phone does not reply because the desktop tool uses the
-same socket for APM1 receive traffic.
+same socket for APM1/APM2 receive traffic.
 
 The integrated experiment monitor can also control the phone's unified
 experiment recorder through the same UDP registration port. The command is:
@@ -118,14 +122,14 @@ may acknowledge state `idle` immediately. A new `START` can then create an
 independent recording context while the previous experiment finishes saving
 and uploading; files and experiment identifiers remain isolated.
 
-## Combined Pose and Magnetic Stream (APM1)
+## Combined Pose and Magnetic Stream (APM2)
 
-After registration, the app sends APM1 UDP datagrams to the advertised
+After registration, the app sends APM2 UDP datagrams to the advertised
 `combined_port`, normally `5558`. All numeric fields are little-endian:
 
 ```text
-char[4] magic = "APM1"
-uint16 version = 1
+char[4] magic = "APM2"
+uint16 version = 2
 uint16 flags                 // bit 0: pose block is valid
 uint32 packet_sequence
 uint8 session_uuid[16]
@@ -141,6 +145,7 @@ uint16 magnetic_count
 uint16 reserved = 0
 
 repeated magnetic_count times:
+    uint32 board_side          // 0 = right, 1 = left
     uint32 sensor_sequence
     uint64 mcu_time_us
     float64 phone_receive_unix
@@ -150,10 +155,14 @@ repeated magnetic_count times:
 uint32 crc32
 ```
 
-The fixed data before magnetic samples is 88 bytes, each magnetic sample is
-108 bytes, and the trailing CRC is 4 bytes. At most ten magnetic samples are
-included, so the largest datagram is 1172 bytes. CRC uses standard
+The fixed data before magnetic samples is 88 bytes, each APM2 magnetic sample
+is 112 bytes, and the trailing CRC is 4 bytes. At most ten magnetic samples
+are included, so the largest datagram is 1212 bytes. CRC uses standard
 CRC-32/ISO-HDLC over every preceding byte.
+
+Desktop decoders also accept legacy APM1 (`magic = "APM1"`, version 1). Its
+108-byte magnetic sample omits `board_side`; every legacy sample is assigned
+to the right board.
 
 Each AR pose drains magnetic samples received up to that AR frame time. If pose
 frames stop for 50 ms, the app sends magnetic-only packets with flag bit 0
@@ -260,7 +269,8 @@ timestamp-named directory per experiment (for example `20260714-205900`); the
 UUID remains in its metadata. Each directory contains:
 
 - `pose.csv`
-- `magnetic.csv` when sensor samples were available
+- `magnetic_right.csv` when right-board samples were available
+- `magnetic_left.csv` when left-board samples were available
 - `video.mp4` when video recording succeeded
 - `sender_transport.csv`
 - `receiver_transport.csv` when the integrated monitor observed the live session

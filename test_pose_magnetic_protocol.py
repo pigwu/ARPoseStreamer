@@ -57,6 +57,32 @@ class PoseMagneticProtocolTests(unittest.TestCase):
         with self.assertRaises(receiver.APM1CRCError):
             receiver.decode_apm1_packet(corrupted)
 
+    def test_apm2_decodes_right_and_left_and_tracks_sequences_independently(self) -> None:
+        packet, _ = receiver._build_apm2_self_test_packet()
+        decoded = receiver.decode_apm_packet(packet)
+
+        self.assertEqual(
+            [sample.side for sample in decoded.magnetic_samples],
+            [receiver.RIGHT_BOARD, receiver.LEFT_BOARD],
+        )
+        self.assertEqual(
+            [sample.sequence for sample in decoded.magnetic_samples],
+            [25, 25],
+        )
+
+        stats = receiver.ReceiverStats()
+        stats.observe(decoded, ("127.0.0.1", 5558), time.time(), time.monotonic())
+        self.assertEqual(len(stats.magnetic_trackers), 2)
+        self.assertTrue(all(tracker.missing == 0 for tracker in stats.magnetic_trackers.values()))
+
+    def test_apm1_magnetic_samples_default_to_right_board(self) -> None:
+        packet, _ = receiver._build_self_test_packet()
+        decoded = receiver.decode_apm_packet(packet)
+        self.assertTrue(decoded.magnetic_samples)
+        self.assertTrue(
+            all(sample.side == receiver.RIGHT_BOARD for sample in decoded.magnetic_samples)
+        )
+
     def test_pose_only_packet_is_valid_when_sensor_is_absent(self) -> None:
         decoded = receiver.decode_apm1_packet(self.build_pose_only_packet())
         self.assertIsNotNone(decoded.pose)
@@ -77,11 +103,33 @@ class PoseMagneticProtocolTests(unittest.TestCase):
 
             with (output / "pose.csv").open(newline="", encoding="utf-8") as handle:
                 pose_rows = list(csv.reader(handle))
-            with (output / "magnetic.csv").open(newline="", encoding="utf-8") as handle:
-                magnetic_rows = list(csv.reader(handle))
+            with (output / "magnetic_right.csv").open(newline="", encoding="utf-8") as handle:
+                right_rows = list(csv.reader(handle))
+            with (output / "magnetic_left.csv").open(newline="", encoding="utf-8") as handle:
+                left_rows = list(csv.reader(handle))
 
             self.assertEqual(len(pose_rows), 2)
-            self.assertEqual(len(magnetic_rows), 1)
+            self.assertEqual(len(right_rows), 1)
+            self.assertEqual(len(left_rows), 1)
+
+    def test_dual_board_csv_rows_are_written_to_separate_files(self) -> None:
+        packet, _ = receiver._build_apm2_self_test_packet()
+        decoded = receiver.decode_apm_packet(packet)
+        with tempfile.TemporaryDirectory(prefix="apm2-dual-board-") as directory:
+            output = Path(directory)
+            with receiver.CSVRecorder(output) as recorder:
+                recorder.write_packet(
+                    decoded,
+                    ("127.0.0.1", 12345),
+                    receive_unix=time.time(),
+                    receive_monotonic=time.monotonic(),
+                )
+
+            for name in ("magnetic_right.csv", "magnetic_left.csv"):
+                with (output / name).open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.reader(handle))
+                self.assertEqual(len(rows), 2, name)
+                self.assertEqual(rows[1][9], "25")
 
 
 if __name__ == "__main__":

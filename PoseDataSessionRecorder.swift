@@ -6,7 +6,10 @@ struct PoseCaptureArtifact {
     let experimentStartUnixTime: TimeInterval
     let sessionDirectoryURL: URL
     let poseCSVURL: URL
+    /// Right gripper magnetic data (UDP 5557). Kept under the legacy property
+    /// name so older capture-library records continue to decode.
     let magneticCSVURL: URL?
+    let leftMagneticCSVURL: URL?
     let senderTransportCSVURL: URL?
     let manifestURL: URL
     let videoURL: URL?
@@ -24,13 +27,19 @@ private struct PoseCaptureManifest: Codable {
     let durationSeconds: TimeInterval
     let poseCSVFileName: String
     let magneticCSVFileName: String?
+    let rightMagneticCSVFileName: String?
+    let leftMagneticCSVFileName: String?
     let senderTransportCSVFileName: String?
     let videoFileName: String?
     let ultraWideVideoFileName: String?
     let sessionStartFrameTime: TimeInterval
     let magneticStartOffsetSeconds: TimeInterval?
+    let rightMagneticStartOffsetSeconds: TimeInterval?
+    let leftMagneticStartOffsetSeconds: TimeInterval?
     let poseSampleCount: Int
     let magneticSampleCount: Int
+    let rightMagneticSampleCount: Int
+    let leftMagneticSampleCount: Int
     let senderTransportSampleCount: Int
     let videoStartOffsetSeconds: TimeInterval?
     let ultraWideVideoStartOffsetSeconds: TimeInterval?
@@ -43,14 +52,17 @@ final class PoseDataSessionRecorder {
     private var experimentID: UUID?
     private var poseCSVURL: URL?
     private var magneticCSVURL: URL?
+    private var leftMagneticCSVURL: URL?
     private var senderTransportCSVURL: URL?
     private var videoURL: URL?
     private var ultraWideVideoURL: URL?
     private var fileHandle: FileHandle?
     private var magneticFileHandle: FileHandle?
+    private var leftMagneticFileHandle: FileHandle?
     private var senderTransportFileHandle: FileHandle?
     private var sessionStartFrameTime: TimeInterval?
     private var firstMagneticMonotonicTime: TimeInterval?
+    private var firstLeftMagneticMonotonicTime: TimeInterval?
     private var videoStartFrameTime: TimeInterval?
     private var ultraWideVideoStartFrameTime: TimeInterval?
     private var creationTime: Date?
@@ -59,6 +71,7 @@ final class PoseDataSessionRecorder {
     private var videoArchiveWarnings: [String] = []
     private var sampleCount = 0
     private var magneticSampleCount = 0
+    private var leftMagneticSampleCount = 0
     private var senderTransportSampleCount = 0
 
     func startSessionIfNeeded() {
@@ -143,7 +156,7 @@ final class PoseDataSessionRecorder {
     func append(magneticSample: MagneticSensorSample) {
         startSessionIfNeeded()
 
-        guard let magneticFileHandle = ensureMagneticFile() else { return }
+        guard let magneticFileHandle = ensureMagneticFile(for: magneticSample.boardSide) else { return }
 
         var fields = [
             String(magneticSample.sequence),
@@ -165,10 +178,18 @@ final class PoseDataSessionRecorder {
 
         do {
             try magneticFileHandle.write(contentsOf: data)
-            if firstMagneticMonotonicTime == nil {
-                firstMagneticMonotonicTime = magneticSample.receivedMonotonicTime
+            switch magneticSample.boardSide {
+            case .right:
+                if firstMagneticMonotonicTime == nil {
+                    firstMagneticMonotonicTime = magneticSample.receivedMonotonicTime
+                }
+                magneticSampleCount += 1
+            case .left:
+                if firstLeftMagneticMonotonicTime == nil {
+                    firstLeftMagneticMonotonicTime = magneticSample.receivedMonotonicTime
+                }
+                leftMagneticSampleCount += 1
             }
-            magneticSampleCount += 1
         } catch {
             return
         }
@@ -244,13 +265,20 @@ final class PoseDataSessionRecorder {
             return
         }
 
-        guard sampleCount > 0 || magneticSampleCount > 0 || videoURL != nil || ultraWideVideoURL != nil else {
+        guard
+            sampleCount > 0 ||
+            magneticSampleCount > 0 ||
+            leftMagneticSampleCount > 0 ||
+            videoURL != nil ||
+            ultraWideVideoURL != nil
+        else {
             reset(deleteSessionDirectory: true)
             return
         }
 
         try? fileHandle?.close()
         try? magneticFileHandle?.close()
+        try? leftMagneticFileHandle?.close()
         try? senderTransportFileHandle?.close()
 
         let archivedVideoURL = archiveVideoIfNeeded(videoURL, into: sessionDirectoryURL, label: "1x video")
@@ -259,12 +287,16 @@ final class PoseDataSessionRecorder {
             into: sessionDirectoryURL,
             label: "0.5x ultra-wide video"
         )
-        let manifestSessionStartFrameTime = sessionStartFrameTime ?? firstMagneticMonotonicTime ?? videoStartFrameTime ?? 0
+        let manifestSessionStartFrameTime = sessionStartFrameTime
+            ?? firstMagneticMonotonicTime
+            ?? firstLeftMagneticMonotonicTime
+            ?? videoStartFrameTime
+            ?? 0
         let stopUnixTime = experimentStopUnixTime ?? Date().timeIntervalSince1970
         let stopMonotonicTime = experimentStopMonotonicTime ?? ProcessInfo.processInfo.systemUptime
 
         let manifest = PoseCaptureManifest(
-            schemaVersion: 3,
+            schemaVersion: 4,
             experimentID: experimentID.uuidString,
             createdAtUnixTime: creationTime.timeIntervalSince1970,
             experimentStartUnixTime: creationTime.timeIntervalSince1970,
@@ -273,13 +305,23 @@ final class PoseDataSessionRecorder {
             durationSeconds: max(0, stopMonotonicTime - manifestSessionStartFrameTime),
             poseCSVFileName: poseCSVURL.lastPathComponent,
             magneticCSVFileName: magneticCSVURL?.lastPathComponent,
+            rightMagneticCSVFileName: magneticCSVURL?.lastPathComponent,
+            leftMagneticCSVFileName: leftMagneticCSVURL?.lastPathComponent,
             senderTransportCSVFileName: senderTransportCSVURL?.lastPathComponent,
             videoFileName: archivedVideoURL?.lastPathComponent,
             ultraWideVideoFileName: archivedUltraWideVideoURL?.lastPathComponent,
             sessionStartFrameTime: manifestSessionStartFrameTime,
             magneticStartOffsetSeconds: firstMagneticMonotonicTime.map { $0 - manifestSessionStartFrameTime },
+            rightMagneticStartOffsetSeconds: firstMagneticMonotonicTime.map {
+                $0 - manifestSessionStartFrameTime
+            },
+            leftMagneticStartOffsetSeconds: firstLeftMagneticMonotonicTime.map {
+                $0 - manifestSessionStartFrameTime
+            },
             poseSampleCount: sampleCount,
             magneticSampleCount: magneticSampleCount,
+            rightMagneticSampleCount: magneticSampleCount,
+            leftMagneticSampleCount: leftMagneticSampleCount,
             senderTransportSampleCount: senderTransportSampleCount,
             videoStartOffsetSeconds: videoStartFrameTime.map { $0 - manifestSessionStartFrameTime },
             ultraWideVideoStartOffsetSeconds: ultraWideVideoStartFrameTime.map {
@@ -299,6 +341,7 @@ final class PoseDataSessionRecorder {
                 sessionDirectoryURL: sessionDirectoryURL,
                 poseCSVURL: poseCSVURL,
                 magneticCSVURL: magneticCSVURL,
+                leftMagneticCSVURL: leftMagneticCSVURL,
                 senderTransportCSVURL: senderTransportCSVURL,
                 manifestURL: manifestURL,
                 videoURL: archivedVideoURL,
@@ -314,24 +357,40 @@ final class PoseDataSessionRecorder {
         reset(deleteSessionDirectory: true)
     }
 
-    private func ensureMagneticFile() -> FileHandle? {
-        if let magneticFileHandle {
+    private func ensureMagneticFile(for side: MagneticBoardSide) -> FileHandle? {
+        switch side {
+        case .right where magneticFileHandle != nil:
             return magneticFileHandle
+        case .left where leftMagneticFileHandle != nil:
+            return leftMagneticFileHandle
+        default:
+            break
         }
-
         guard let sessionDirectoryURL else { return nil }
-        let url = sessionDirectoryURL.appendingPathComponent("magnetic.csv")
+        let url = sessionDirectoryURL.appendingPathComponent("magnetic_\(side.fileStem).csv")
 
         do {
             try Data(Self.magneticCSVHeader.utf8).write(to: url, options: .atomic)
             let handle = try FileHandle(forWritingTo: url)
             try handle.seekToEnd()
-            magneticCSVURL = url
-            magneticFileHandle = handle
+            switch side {
+            case .right:
+                magneticCSVURL = url
+                magneticFileHandle = handle
+            case .left:
+                leftMagneticCSVURL = url
+                leftMagneticFileHandle = handle
+            }
             return handle
         } catch {
-            magneticCSVURL = nil
-            magneticFileHandle = nil
+            switch side {
+            case .right:
+                magneticCSVURL = nil
+                magneticFileHandle = nil
+            case .left:
+                leftMagneticCSVURL = nil
+                leftMagneticFileHandle = nil
+            }
             return nil
         }
     }
@@ -404,19 +463,23 @@ final class PoseDataSessionRecorder {
 
         try? fileHandle?.close()
         try? magneticFileHandle?.close()
+        try? leftMagneticFileHandle?.close()
         try? senderTransportFileHandle?.close()
         experimentID = nil
         sessionDirectoryURL = nil
         poseCSVURL = nil
         magneticCSVURL = nil
+        leftMagneticCSVURL = nil
         senderTransportCSVURL = nil
         videoURL = nil
         ultraWideVideoURL = nil
         fileHandle = nil
         magneticFileHandle = nil
+        leftMagneticFileHandle = nil
         senderTransportFileHandle = nil
         sessionStartFrameTime = nil
         firstMagneticMonotonicTime = nil
+        firstLeftMagneticMonotonicTime = nil
         videoStartFrameTime = nil
         ultraWideVideoStartFrameTime = nil
         creationTime = nil
@@ -425,6 +488,7 @@ final class PoseDataSessionRecorder {
         videoArchiveWarnings = []
         sampleCount = 0
         magneticSampleCount = 0
+        leftMagneticSampleCount = 0
         senderTransportSampleCount = 0
 
         if deleteSessionDirectory, let directoryURL {

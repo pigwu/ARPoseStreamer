@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Receive combined AR pose and magnetic sensor packets from the iPhone.
 
-The wire format is APM1, little-endian throughout::
+APM2 keeps the APM1 header and adds a board-side field to every magnetic
+sample.  APM1 remains accepted for recordings made by the single-board test
+version and is interpreted as right-board data.  Values are little-endian::
 
-    4s magic (``APM1``)
-    uint16 version (1)
+    4s magic (``APM1`` or ``APM2``)
+    uint16 version (1 or 2)
     uint16 flags (bit 0: pose is present)
     uint32 packet_sequence
     uint8 session_uuid[16]
@@ -19,10 +21,11 @@ The wire format is APM1, little-endian throughout::
     magnetic_sample[magnetic_count]
     uint32 crc32
 
-Each magnetic sample contains ``uint32 sequence``, ``uint64 mcu_time_us``,
-two doubles for the phone receive Unix/monotonic times, and 20 float32
-values (five sensors, each ordered t/x/y/z).  The CRC is zlib CRC32 over
-every byte before the final CRC field.
+Each APM2 magnetic sample starts with ``uint32 board_side`` (0 right, 1 left),
+followed by ``uint32 sequence``, ``uint64 mcu_time_us``, two doubles for the
+phone receive Unix/monotonic times, and 20 float32 values (five sensors, each
+ordered t/x/y/z).  APM1 omits ``board_side``.  The CRC is zlib CRC32 over every
+byte before the final CRC field.
 
 ``decode_apm1_packet`` is intentionally independent from the receiver so it
 can be imported by tests and other desktop tools.
@@ -49,6 +52,11 @@ from typing import Deque, Dict, Iterable, List, Optional, Sequence, TextIO, Tupl
 
 MAGIC = b"APM1"
 PROTOCOL_VERSION = 1
+APM2_MAGIC = b"APM2"
+APM2_PROTOCOL_VERSION = 2
+RIGHT_BOARD = "right"
+LEFT_BOARD = "left"
+BOARD_SIDE_NAMES = {0: RIGHT_BOARD, 1: LEFT_BOARD}
 POSE_PRESENT_FLAG = 0x0001
 KNOWN_FLAGS = POSE_PRESENT_FLAG
 DEFAULT_HOST = "0.0.0.0"
@@ -56,9 +64,10 @@ DEFAULT_COMBINED_PORT = 5558
 DEFAULT_REGISTRATION_PORT = 5559
 DEFAULT_VIDEO_PORT = 5560
 
-# Fixed APM1 header, one magnetic sample, and the trailing checksum.
+# Fixed APM1/APM2 header, magnetic sample layouts, and trailing checksum.
 HEADER_STRUCT = struct.Struct("<4sHHI16sdIdd7fHH")
 MAGNETIC_SAMPLE_STRUCT = struct.Struct("<IQdd20f")
+APM2_MAGNETIC_SAMPLE_STRUCT = struct.Struct("<IIQdd20f")
 CRC_STRUCT = struct.Struct("<I")
 MIN_PACKET_SIZE = HEADER_STRUCT.size + CRC_STRUCT.size
 UINT32_MASK = 0xFFFFFFFF
@@ -88,6 +97,7 @@ class PoseSample:
 
 @dataclass(frozen=True)
 class MagneticSample:
+    side: str
     sequence: int
     mcu_time_us: int
     phone_receive_unix: float
@@ -114,8 +124,8 @@ class APM1Packet:
     crc32: int
 
 
-def decode_apm1_packet(datagram: bytes) -> APM1Packet:
-    """Decode and validate one complete APM1 UDP datagram.
+def decode_apm_packet(datagram: bytes) -> APM1Packet:
+    """Decode and validate one complete APM1 or APM2 UDP datagram.
 
     Raises:
         APM1FormatError: if magic, version, flags, reserved data, or size is
@@ -134,7 +144,7 @@ def decode_apm1_packet(datagram: bytes) -> APM1Packet:
     try:
         header = HEADER_STRUCT.unpack_from(packet, 0)
     except struct.error as exc:  # Defensive; the minimum-size check normally catches this.
-        raise APM1FormatError(f"cannot unpack APM1 header: {exc}") from exc
+        raise APM1FormatError(f"cannot unpack APM header: {exc}") from exc
 
     (
         magic,
@@ -157,11 +167,15 @@ def decode_apm1_packet(datagram: bytes) -> APM1Packet:
         reserved,
     ) = header
 
-    if magic != MAGIC:
-        raise APM1FormatError(f"wrong magic: expected {MAGIC!r}, got {magic!r}")
-    if version != PROTOCOL_VERSION:
+    if (magic, version) == (MAGIC, PROTOCOL_VERSION):
+        magnetic_struct = MAGNETIC_SAMPLE_STRUCT
+        protocol_name = "APM1"
+    elif (magic, version) == (APM2_MAGIC, APM2_PROTOCOL_VERSION):
+        magnetic_struct = APM2_MAGNETIC_SAMPLE_STRUCT
+        protocol_name = "APM2"
+    else:
         raise APM1FormatError(
-            f"unsupported APM1 version: expected {PROTOCOL_VERSION}, got {version}"
+            f"unsupported APM magic/version pair: {magic!r} version {version}"
         )
     if flags & ~KNOWN_FLAGS:
         raise APM1FormatError(f"unknown APM1 flags: 0x{flags:04x}")
@@ -170,7 +184,7 @@ def decode_apm1_packet(datagram: bytes) -> APM1Packet:
 
     expected_size = (
         HEADER_STRUCT.size
-        + magnetic_count * MAGNETIC_SAMPLE_STRUCT.size
+        + magnetic_count * magnetic_struct.size
         + CRC_STRUCT.size
     )
     if len(packet) != expected_size:
@@ -202,17 +216,27 @@ def decode_apm1_packet(datagram: bytes) -> APM1Packet:
     samples: List[MagneticSample] = []
     offset = HEADER_STRUCT.size
     for _ in range(magnetic_count):
-        unpacked = MAGNETIC_SAMPLE_STRUCT.unpack_from(packet, offset)
+        unpacked = magnetic_struct.unpack_from(packet, offset)
+        if protocol_name == "APM2":
+            side_value = unpacked[0]
+            if side_value not in BOARD_SIDE_NAMES:
+                raise APM1FormatError(f"unknown APM2 board side: {side_value}")
+            side = BOARD_SIDE_NAMES[side_value]
+            value_offset = 1
+        else:
+            side = RIGHT_BOARD
+            value_offset = 0
         samples.append(
             MagneticSample(
-                sequence=unpacked[0],
-                mcu_time_us=unpacked[1],
-                phone_receive_unix=unpacked[2],
-                phone_receive_monotonic=unpacked[3],
-                values=tuple(unpacked[4:]),
+                side=side,
+                sequence=unpacked[value_offset],
+                mcu_time_us=unpacked[value_offset + 1],
+                phone_receive_unix=unpacked[value_offset + 2],
+                phone_receive_monotonic=unpacked[value_offset + 3],
+                values=tuple(unpacked[value_offset + 4 :]),
             )
         )
-        offset += MAGNETIC_SAMPLE_STRUCT.size
+        offset += magnetic_struct.size
 
     return APM1Packet(
         version=version,
@@ -226,9 +250,14 @@ def decode_apm1_packet(datagram: bytes) -> APM1Packet:
     )
 
 
+def decode_apm1_packet(datagram: bytes) -> APM1Packet:
+    """Compatibility entry point that now accepts both APM1 and APM2."""
+    return decode_apm_packet(datagram)
+
+
 def decode_packet(datagram: bytes) -> APM1Packet:
-    """Compatibility-friendly short name for :func:`decode_apm1_packet`."""
-    return decode_apm1_packet(datagram)
+    """Compatibility-friendly short name for :func:`decode_apm_packet`."""
+    return decode_apm_packet(datagram)
 
 
 @dataclass
@@ -283,7 +312,9 @@ class ReceiverStats:
     recent_packet_times: Deque[float] = field(default_factory=deque)
     packet_trackers: Dict[uuid.UUID, SequenceTracker] = field(default_factory=dict)
     pose_trackers: Dict[uuid.UUID, SequenceTracker] = field(default_factory=dict)
-    magnetic_trackers: Dict[uuid.UUID, SequenceTracker] = field(default_factory=dict)
+    magnetic_trackers: Dict[Tuple[uuid.UUID, str], SequenceTracker] = field(
+        default_factory=dict
+    )
 
     def observe(
         self,
@@ -307,12 +338,11 @@ class ReceiverStats:
             self.pose_trackers.setdefault(packet.session_id, SequenceTracker()).observe(
                 packet.pose.sequence
             )
-        magnetic_tracker = self.magnetic_trackers.setdefault(
-            packet.session_id, SequenceTracker()
-        )
         for sample in packet.magnetic_samples:
             self.magnetic_samples += 1
-            magnetic_tracker.observe(sample.sequence)
+            self.magnetic_trackers.setdefault(
+                (packet.session_id, sample.side), SequenceTracker()
+            ).observe(sample.sequence)
 
     def _trim_rate_window(self, now: float) -> None:
         while self.recent_packet_times and now - self.recent_packet_times[0] > 5.0:
@@ -336,24 +366,31 @@ class ReceiverStats:
 
 
 class CSVRecorder:
-    """Write accepted APM1 data to separate pose and magnetic CSV files."""
+    """Write accepted APM data to pose plus independent right/left CSV files."""
 
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = output_dir.expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.pose_path = self.output_dir / "pose.csv"
-        self.magnetic_path = self.output_dir / "magnetic.csv"
+        self.magnetic_path = self.output_dir / "magnetic_right.csv"
+        self.left_magnetic_path = self.output_dir / "magnetic_left.csv"
         self.pose_file: TextIO = self.pose_path.open("w", newline="", encoding="utf-8")
         try:
             self.magnetic_file: TextIO = self.magnetic_path.open(
                 "w", newline="", encoding="utf-8"
             )
+            self.left_magnetic_file: TextIO = self.left_magnetic_path.open(
+                "w", newline="", encoding="utf-8"
+            )
         except Exception:
             self.pose_file.close()
+            if hasattr(self, "magnetic_file"):
+                self.magnetic_file.close()
             raise
 
         self.pose_writer = csv.writer(self.pose_file)
         self.magnetic_writer = csv.writer(self.magnetic_file)
+        self.left_magnetic_writer = csv.writer(self.left_magnetic_file)
         self._last_flush = time.monotonic()
         self._write_headers()
 
@@ -401,6 +438,7 @@ class CSVRecorder:
                 ]
             )
         self.magnetic_writer.writerow(magnetic_header)
+        self.left_magnetic_writer.writerow(magnetic_header)
 
     def write_packet(
         self,
@@ -436,7 +474,12 @@ class CSVRecorder:
 
         for sample_index, sample in enumerate(packet.magnetic_samples):
             sample_latency_ms = (receive_unix - sample.phone_receive_unix) * 1000.0
-            self.magnetic_writer.writerow(
+            writer = (
+                self.magnetic_writer
+                if sample.side == RIGHT_BOARD
+                else self.left_magnetic_writer
+            )
+            writer.writerow(
                 common
                 + [
                     sample_index,
@@ -455,12 +498,14 @@ class CSVRecorder:
         if force or current - self._last_flush >= 1.0:
             self.pose_file.flush()
             self.magnetic_file.flush()
+            self.left_magnetic_file.flush()
             self._last_flush = current
 
     def close(self) -> None:
         self.flush_if_due(force=True)
         self.pose_file.close()
         self.magnetic_file.close()
+        self.left_magnetic_file.close()
 
     def __enter__(self) -> "CSVRecorder":
         return self
@@ -558,9 +603,10 @@ def run_receiver(args: argparse.Namespace) -> int:
     next_hello = time.monotonic()
     next_status = time.monotonic() + args.status_interval
 
-    print(f"[INFO] Listening for APM1 UDP on {args.host}:{args.port}")
+    print(f"[INFO] Listening for APM1/APM2 UDP on {args.host}:{args.port}")
     print(f"[INFO] Pose CSV: {recorder.pose_path}")
-    print(f"[INFO] Magnetic CSV: {recorder.magnetic_path}")
+    print(f"[INFO] Right magnetic CSV: {recorder.magnetic_path}")
+    print(f"[INFO] Left magnetic CSV: {recorder.left_magnetic_path}")
     if args.phone_ip:
         print(
             f"[INFO] Registering with phone at {args.phone_ip}:"
@@ -605,7 +651,7 @@ def run_receiver(args: argparse.Namespace) -> int:
                 receive_unix = time.time()
                 receive_monotonic = time.monotonic()
                 try:
-                    decoded = decode_apm1_packet(received_datagram)
+                    decoded = decode_apm_packet(received_datagram)
                 except APM1CRCError as exc:
                     stats.crc_errors += 1
                     if _error_should_be_printed(stats.crc_errors):
@@ -688,8 +734,41 @@ def _build_self_test_packet() -> Tuple[bytes, uuid.UUID]:
     return payload + CRC_STRUCT.pack(zlib.crc32(payload) & UINT32_MASK), session_id
 
 
+def _build_apm2_self_test_packet() -> Tuple[bytes, uuid.UUID]:
+    """Construct one right and one left APM2 sample with equal sequences."""
+    session_id = uuid.UUID("87654321-4321-8765-cba9-876543210fed")
+    rows = []
+    for side_value in (0, 1):
+        values = tuple(float(side_value * 100 + index) for index in range(20))
+        rows.append(
+            APM2_MAGNETIC_SAMPLE_STRUCT.pack(
+                side_value,
+                25,
+                9_000_000 + side_value,
+                1_700_000_001.0 + side_value * 0.01,
+                2000.0 + side_value * 0.01,
+                *values,
+            )
+        )
+    payload = HEADER_STRUCT.pack(
+        APM2_MAGIC,
+        APM2_PROTOCOL_VERSION,
+        0,
+        9,
+        session_id.bytes,
+        1_700_000_001.1,
+        0,
+        0.0,
+        0.0,
+        *(0.0 for _ in range(7)),
+        len(rows),
+        0,
+    ) + b"".join(rows)
+    return payload + CRC_STRUCT.pack(zlib.crc32(payload) & UINT32_MASK), session_id
+
+
 def run_self_test() -> int:
-    """Build, decode, and deliberately corrupt a local APM1 packet."""
+    """Decode legacy APM1 and dual-board APM2, then verify CRC rejection."""
 
     datagram, expected_session = _build_self_test_packet()
     decoded = decode_apm1_packet(datagram)
@@ -697,6 +776,7 @@ def run_self_test() -> int:
     assert decoded.packet_sequence == 42
     assert decoded.pose is not None and decoded.pose.sequence == 77
     assert len(decoded.magnetic_samples) == 2
+    assert all(sample.side == RIGHT_BOARD for sample in decoded.magnetic_samples)
     assert decoded.magnetic_samples[0].sequence == 1000
     assert decoded.magnetic_samples[1].values[-1] == 119.0
     assert len(datagram) == MIN_PACKET_SIZE + 2 * MAGNETIC_SAMPLE_STRUCT.size
@@ -732,6 +812,18 @@ def run_self_test() -> int:
     assert not decoded_pose_only.magnetic_samples
     assert len(pose_only) == MIN_PACKET_SIZE
 
+    apm2_datagram, apm2_session = _build_apm2_self_test_packet()
+    decoded_apm2 = decode_apm_packet(apm2_datagram)
+    assert decoded_apm2.session_id == apm2_session
+    assert [sample.side for sample in decoded_apm2.magnetic_samples] == [
+        RIGHT_BOARD,
+        LEFT_BOARD,
+    ]
+    dual_stats = ReceiverStats()
+    dual_stats.observe(decoded_apm2, ("127.0.0.1", 5558), time.time(), time.monotonic())
+    assert len(dual_stats.magnetic_trackers) == 2
+    assert all(tracker.missing == 0 for tracker in dual_stats.magnetic_trackers.values())
+
     corrupted = bytearray(datagram)
     corrupted[HEADER_STRUCT.size + 1] ^= 0x01
     try:
@@ -743,7 +835,7 @@ def run_self_test() -> int:
 
     print(
         f"[SELF-TEST] PASS: decoded {len(datagram)}-byte packet with "
-        f"{len(decoded.magnetic_samples)} magnetic samples plus pose-only mode; "
+        f"legacy APM1 plus {len(decoded_apm2.magnetic_samples)} side-labelled APM2 samples; "
         "CRC rejection verified"
     )
     return 0
@@ -752,8 +844,9 @@ def run_self_test() -> int:
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Receive APM1 pose/magnetic UDP packets, save pose.csv and "
-            "magnetic.csv, and optionally register with the iPhone gateway."
+            "Receive APM1/APM2 pose/magnetic UDP packets, save pose.csv plus "
+            "magnetic_right.csv and magnetic_left.csv, and optionally register "
+            "with the iPhone gateway."
         )
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="Local address to bind")

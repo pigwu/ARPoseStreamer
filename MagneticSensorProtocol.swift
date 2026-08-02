@@ -16,6 +16,33 @@ struct ChipValues: Equatable, Sendable {
 /// not sufficiently descriptive.
 typealias MagneticSensorChipValues = ChipValues
 
+enum MagneticBoardSide: UInt32, CaseIterable, Equatable, Hashable, Sendable {
+    case right = 0
+    case left = 1
+
+    var displayName: String {
+        switch self {
+        case .right:
+            return "Right"
+        case .left:
+            return "Left"
+        }
+    }
+
+    var fileStem: String {
+        displayName.lowercased()
+    }
+
+    var defaultListenPort: UInt16 {
+        switch self {
+        case .right:
+            return 5557
+        case .left:
+            return 5562
+        }
+    }
+}
+
 enum MagneticSensorComponent: String, Equatable, Sendable {
     case t
     case x
@@ -51,13 +78,15 @@ struct MagneticSensorSample: Equatable, Sendable {
     let receivedWallTime: TimeInterval
     let receivedMonotonicTime: TimeInterval
     let chips: [ChipValues]
+    let boardSide: MagneticBoardSide
 
     init(
         sequence: UInt32,
         mcuTimeUs: UInt64,
         receivedWallTime: TimeInterval,
         receivedMonotonicTime: TimeInterval,
-        chips: [ChipValues]
+        chips: [ChipValues],
+        boardSide: MagneticBoardSide = .right
     ) throws {
         try Self.validate(chips: chips)
         self.sequence = sequence
@@ -65,6 +94,7 @@ struct MagneticSensorSample: Equatable, Sendable {
         self.receivedWallTime = receivedWallTime
         self.receivedMonotonicTime = receivedMonotonicTime
         self.chips = chips
+        self.boardSide = boardSide
     }
 
     fileprivate init(
@@ -72,13 +102,15 @@ struct MagneticSensorSample: Equatable, Sendable {
         mcuTimeUs: UInt64,
         receivedWallTime: TimeInterval,
         receivedMonotonicTime: TimeInterval,
-        validatedChips chips: [ChipValues]
+        validatedChips chips: [ChipValues],
+        boardSide: MagneticBoardSide
     ) {
         self.sequence = sequence
         self.mcuTimeUs = mcuTimeUs
         self.receivedWallTime = receivedWallTime
         self.receivedMonotonicTime = receivedMonotonicTime
         self.chips = chips
+        self.boardSide = boardSide
     }
 
     subscript(chipIndex: Int) -> ChipValues {
@@ -143,7 +175,8 @@ enum ASKNPacketDecoder {
     static func decode(
         _ data: Data,
         receivedWallTime: TimeInterval,
-        receivedMonotonicTime: TimeInterval
+        receivedMonotonicTime: TimeInterval,
+        boardSide: MagneticBoardSide = .right
     ) throws -> MagneticSensorSample {
         guard data.count == packetLength else {
             throw ASKNDecodeError.invalidLength(expected: packetLength, actual: data.count)
@@ -189,7 +222,8 @@ enum ASKNPacketDecoder {
             mcuTimeUs: mcuTimeUs,
             receivedWallTime: receivedWallTime,
             receivedMonotonicTime: receivedMonotonicTime,
-            validatedChips: chips
+            validatedChips: chips,
+            boardSide: boardSide
         )
     }
 }

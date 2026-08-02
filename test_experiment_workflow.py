@@ -10,6 +10,7 @@ from pathlib import Path
 
 import zarr
 from PyQt6.QtCore import Qt
+import pose_magnetic_receiver as magnetic_receiver
 
 from capture_upload_server import (
     UploadHandler,
@@ -25,6 +26,7 @@ from experiment_replay_ui import (
     _relative_magnetic_magnitudes,
     decode_remote_recording_ack,
     encode_remote_recording_command,
+    magnetic_metrics_by_side,
 )
 from experiment_zarr import AutoZarrExporter
 
@@ -187,6 +189,62 @@ class ExperimentWorkflowTests(unittest.TestCase):
                 "state": "recording",
             },
         )
+
+    def test_dual_magnetic_uploads_use_independent_server_files(self) -> None:
+        experiment_id = "dual-magnetic-upload"
+        right = self._upload(
+            experiment_id,
+            "magnetic_right_csv",
+            "magnetic_right.csv",
+            b"right\n",
+            1,
+            2,
+        )
+        left = self._upload(
+            experiment_id,
+            "magnetic_left_csv",
+            "magnetic_left.csv",
+            b"left\n",
+            2,
+            2,
+        )
+
+        self.assertEqual(Path(right["saved_to"]).name, "magnetic_right.csv")
+        self.assertEqual(Path(left["saved_to"]).name, "magnetic_left.csv")
+        self.assertEqual(Path(right["saved_to"]).read_bytes(), b"right\n")
+        self.assertEqual(Path(left["saved_to"]).read_bytes(), b"left\n")
+
+    def test_live_magnetic_metrics_keep_right_and_left_separate(self) -> None:
+        packet, _ = magnetic_receiver._build_apm2_self_test_packet()
+        decoded = magnetic_receiver.decode_apm_packet(packet)
+        metrics = magnetic_metrics_by_side(decoded.magnetic_samples, {})
+
+        self.assertEqual(metrics["right_magnetic_sequence"], 25)
+        self.assertEqual(metrics["left_magnetic_sequence"], 25)
+        self.assertEqual(metrics["right_magnetic_count"], 1)
+        self.assertEqual(metrics["left_magnetic_count"], 1)
+        self.assertNotEqual(metrics["right_chips"], metrics["left_chips"])
+
+    def test_dataset_loads_right_and_left_magnetic_tables(self) -> None:
+        folder = self.root / "dual-magnetic-dataset"
+        folder.mkdir()
+        (folder / "capture_manifest.json").write_text(
+            json.dumps({"sessionStartFrameTime": 100.0}),
+            encoding="utf-8",
+        )
+        for side, value in (("right", 1), ("left", 2)):
+            (folder / f"magnetic_{side}.csv").write_text(
+                "sequence,phone_monotonic_time,s0_t,s0_x,s0_y,s0_z\n"
+                f"1,100.25,0,{value},0,0\n",
+                encoding="utf-8",
+            )
+
+        dataset = ExperimentDataset.load(folder)
+
+        self.assertEqual(dataset.magnetic.rows[0]["s0_x"], "1")
+        self.assertEqual(dataset.magnetic_left.rows[0]["s0_x"], "2")
+        self.assertAlmostEqual(dataset.magnetic.times[0], 0.25)
+        self.assertAlmostEqual(dataset.magnetic_left.times[0], 0.25)
         self.assertEqual(
             decode_remote_recording_ack(
                 b"PC_RECORD_ACK,1,request-43,STOP,OK,idle\n"
@@ -584,10 +642,18 @@ class ExperimentWorkflowTests(unittest.TestCase):
         ]
         first_values = [str(chip * 10 + axis) for chip in range(5) for axis in range(4)]
         second_values = [str(chip * 10 + axis + 1) for chip in range(5) for axis in range(4)]
-        (folder / "magnetic.csv").write_text(
+        (folder / "magnetic_right.csv").write_text(
             "relative_time," + ",".join(magnetic_columns) + "\n"
             "0.0," + ",".join(first_values) + "\n"
             "0.1," + ",".join(second_values) + "\n",
+            encoding="utf-8",
+        )
+        left_first_values = [str(100 + chip * 10 + axis) for chip in range(5) for axis in range(4)]
+        left_second_values = [str(101 + chip * 10 + axis) for chip in range(5) for axis in range(4)]
+        (folder / "magnetic_left.csv").write_text(
+            "relative_time," + ",".join(magnetic_columns) + "\n"
+            "0.0," + ",".join(left_first_values) + "\n"
+            "0.1," + ",".join(left_second_values) + "\n",
             encoding="utf-8",
         )
 
@@ -603,6 +669,10 @@ class ExperimentWorkflowTests(unittest.TestCase):
         self.assertEqual(root["data/magnetic_valid"].shape, (2, 5))
         self.assertTrue(root["data/magnetic_valid"][:].all())
         self.assertAlmostEqual(float(root["data/magnetic_txyz"][1, 4, 3]), 44.0)
+        self.assertEqual(root["data/magnetic_left_txyz"].shape, (2, 5, 4))
+        self.assertTrue(root["data/magnetic_left_valid"][:].all())
+        self.assertAlmostEqual(float(root["data/magnetic_left_txyz"][1, 4, 3]), 144.0)
+        self.assertEqual(root["data/magnet_xyz"].shape, (2, 2, 4, 3))
 
     def _post_json(self, path: str, value: dict) -> dict:
         body = json.dumps(value).encode()

@@ -4,11 +4,11 @@
 
 ARPoseStreamer has three cooperating parts:
 
-1. optional Wi-Fi magnetic sensor board
+1. two optional Wi-Fi magnetic sensor boards
 2. iPhone capture gateway
 3. optional host receiver
 
-The iPhone always remains the capture authority. It runs ARKit, receives optional magnetic samples from a board on the phone hotspot, records locally, and forwards combined data only while a computer is registered. The computer is not required during capture.
+The iPhone always remains the capture authority. It runs ARKit, receives optional right and left magnetic samples from two boards on the phone hotspot, records them independently, and forwards combined data only while a computer is registered. The computer is not required during capture.
 
 ## Data Flow
 
@@ -31,10 +31,10 @@ terminal / CSV / downstream pipeline
 Hotspot magnetic flow:
 
 ```text
-optional board -- ASKN UDP 5557 --> iPhone gateway
-ARKit pose -----------------------> timestamp-preserving mux
-                                      |-> local pose/magnetic/video capture
-                                      `-> APM1 UDP 5558 when a PC is registered
+right board -- ASKN UDP 5557 --\
+                                  > iPhone timestamp-preserving mux
+left board  -- ASKN UDP 5562 --/              |-> local right/left CSV capture
+ARKit pose ----------------------->             `-> APM2 UDP 5558 when a PC is registered
 ```
 
 ## iPhone Side
@@ -57,9 +57,9 @@ Responsibilities:
 - optionally record camera video to a local MP4 file
 - store pose CSV and capture manifest for offline export
 - register each capture in a persistent local history library
-- receive five-chip ASKN magnetic samples from the hotspot DHCP gateway path
-- keep magnetic input optional so pose/video operation never waits for a board
-- multiplex pose and zero or more magnetic samples into APM1 packets
+- receive five-chip ASKN magnetic samples on right UDP 5557 and left UDP 5562
+- keep both magnetic inputs optional so pose/video operation never waits for a board
+- multiplex pose and zero or more side-labelled magnetic samples into APM2 packets
 - discover an optional computer through `PC_HELLO` heartbeats on UDP `5559`
 
 ## Host Side
@@ -77,7 +77,8 @@ Responsibilities:
 - show stream rate and packet-drop hints
 - optionally log incoming pose to CSV
 - receive uploaded capture files over HTTP
-- register with the phone and persist combined pose/magnetic live data
+- decode APM2 while retaining APM1 single-board compatibility
+- register with the phone and persist/display right and left magnetic data independently
 
 ## Design Goals
 

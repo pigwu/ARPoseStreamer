@@ -82,17 +82,18 @@ This mode does not require the school Wi-Fi or a computer during capture.
 1. On the iPhone, enable Personal Hotspot and `Allow Others to Join`.
 2. For 2.4 GHz boards such as many ESP32 variants, enable `Maximize Compatibility`.
 3. Use an ASCII-only iPhone name and hotspot password for the most reliable embedded Wi-Fi compatibility.
-4. Configure the board with the hotspot SSID/password and power it from the phone USB-C port.
-5. The board reads the DHCP gateway and sends 96-byte ASKN UDP packets to gateway port `5557`.
-6. Open the app. The magnetic listener starts automatically by default and shows receive rate, loss, sequence, and five-chip values.
+4. Configure both boards with the hotspot SSID/password and power them as required.
+5. Each board reads the DHCP gateway. The right board sends 96-byte ASKN UDP packets to gateway port `5557`; the left board sends the same format to port `5562`.
+6. Open the app. Both magnetic listeners start automatically by default and show independent receive rate, loss, sequence, and five-chip values.
 7. Tap `Start Recording`. Pose, magnetic data, and optional video are saved in one local capture directory.
 
 The app cannot turn Personal Hotspot on through a public iOS API. Enable it manually before powering the board. The board must use the DHCP gateway address instead of assuming the phone is always `172.20.10.1`.
 
-The magnetic board is optional during experiments. With no board connected,
-ARKit preview, pose/video recording, legacy pose UDP, APM1 pose packets with
+Both magnetic boards are optional during experiments. With neither board connected,
+ARKit preview, pose/video recording, legacy pose UDP, APM2 pose packets with
 `magnetic_count = 0`, history, and later upload all continue to work. The app
-creates `magnetic.csv` only after the first valid magnetic sample arrives.
+creates `magnetic_right.csv` and `magnetic_left.csv` independently after the
+first valid sample arrives on each side.
 
 When a computer is available, connect it to the same hotspot and run:
 
@@ -106,7 +107,7 @@ On Windows:
 py pose_magnetic_receiver.py --phone-ip 172.20.10.1
 ```
 
-The computer sends `PC_HELLO` heartbeats to the app and receives combined APM1 packets on UDP `5558`. If the computer disconnects, local phone recording continues. Start `capture_upload_server.py` later and use `Past Records -> Upload Data` to transfer `pose.csv`, `magnetic.csv`, and the capture manifest.
+The computer sends `PC_HELLO` heartbeats to the app and receives combined APM2 packets on UDP `5558`. The receiver also accepts historical APM1 packets as right-board data. If the computer disconnects, local phone recording continues. Start `capture_upload_server.py` later and use `Past Records -> Upload Data` to transfer `pose.csv`, the available right/left magnetic CSV files, and the capture manifest.
 
 Personal Hotspot routing must be validated on the target iPhone and iOS version; the simulator cannot test this path.
 

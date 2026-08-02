@@ -199,7 +199,8 @@ private struct BottomDashboard: View {
             }
 
             if viewModel.isMagneticListening && viewModel.magneticStats.receivedPackets > 0 {
-                MagneticMetricsRow(viewModel: viewModel)
+                MagneticMetricsRow(viewModel: viewModel, side: .right)
+                MagneticMetricsRow(viewModel: viewModel, side: .left)
 
                 HStack {
                     Text(viewModel.latestMagneticSummary)
@@ -213,7 +214,8 @@ private struct BottomDashboard: View {
 
                 if viewModel.showMagneticChart {
                     MagneticMagnitudeChart(
-                        samples: viewModel.magneticHistory,
+                        rightSamples: viewModel.magneticHistory,
+                        leftSamples: viewModel.leftMagneticHistory,
                         chipIndex: viewModel.selectedMagneticChip
                     )
                     .frame(height: 76)
@@ -263,7 +265,8 @@ private struct StatusStrip: View {
                 }
 
                 if viewModel.isMagneticListening {
-                    StatusChip(text: "Magnetic", isActive: viewModel.magneticStats.receiveRateHz > 0)
+                    StatusChip(text: "Right mag", isActive: viewModel.magneticStats.rightBoard.receiveRateHz > 0)
+                    StatusChip(text: "Left mag", isActive: viewModel.magneticStats.leftBoard.receiveRateHz > 0)
                 }
 
                 if viewModel.isComputerConnected {
@@ -299,13 +302,19 @@ private struct VideoMetricsRow: View {
 
 private struct MagneticMetricsRow: View {
     @ObservedObject var viewModel: PositionViewModel
+    let side: MagneticBoardSide
 
     var body: some View {
         HStack(spacing: 8) {
-            CompactMetricCard(label: "Mag Hz", value: viewModel.magneticReceiveRateText)
-            CompactMetricCard(label: "Loss", value: viewModel.magneticLossText)
-            CompactMetricCard(label: "Seq", value: viewModel.magneticSequenceText)
-            CompactMetricCard(label: "S\(viewModel.selectedMagneticChip) |B|", value: viewModel.selectedMagneticMagnitudeText)
+            CompactMetricCard(label: "\(side.displayName) Hz", value: viewModel.magneticReceiveRateText(for: side))
+            CompactMetricCard(label: "Loss", value: viewModel.magneticLossText(for: side))
+            CompactMetricCard(label: "Seq", value: viewModel.magneticSequenceText(for: side))
+            CompactMetricCard(
+                label: "S\(viewModel.selectedMagneticChip) |B|",
+                value: side == .right
+                    ? viewModel.selectedMagneticMagnitudeText
+                    : viewModel.selectedLeftMagneticMagnitudeText
+            )
         }
     }
 }
@@ -554,41 +563,57 @@ private struct CompactMetricCard: View {
 }
 
 private struct MagneticMagnitudeChart: View {
-    let samples: [MagneticHistorySample]
+    let rightSamples: [MagneticHistorySample]
+    let leftSamples: [MagneticHistorySample]
     let chipIndex: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("5 Second Magnetic Magnitude - S\(chipIndex)")
+            Text("5 Second Magnetic Magnitude - S\(chipIndex) (Right mint / Left orange)")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.72))
 
             Canvas { context, size in
-                let points = samples.compactMap { sample -> (TimeInterval, Double)? in
+                let rightPoints = rightSamples.compactMap { sample -> (TimeInterval, Double)? in
                     guard sample.magnitudes.indices.contains(chipIndex) else { return nil }
                     return (sample.timestamp, sample.magnitudes[chipIndex])
                 }
-                guard points.count > 1, let firstTime = points.first?.0, let lastTime = points.last?.0 else { return }
+                let leftPoints = leftSamples.compactMap { sample -> (TimeInterval, Double)? in
+                    guard sample.magnitudes.indices.contains(chipIndex) else { return nil }
+                    return (sample.timestamp, sample.magnitudes[chipIndex])
+                }
+                let allPoints = rightPoints + leftPoints
+                guard allPoints.count > 1 else { return }
 
-                let values = points.map { $0.1 }
+                let values = allPoints.map { $0.1 }
                 let low = values.min() ?? 0
                 let high = values.max() ?? 1
                 let valueRange = max(high - low, 1e-6)
+                let firstTime = allPoints.map(\.0).min() ?? 0
+                let lastTime = allPoints.map(\.0).max() ?? firstTime
                 let timeRange = max(lastTime - firstTime, 1e-6)
 
-                var path = Path()
-                for (index, point) in points.enumerated() {
-                    let x = CGFloat((point.0 - firstTime) / timeRange) * size.width
-                    let normalized = (point.1 - low) / valueRange
-                    let y = size.height - CGFloat(normalized) * size.height
-                    if index == 0 {
-                        path.move(to: CGPoint(x: x, y: y))
-                    } else {
-                        path.addLine(to: CGPoint(x: x, y: y))
+                func path(for points: [(TimeInterval, Double)]) -> Path {
+                    var path = Path()
+                    for (index, point) in points.enumerated() {
+                        let x = CGFloat((point.0 - firstTime) / timeRange) * size.width
+                        let normalized = (point.1 - low) / valueRange
+                        let y = size.height - CGFloat(normalized) * size.height
+                        if index == 0 {
+                            path.move(to: CGPoint(x: x, y: y))
+                        } else {
+                            path.addLine(to: CGPoint(x: x, y: y))
+                        }
                     }
+                    return path
                 }
 
-                context.stroke(path, with: .color(.mint), lineWidth: 2)
+                if rightPoints.count > 1 {
+                    context.stroke(path(for: rightPoints), with: .color(.mint), lineWidth: 2)
+                }
+                if leftPoints.count > 1 {
+                    context.stroke(path(for: leftPoints), with: .color(.orange), lineWidth: 2)
+                }
             }
         }
         .padding(8)

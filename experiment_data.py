@@ -59,7 +59,10 @@ class ExperimentDataset:
     directory: Path
     manifest: dict
     pose: TimedRows
+    # ``magnetic`` remains the right-board table for compatibility with old
+    # replay/export code and single-board captures.
     magnetic: TimedRows
+    magnetic_left: TimedRows
     sender_transport: TimedRows
     receiver_transport: TimedRows
     gripper: TimedRows
@@ -109,8 +112,21 @@ class ExperimentDataset:
         magnetic_path = _component_path(
             directory,
             components,
-            "magnetic_csv",
-            ["magnetic.csv", "magnetic_csv__magnetic.csv"],
+            "magnetic_right_csv",
+            ["magnetic_right.csv", "magnetic_right_csv__magnetic_right.csv"],
+        )
+        if magnetic_path is None:
+            magnetic_path = _component_path(
+                directory,
+                components,
+                "magnetic_csv",
+                ["magnetic.csv", "magnetic_csv__magnetic.csv"],
+            )
+        magnetic_left_path = _component_path(
+            directory,
+            components,
+            "magnetic_left_csv",
+            ["magnetic_left.csv", "magnetic_left_csv__magnetic_left.csv"],
         )
         sender_path = _component_path(
             directory,
@@ -163,11 +179,16 @@ class ExperimentDataset:
             magnetic_path,
             ["relative_time", "experiment_time", "phone_monotonic_time"],
         )
-        if magnetic.rows and "relative_time" not in magnetic.rows[0]:
-            magnetic.times = [
-                max(0.0, _float(row.get("phone_monotonic_time")) - start_monotonic)
-                for row in magnetic.rows
-            ]
+        magnetic_left = TimedRows.from_csv(
+            magnetic_left_path,
+            ["relative_time", "experiment_time", "phone_monotonic_time"],
+        )
+        for table in (magnetic, magnetic_left):
+            if table.rows and "relative_time" not in table.rows[0]:
+                table.times = [
+                    max(0.0, _float(row.get("phone_monotonic_time")) - start_monotonic)
+                    for row in table.rows
+                ]
         sender_transport = TimedRows.from_csv(sender_path, ["relative_time", "experiment_time"])
         receiver_transport = TimedRows.from_csv(
             receiver_path,
@@ -183,7 +204,14 @@ class ExperimentDataset:
         gripper = TimedRows.from_csv(gripper_path, ["experiment_time", "relative_time"])
 
         duration = _float(manifest.get("durationSeconds"), 0.0)
-        for table in (pose, magnetic, sender_transport, receiver_transport, gripper):
+        for table in (
+            pose,
+            magnetic,
+            magnetic_left,
+            sender_transport,
+            receiver_transport,
+            gripper,
+        ):
             if table.times:
                 duration = max(duration, table.times[-1])
 
@@ -192,6 +220,7 @@ class ExperimentDataset:
             manifest=manifest,
             pose=pose,
             magnetic=magnetic,
+            magnetic_left=magnetic_left,
             sender_transport=sender_transport,
             receiver_transport=receiver_transport,
             gripper=gripper,

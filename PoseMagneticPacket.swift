@@ -1,6 +1,6 @@
 import Foundation
 
-/// AR pose data in the representation needed by the combined APM1 protocol.
+/// AR pose data in the representation needed by the combined APM2 protocol.
 /// This deliberately has no ARKit dependency. An `ARPoseUDPSender.PoseSample`
 /// can be adapted by passing `sample.position` and
 /// `sample.orientation.vector` to this initializer.
@@ -26,25 +26,27 @@ struct PoseMagneticPoseValue: Equatable, Sendable {
     }
 }
 
-enum APM1PacketEncodingError: Error, Equatable, LocalizedError {
+enum APM2PacketEncodingError: Error, Equatable, LocalizedError {
     case tooManyMagneticSamples(maximum: Int, actual: Int)
 
     var errorDescription: String? {
         switch self {
         case let .tooManyMagneticSamples(maximum, actual):
-            return "APM1 supports at most \(maximum) magnetic samples per packet; received \(actual)."
+            return "APM2 supports at most \(maximum) magnetic samples per packet; received \(actual)."
         }
     }
 }
 
-/// Encodes one optional pose and up to ten magnetic samples into an APM1 UDP
-/// payload. Every numeric value, including the trailing CRC32, is little-endian.
-enum APM1PacketEncoder {
-    static let version: UInt16 = 1
+/// Encodes one optional pose and up to ten side-labelled magnetic samples into
+/// an APM2 UDP payload. Every numeric value, including the trailing CRC32, is
+/// little-endian. APM2 keeps the APM1 header and prefixes each magnetic sample
+/// with a UInt32 board side (0 right, 1 left).
+enum APM2PacketEncoder {
+    static let version: UInt16 = 2
     static let posePresentFlag: UInt16 = 1 << 0
     static let maximumMagneticSampleCount = 10
     static let fixedBytesBeforeMagneticSamples = 88
-    static let bytesPerMagneticSample = 108
+    static let bytesPerMagneticSample = 112
     static let crcByteCount = 4
 
     static func encode(
@@ -55,7 +57,7 @@ enum APM1PacketEncoder {
         magneticSamples: [MagneticSensorSample]
     ) throws -> Data {
         guard magneticSamples.count <= maximumMagneticSampleCount else {
-            throw APM1PacketEncodingError.tooManyMagneticSamples(
+            throw APM2PacketEncodingError.tooManyMagneticSamples(
                 maximum: maximumMagneticSampleCount,
                 actual: magneticSamples.count
             )
@@ -67,8 +69,8 @@ enum APM1PacketEncoder {
         var data = Data()
         data.reserveCapacity(expectedSize)
 
-        // The APM1 magic is raw ASCII, not a byte-swapped integer.
-        data.append(contentsOf: [0x41, 0x50, 0x4D, 0x31])
+        // The APM2 magic is raw ASCII, not a byte-swapped integer.
+        data.append(contentsOf: [0x41, 0x50, 0x4D, 0x32])
         append(version, to: &data)
         append(pose == nil ? 0 : posePresentFlag, to: &data)
         append(packetSequence, to: &data)
@@ -94,6 +96,7 @@ enum APM1PacketEncoder {
         append(UInt16(0), to: &data) // reserved
 
         for sample in magneticSamples {
+            append(sample.boardSide.rawValue, to: &data)
             append(sample.sequence, to: &data)
             append(sample.mcuTimeUs, to: &data)
             append(sample.receivedWallTime, to: &data)

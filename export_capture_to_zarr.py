@@ -23,7 +23,7 @@ MAGNETIC_VALUE_DIM = 4
 EVAL_MAGNET_USED_CHIP_COUNT = 4
 EVAL_MAGNET_SUBTRACT_BASELINE = True
 MAGNET_ABNORMAL_ABS_THRESHOLD = 5000.0
-RDP_SOURCE_ZARR_SCHEMA_VERSION = 3
+RDP_SOURCE_ZARR_SCHEMA_VERSION = 4
 STATIC_POS_THRESHOLD = 1e-4
 STATIC_ROT_THRESHOLD = 1e-3
 VIDEO_PANEL_WIDTH = 420
@@ -40,6 +40,7 @@ class CaptureInputs:
     manifest: dict
     pose_csv: Optional[Path]
     magnetic_csv: Optional[Path]
+    magnetic_left_csv: Optional[Path]
     force_csv: Optional[Path]
     gripper_csv: Optional[Path]
     video_path: Optional[Path]
@@ -87,6 +88,8 @@ class EpisodeArrays:
     magnet_sample_count: np.ndarray
     magnetic_txyz: np.ndarray
     magnetic_valid: np.ndarray
+    magnetic_left_txyz: np.ndarray
+    magnetic_left_valid: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -237,12 +240,29 @@ def discover_capture(directory: Path) -> CaptureInputs:
         require_nonempty=True,
     )
 
-    magnetic_name = manifest.get("magneticCSVFileName")
+    magnetic_name = (
+        manifest.get("rightMagneticCSVFileName")
+        or manifest.get("magneticCSVFileName")
+    )
     magnetic_csv = find_capture_file(
         directory,
         logical_name=magnetic_name,
-        component_prefix="magnetic_csv",
-        fallback_patterns=("magnetic.csv", "magnetic_csv__*.csv", "*magnetic*.csv"),
+        component_prefix="magnetic_right_csv",
+        fallback_patterns=(
+            "magnetic_right.csv",
+            "magnetic_right_csv__*.csv",
+            "magnetic.csv",
+            "magnetic_csv__*.csv",
+        ),
+        require_nonempty=True,
+        required=False,
+    )
+    magnetic_left_name = manifest.get("leftMagneticCSVFileName")
+    magnetic_left_csv = find_capture_file(
+        directory,
+        logical_name=magnetic_left_name,
+        component_prefix="magnetic_left_csv",
+        fallback_patterns=("magnetic_left.csv", "magnetic_left_csv__*.csv"),
         require_nonempty=True,
         required=False,
     )
@@ -302,6 +322,7 @@ def discover_capture(directory: Path) -> CaptureInputs:
         manifest=manifest,
         pose_csv=pose_csv,
         magnetic_csv=magnetic_csv,
+        magnetic_left_csv=magnetic_left_csv,
         force_csv=force_csv,
         gripper_csv=gripper_csv,
         video_path=video_path,
@@ -319,6 +340,11 @@ def build_episode(
 ) -> EpisodeArrays:
     pose = load_pose_series(capture.pose_csv, capture.manifest) if capture.pose_csv else None
     magnetic = load_magnetic_series(capture.magnetic_csv, capture.manifest) if capture.magnetic_csv else None
+    magnetic_left = (
+        load_magnetic_series(capture.magnetic_left_csv, capture.manifest)
+        if capture.magnetic_left_csv
+        else None
+    )
     force = load_force_series(capture.force_csv, capture.manifest) if capture.force_csv else None
     gripper = load_gripper_series(capture.gripper_csv, capture.manifest) if capture.gripper_csv else None
     eef_calibration = load_eef_calibration_result(eef_calibration_result)
@@ -344,6 +370,10 @@ def build_episode(
         )
     force_torque, force_valid = sample_force_on_time(force, sample_time)
     magnetic_txyz, magnetic_valid = sample_magnetic_on_time(magnetic, sample_time)
+    magnetic_left_txyz, magnetic_left_valid = sample_magnetic_on_time(
+        magnetic_left,
+        sample_time,
+    )
     gripper_width = sample_gripper_on_time(gripper, sample_time)
     if gripper is None:
         print(f"[WARN] {capture.directory.name}: no aruco_gripper.csv found; robot0_gripper_width stays zero")
@@ -357,6 +387,8 @@ def build_episode(
         magnetic_txyz=magnetic_txyz,
         magnetic_valid=magnetic_valid,
         sample_time=sample_time,
+        magnetic_left_txyz=magnetic_left_txyz,
+        magnetic_left_valid=magnetic_left_valid,
     )
     cleaned_magnet_xyz, replaced_magnet_count = replace_abnormal_magnet_readings(magnet_xyz)
     if replaced_magnet_count:
@@ -380,6 +412,8 @@ def build_episode(
         "magnet_sample_count": magnet_sample_count,
         "magnetic_txyz": magnetic_txyz,
         "magnetic_valid": magnetic_valid,
+        "magnetic_left_txyz": magnetic_left_txyz,
+        "magnetic_left_valid": magnetic_left_valid,
     }
     if trim_static:
         data = trim_static_frames(
@@ -401,6 +435,8 @@ def build_episode(
     magnet_sample_count = data["magnet_sample_count"]
     magnetic_txyz = data["magnetic_txyz"]
     magnetic_valid = data["magnetic_valid"]
+    magnetic_left_txyz = data["magnetic_left_txyz"]
+    magnetic_left_valid = data["magnetic_left_valid"]
 
     pose6 = np.concatenate([eef_pos, eef_rot_axis_angle], axis=1).astype(np.float32)
     start_pose = pose6[0] if len(pose6) else np.zeros(POSE_DIM, dtype=np.float32)
@@ -432,6 +468,8 @@ def build_episode(
         magnet_sample_count=magnet_sample_count.astype(np.int32, copy=False),
         magnetic_txyz=magnetic_txyz.astype(np.float32, copy=False),
         magnetic_valid=magnetic_valid.astype(bool, copy=False),
+        magnetic_left_txyz=magnetic_left_txyz.astype(np.float32, copy=False),
+        magnetic_left_valid=magnetic_left_valid.astype(bool, copy=False),
     )
 
 
@@ -473,7 +511,10 @@ def make_zarr_attrs(eef_calibration_result: Optional[Path], action_source: str) 
         "rdp_source_zarr_schema_version": RDP_SOURCE_ZARR_SCHEMA_VERSION,
         "magnet_key": "magnet_xyz",
         "magnet_processing": "eval_compatible",
-        "magnet_source_key": "magnetic_txyz[:, :, 1:4]",
+        "magnet_source_key": (
+            "stack(right=magnetic_txyz,left=magnetic_left_txyz)[:, :, :, 1:4]"
+        ),
+        "magnet_board_order": ["right", "left"],
         "magnet_used_chip_count": EVAL_MAGNET_USED_CHIP_COUNT,
         "magnet_subtract_baseline": EVAL_MAGNET_SUBTRACT_BASELINE,
         "magnet_abnormal_abs_threshold": MAGNET_ABNORMAL_ABS_THRESHOLD,
@@ -565,6 +606,8 @@ def build_magnet_arrays(
     magnetic_txyz: np.ndarray,
     magnetic_valid: np.ndarray,
     sample_time: np.ndarray,
+    magnetic_left_txyz: Optional[np.ndarray] = None,
+    magnetic_left_valid: Optional[np.ndarray] = None,
     used_chip_count: int = EVAL_MAGNET_USED_CHIP_COUNT,
     subtract_baseline: bool = EVAL_MAGNET_SUBTRACT_BASELINE,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -573,21 +616,49 @@ def build_magnet_arrays(
         raise ValueError(
             f"used_chip_count must be in [1, {MAGNETIC_CHIP_COUNT}], got {used_chip_count}"
         )
-    magnet_xyz = magnetic_txyz[:, None, :used_chip_count, 1:4].astype(np.float32, copy=True)
-    valid = np.any(magnetic_valid[:, :used_chip_count], axis=1).astype(np.int32)
-    magnet_sample_count = valid[:, None]
-    invalid_rows = valid == 0
+    if magnetic_left_txyz is None:
+        magnetic_left_txyz = np.zeros_like(magnetic_txyz)
+    if magnetic_left_valid is None:
+        magnetic_left_valid = np.zeros_like(magnetic_valid, dtype=bool)
+    if magnetic_left_txyz.shape != magnetic_txyz.shape:
+        raise ValueError(
+            "Right and left magnetic arrays must have the same shape: "
+            f"{magnetic_txyz.shape} != {magnetic_left_txyz.shape}"
+        )
+    if magnetic_left_valid.shape != magnetic_valid.shape:
+        raise ValueError(
+            "Right and left magnetic validity arrays must have the same shape: "
+            f"{magnetic_valid.shape} != {magnetic_left_valid.shape}"
+        )
+
+    magnet_xyz = np.stack(
+        [
+            magnetic_txyz[:, :used_chip_count, 1:4],
+            magnetic_left_txyz[:, :used_chip_count, 1:4],
+        ],
+        axis=1,
+    ).astype(np.float32, copy=True)
+    valid = np.column_stack(
+        [
+            np.any(magnetic_valid[:, :used_chip_count], axis=1),
+            np.any(magnetic_left_valid[:, :used_chip_count], axis=1),
+        ]
+    )
+    magnet_sample_count = valid.astype(np.int32)
 
     if subtract_baseline:
         magnet_xyz = subtract_first_valid_magnet_baseline(
             magnet_xyz=magnet_xyz,
-            valid_rows=valid.astype(bool),
+            valid_rows=valid,
         )
-    if np.any(invalid_rows):
-        magnet_xyz[invalid_rows] = 0
+    magnet_xyz[~valid] = 0
 
     timestamp_sec = np.nan_to_num(sample_time.astype(np.float64, copy=False), nan=0.0)
-    magnet_timestamp_ns = np.rint(timestamp_sec[:, None] * 1e9).astype(np.int64)
+    magnet_timestamp_ns = np.repeat(
+        np.rint(timestamp_sec[:, None] * 1e9).astype(np.int64),
+        2,
+        axis=1,
+    )
     return magnet_xyz, magnet_timestamp_ns, magnet_sample_count
 
 
@@ -599,25 +670,32 @@ def subtract_first_valid_magnet_baseline(
     if magnet_xyz.ndim != 4 or magnet_xyz.shape[-1] != 3:
         raise ValueError(f"Expected magnet_xyz [T, S, N, 3], got {magnet_xyz.shape}")
 
-    valid_rows = np.asarray(valid_rows, dtype=bool).reshape(-1)
-    if valid_rows.shape[0] != magnet_xyz.shape[0]:
+    valid_rows = np.asarray(valid_rows, dtype=bool)
+    if valid_rows.ndim == 1:
+        valid_rows = np.repeat(valid_rows[:, None], magnet_xyz.shape[1], axis=1)
+    if valid_rows.shape != magnet_xyz.shape[:2]:
         raise ValueError(
-            f"valid_rows length {valid_rows.shape[0]} does not match magnet rows {magnet_xyz.shape[0]}"
+            f"valid_rows shape {valid_rows.shape} does not match magnet rows {magnet_xyz.shape[:2]}"
         )
-    valid_indices = np.flatnonzero(valid_rows)
-    if valid_indices.size == 0:
-        return magnet_xyz.copy()
 
-    baseline = np.zeros(magnet_xyz.shape[2:], dtype=np.float32)
-    valid_values = magnet_xyz[valid_indices]
-    for sensor_idx in range(magnet_xyz.shape[2]):
-        for axis_idx in range(3):
-            values = valid_values[:, :, sensor_idx, axis_idx].reshape(-1)
-            finite_indices = np.flatnonzero(np.isfinite(values))
-            if finite_indices.size > 0:
-                baseline[sensor_idx, axis_idx] = values[finite_indices[0]]
+    baseline = np.zeros(magnet_xyz.shape[1:], dtype=np.float32)
+    for sample_idx in range(magnet_xyz.shape[1]):
+        valid_indices = np.flatnonzero(valid_rows[:, sample_idx])
+        for sensor_idx in range(magnet_xyz.shape[2]):
+            for axis_idx in range(3):
+                values = magnet_xyz[
+                    valid_indices,
+                    sample_idx,
+                    sensor_idx,
+                    axis_idx,
+                ]
+                finite_indices = np.flatnonzero(np.isfinite(values))
+                if finite_indices.size > 0:
+                    baseline[sample_idx, sensor_idx, axis_idx] = values[
+                        finite_indices[0]
+                    ]
 
-    return (magnet_xyz - baseline[None, None, :, :]).astype(np.float32)
+    return (magnet_xyz - baseline[None, :, :, :]).astype(np.float32)
 
 
 def replace_abnormal_magnet_readings(magnet_xyz: np.ndarray) -> Tuple[np.ndarray, int]:
@@ -1416,6 +1494,12 @@ def write_zarr(
     magnet_sample_count = np.concatenate([ep.magnet_sample_count for ep in episodes], axis=0)
     magnetic_txyz = np.concatenate([ep.magnetic_txyz for ep in episodes], axis=0)
     magnetic_valid = np.concatenate([ep.magnetic_valid for ep in episodes], axis=0)
+    magnetic_left_txyz = np.concatenate(
+        [ep.magnetic_left_txyz for ep in episodes], axis=0
+    )
+    magnetic_left_valid = np.concatenate(
+        [ep.magnetic_left_valid for ep in episodes], axis=0
+    )
     episode_ends = np.cumsum([len(ep.timestamp) for ep in episodes], dtype=np.int64)
 
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
@@ -1466,6 +1550,20 @@ def write_zarr(
         data_group,
         "magnetic_valid",
         magnetic_valid,
+        (ZARR_CHUNK_ROWS, MAGNETIC_CHIP_COUNT),
+        compressor,
+    )
+    write_array(
+        data_group,
+        "magnetic_left_txyz",
+        magnetic_left_txyz,
+        (ZARR_CHUNK_ROWS, MAGNETIC_CHIP_COUNT, MAGNETIC_VALUE_DIM),
+        compressor,
+    )
+    write_array(
+        data_group,
+        "magnetic_left_valid",
+        magnetic_left_valid,
         (ZARR_CHUNK_ROWS, MAGNETIC_CHIP_COUNT),
         compressor,
     )

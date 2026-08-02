@@ -53,7 +53,10 @@ struct CaptureRecord: Identifiable, Codable, Hashable {
     var displayName: String
     let sessionDirectoryName: String
     let poseCSVFileName: String
+    /// Right gripper magnetic CSV. The property name is retained for decoding
+    /// records created by the single-board test version.
     let magneticCSVFileName: String?
+    let leftMagneticCSVFileName: String?
     let senderTransportCSVFileName: String?
     let manifestFileName: String
     let videoFileName: String?
@@ -100,6 +103,7 @@ final class CaptureLibraryStore {
             sessionDirectoryName: artifact.sessionDirectoryURL.lastPathComponent,
             poseCSVFileName: artifact.poseCSVURL.lastPathComponent,
             magneticCSVFileName: artifact.magneticCSVURL?.lastPathComponent,
+            leftMagneticCSVFileName: artifact.leftMagneticCSVURL?.lastPathComponent,
             senderTransportCSVFileName: artifact.senderTransportCSVURL?.lastPathComponent,
             manifestFileName: artifact.manifestURL.lastPathComponent,
             videoFileName: artifact.videoURL?.lastPathComponent,
@@ -157,6 +161,11 @@ final class CaptureLibraryStore {
     func urlForMagneticCSV(record: CaptureRecord) -> URL? {
         guard let magneticCSVFileName = record.magneticCSVFileName else { return nil }
         return Self.captureDirectory(for: record).appendingPathComponent(magneticCSVFileName)
+    }
+
+    func urlForLeftMagneticCSV(record: CaptureRecord) -> URL? {
+        guard let fileName = record.leftMagneticCSVFileName else { return nil }
+        return Self.captureDirectory(for: record).appendingPathComponent(fileName)
     }
 
     func urlForSenderTransportCSV(record: CaptureRecord) -> URL? {
