@@ -18,7 +18,31 @@ private final class ExperimentRecordingContext {
         expectedFrameRate: 10
     )
     let poseSessionRecorder = PoseDataSessionRecorder()
+    private let magneticRecordingQueue = DispatchQueue(
+        label: "umi.pose.recording.magnetic.\(UUID().uuidString)",
+        qos: .utility
+    )
     var isDiscarded = false
+
+    func appendMagneticSample(_ sample: MagneticSensorSample) {
+        magneticRecordingQueue.async { [recorder = poseSessionRecorder] in
+            recorder.append(magneticSample: sample)
+        }
+    }
+
+    /// Finalization runs off the AR queue and waits for every magnetic sample
+    /// accepted before stop/failure to reach disk before closing the CSV files.
+    func finishSessionAfterMagneticWrites() {
+        magneticRecordingQueue.sync { [recorder = poseSessionRecorder] in
+            recorder.finishSession()
+        }
+    }
+
+    func discardSessionAfterMagneticWrites() {
+        magneticRecordingQueue.sync { [recorder = poseSessionRecorder] in
+            recorder.discardSession()
+        }
+    }
 }
 
 final class ARPoseUDPSender: NSObject, ARSessionDelegate {
@@ -275,7 +299,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
     func appendMagneticSample(_ sample: MagneticSensorSample) {
         arQueue.async { [weak self] in
             guard let context = self?.activeRecordingContext else { return }
-            context.poseSessionRecorder.append(magneticSample: sample)
+            context.appendMagneticSample(sample)
         }
     }
 
@@ -361,7 +385,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
                 }
                 let finalPrimaryStatus = primaryFinalStatus
                 self.recordingFinalizationQueue.async { [weak self] in
-                    context.poseSessionRecorder.finishSession()
+                    context.finishSessionAfterMagneticWrites()
                     self?.arQueue.async { [weak self] in
                         guard
                             let self,
@@ -710,7 +734,9 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
             self.isRecordingEnabled = false
             context.videoRecorder.discardRecording()
             context.ultraWideVideoRecorder.discardRecording()
-            context.poseSessionRecorder.discardSession()
+            self.recordingFinalizationQueue.async {
+                context.discardSessionAfterMagneticWrites()
+            }
 
             if !self.isStreamingEnabled {
                 self.pauseSessionIfNeeded()
@@ -739,7 +765,7 @@ final class ARPoseUDPSender: NSObject, ARSessionDelegate {
                     )
                     context.poseSessionRecorder.addWarning("1x recording failed: \(message)")
                     self.recordingFinalizationQueue.async {
-                        context.poseSessionRecorder.finishSession()
+                        context.finishSessionAfterMagneticWrites()
                     }
                     if !self.isStreamingEnabled {
                         self.pauseSessionIfNeeded()
