@@ -1125,14 +1125,23 @@ class ExperimentMonitorWindow(QMainWindow):
 
         self.plot_tabs = QTabWidget()
         self.pose_plot = self._make_plot("Position", "m")
-        self.magnetic_plot = self._make_plot("Magnetic magnitude change", "Δ|B|")
+        self.magnetic_plot = self._make_plot("Right sensor magnitude change (UDP 5557)", "Δ|B|")
+        self.magnetic_left_plot = self._make_plot("Left sensor magnitude change (UDP 5562)", "Δ|B|")
+        magnetic_plots = QWidget()
+        magnetic_plots_layout = QVBoxLayout(magnetic_plots)
+        magnetic_plots_layout.setContentsMargins(0, 0, 0, 0)
+        magnetic_plots_layout.setSpacing(4)
+        magnetic_plots_layout.addWidget(self.magnetic_plot, 1)
+        magnetic_plots_layout.addWidget(self.magnetic_left_plot, 1)
+        if pg is not None:
+            self.magnetic_left_plot.setXLink(self.magnetic_plot)
         self.transport_plot = self._make_plot("Transport", "")
         self.gripper_plot = self._make_plot("Offline gripper distance", "mm")
         self.plot_tabs.addTab(self.pose_plot, "Pose")
-        self.plot_tabs.addTab(self.magnetic_plot, "Sensor")
+        self.plot_tabs.addTab(magnetic_plots, "Sensor")
         self.plot_tabs.addTab(self.transport_plot, "Propagation")
         self.plot_tabs.addTab(self.gripper_plot, "Gripper")
-        self.plot_tabs.setMinimumHeight(270)
+        self.plot_tabs.setMinimumHeight(330)
         self.gripper_plot.setMinimumHeight(235)
         replay_layout.addWidget(self.plot_tabs, 3)
         splitter.addWidget(replay)
@@ -2189,7 +2198,13 @@ class ExperimentMonitorWindow(QMainWindow):
             return
         dataset = self.dataset
         self.plot_cursors = []
-        for plot in (self.pose_plot, self.magnetic_plot, self.transport_plot, self.gripper_plot):
+        for plot in (
+            self.pose_plot,
+            self.magnetic_plot,
+            self.magnetic_left_plot,
+            self.transport_plot,
+            self.gripper_plot,
+        ):
             plot.clear()
             plot.addLegend()
         colors = ["#ff5c5c", "#56d364", "#58a6ff", "#d2a8ff", "#f2cc60"]
@@ -2205,15 +2220,15 @@ class ExperimentMonitorWindow(QMainWindow):
                 dataset.magnetic.times,
                 _relative_magnetic_magnitudes(dataset.magnetic.rows, chip),
                 pen=pg.mkPen(colors[chip], width=1.5),
-                name=f"R-S{chip}",
+                name=f"S{chip}",
             )
-            self.magnetic_plot.plot(
+            self.magnetic_left_plot.plot(
                 dataset.magnetic_left.times,
                 _relative_magnetic_magnitudes(dataset.magnetic_left.rows, chip),
-                pen=pg.mkPen(colors[chip], width=1.5, style=Qt.PenStyle.DashLine),
-                name=f"L-S{chip}",
+                pen=pg.mkPen(colors[chip], width=1.5),
+                name=f"S{chip}",
             )
-        for plot in (self.pose_plot, self.magnetic_plot):
+        for plot in (self.pose_plot, self.magnetic_plot, self.magnetic_left_plot):
             cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff", width=1))
             plot.addItem(cursor)
             self.plot_cursors.append(cursor)
@@ -2275,8 +2290,8 @@ class ExperimentMonitorWindow(QMainWindow):
             )
         cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff", width=1))
         plot.addItem(cursor)
-        if len(self.plot_cursors) >= 3:
-            self.plot_cursors[2] = cursor
+        if len(self.plot_cursors) >= 4:
+            self.plot_cursors[3] = cursor
         else:
             self.plot_cursors.append(cursor)
 
