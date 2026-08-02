@@ -62,20 +62,18 @@ struct ContentView: View {
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-                VStack(spacing: 0) {
-                    TopBar(
-                        title: "ARPoseStreamer",
-                        onMenuTapped: {
-                            withAnimation(.easeInOut(duration: 0.22)) {
-                                isSidebarPresented.toggle()
-                            }
+                BottomDashboard(viewModel: viewModel)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+
+                TopBar(
+                    title: "ARPoseStreamer",
+                    onMenuTapped: {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            isSidebarPresented.toggle()
                         }
-                    )
-
-                    Spacer()
-
-                    BottomDashboard(viewModel: viewModel)
-                }
+                    }
+                )
+                .frame(maxHeight: .infinity, alignment: .top)
 
             }
 
@@ -199,8 +197,7 @@ private struct BottomDashboard: View {
             }
 
             if viewModel.isMagneticListening && viewModel.magneticStats.receivedPackets > 0 {
-                MagneticMetricsRow(viewModel: viewModel, side: .right)
-                MagneticMetricsRow(viewModel: viewModel, side: .left)
+                MagneticMetricsPanel(viewModel: viewModel)
 
                 HStack {
                     Text(viewModel.latestMagneticSummary)
@@ -300,22 +297,53 @@ private struct VideoMetricsRow: View {
     }
 }
 
+private struct MagneticMetricsPanel: View {
+    @ObservedObject var viewModel: PositionViewModel
+
+    var body: some View {
+        VStack(spacing: 6) {
+            MagneticMetricsRow(viewModel: viewModel, side: .right)
+            MagneticMetricsRow(viewModel: viewModel, side: .left)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
 private struct MagneticMetricsRow: View {
     @ObservedObject var viewModel: PositionViewModel
     let side: MagneticBoardSide
 
+    private var magnitudeText: String {
+        side == .right
+            ? viewModel.selectedMagneticMagnitudeText
+            : viewModel.selectedLeftMagneticMagnitudeText
+    }
+
     var body: some View {
         HStack(spacing: 8) {
-            CompactMetricCard(label: "\(side.displayName) Hz", value: viewModel.magneticReceiveRateText(for: side))
-            CompactMetricCard(label: "Loss", value: viewModel.magneticLossText(for: side))
-            CompactMetricCard(label: "Seq", value: viewModel.magneticSequenceText(for: side))
-            CompactMetricCard(
-                label: "S\(viewModel.selectedMagneticChip) |B|",
-                value: side == .right
-                    ? viewModel.selectedMagneticMagnitudeText
-                    : viewModel.selectedLeftMagneticMagnitudeText
-            )
+            Text(side.displayName)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(side == .right ? Color.mint : Color.orange)
+                .frame(width: 34, alignment: .leading)
+
+            metric("\(viewModel.magneticReceiveRateText(for: side)) Hz")
+            metric("Loss \(viewModel.magneticLossText(for: side))")
+            metric("#\(viewModel.magneticSequenceText(for: side))")
+            metric("|B| \(magnitudeText)")
         }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func metric(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.monospacedDigit().weight(.semibold))
+            .foregroundStyle(.white.opacity(0.88))
+            .lineLimit(1)
+            .minimumScaleFactor(0.62)
+            .frame(maxWidth: .infinity)
     }
 }
 
